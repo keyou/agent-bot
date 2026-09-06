@@ -2958,6 +2958,43 @@ describe("ProxySessionController", () => {
     );
   });
 
+  test("checks an inherited topic root without loading the full graph before presenting the card", async () => {
+    const { controller, runtime, outbound, presenter, store } = fixture();
+    const topicMessage = (text: string) => threadMessage("group", "group", "topic", "om_root", text);
+    await controller.onMessage(topicMessage("/new linked task"));
+    const sessionId = store.getUserContext("chat_id:group:thread_id:topic")!.currentSessionId!;
+    store.saveTurnSnapshot("root", "source", { status: "completed" });
+    store.saveTurnParent("root", "source");
+    store.bindMessageToTurn("om_root", "source", "root");
+    store.audit("chat_id:group:thread_id:topic", "thread_forked", {
+      forkedLocalSessionId: sessionId, sourceTurnId: "root",
+    });
+    const graphRead = vi.spyOn(store, "listTaskTurnGraph").mockImplementation(() => {
+      throw new Error("The prompt path must not load the full history graph");
+    });
+    const membershipCheck = vi.spyOn(store, "hasTaskHistoryTurn");
+
+    await controller.onMessage(topicMessage("continue"));
+    expect(membershipCheck).toHaveBeenCalledWith(sessionId, "root");
+    expect(runtime.startTurn).toHaveBeenLastCalledWith(sessionId, "continue");
+    expect(presenter.startPendingTurn).toHaveBeenCalledWith(
+      sessionId, "chat_id:group:thread_id:topic", "linked task",
+      { messageId: "m-topic-continue", replyInThread: true }, "continue",
+    );
+    await controller.onMessage(topicMessage("next instruction"));
+    expect(runtime.steerTurn).toHaveBeenLastCalledWith(sessionId, "turn_1", "next instruction");
+    expect(outbound.readReferencedMessage).not.toHaveBeenCalled();
+    expect(graphRead).not.toHaveBeenCalled();
+
+    await controller.onMessage(topicMessage("/new fresh task"));
+    await controller.onMessage(topicMessage("start fresh"));
+    expect(outbound.readReferencedMessage).toHaveBeenCalledOnce();
+    expect(outbound.readReferencedMessage).toHaveBeenCalledWith("om_root");
+    expect(runtime.startTurn).toHaveBeenLastCalledWith(
+      expect.any(String), expect.stringContaining("start fresh\n\n话题根消息："),
+    );
+  });
+
   test("injects an unanchored topic root once into the task Prompt", async () => {
     const { controller, runtime, outbound, store } = fixture();
     vi.mocked(outbound.readReferencedMessage!).mockResolvedValueOnce({

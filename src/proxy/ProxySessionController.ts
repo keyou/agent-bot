@@ -2884,8 +2884,7 @@ export class ProxySessionController {
     const anchor = this.store.findTurnAnchorByMessageId(messageId);
     if (!anchor) return false;
     if (record.lastTurnId === anchor.turnId) return true;
-    return this.store.listTaskTurnGraph(record.localSessionId)
-      .some((turn) => turn.turnId === anchor.turnId);
+    return this.store.hasTaskHistoryTurn(record.localSessionId, anchor.turnId);
   }
 
   private async forkThreadSession(message: IncomingMessage): Promise<void> {

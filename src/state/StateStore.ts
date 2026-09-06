@@ -1255,6 +1255,46 @@ export class StateStore {
     }));
   }
 
+  hasTaskHistoryTurn(localSessionId: string, turnId: string): boolean {
+    const readParent = this.db.prepare(`
+      SELECT ts.local_session_id, tpl.parent_turn_id
+      FROM turn_snapshots ts
+      LEFT JOIN turn_parent_links tpl ON tpl.turn_id = ts.turn_id
+      WHERE ts.turn_id = ?
+        AND json_extract(ts.snapshot_json, '$.status') = 'completed'
+    `);
+    type ParentRow = { local_session_id: string; parent_turn_id: string | null };
+    const target = readParent.get(turnId) as ParentRow | undefined;
+    if (!target) return false;
+    if (target.local_session_id === localSessionId) return true;
+
+    const backfilledSessions = new Set<string>();
+    let ancestorTurnId = this.findForkSourceTurnId(localSessionId);
+    if (!ancestorTurnId) {
+      // Reset-only legacy tasks may have partially saved cross-session links.
+      this.backfillTurnParents(localSessionId);
+      backfilledSessions.add(localSessionId);
+      ancestorTurnId = this.findCrossSessionParentTurnId(localSessionId);
+    }
+    const visited = new Set<string>();
+    while (ancestorTurnId && !visited.has(ancestorTurnId)) {
+      if (ancestorTurnId === turnId) return true;
+      visited.add(ancestorTurnId);
+      const ancestor = readParent.get(ancestorTurnId) as ParentRow | undefined;
+      if (!ancestor) return false;
+      let parentTurnId = ancestor.parent_turn_id;
+      // Older snapshots may lack parent links. Repair each owner at most once,
+      // without loading full snapshots or rebuilding already linked ancestry.
+      if (!parentTurnId && !backfilledSessions.has(ancestor.local_session_id)) {
+        this.backfillTurnParents(ancestor.local_session_id);
+        backfilledSessions.add(ancestor.local_session_id);
+        parentTurnId = (readParent.get(ancestorTurnId) as ParentRow | undefined)?.parent_turn_id ?? null;
+      }
+      ancestorTurnId = parentTurnId ?? undefined;
+    }
+    return false;
+  }
+
   listTaskTurnGraph(localSessionId: string): CompletedTurnSnapshotRecord[] {
     this.backfillTurnParents(localSessionId);
     const records = new Map(

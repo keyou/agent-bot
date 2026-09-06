@@ -751,6 +751,121 @@ describe("StateStore runtime metadata", () => {
       .toEqual(["turn_forked", "turn_anchor", "turn_root"]);
   });
 
+  test("checks linked multi-level Fork ancestry without rebuilding parent links", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const dbPath = path.join(directory, "state.sqlite");
+    const store = new StateStore(dbPath);
+    stores.push(store);
+    for (const [turnId, sessionId, parent] of [
+      ["root", "source", undefined],
+      ["anchor", "source", "root"],
+      ["branch", "fork", "anchor"],
+      ["local", "nested-fork", "branch"],
+    ] as const) {
+      store.saveTurnSnapshot(turnId, sessionId, { status: "completed" });
+      store.saveTurnParent(turnId, sessionId, parent);
+    }
+    store.audit("chat_id:fork", "session_forked", {
+      forkedLocalSessionId: "fork", sourceTurnId: "anchor",
+    });
+    store.audit("chat_id:nested", "thread_forked", {
+      forkedLocalSessionId: "nested-fork", sourceTurnId: "branch",
+    });
+    const db = new Database(dbPath);
+    try {
+      db.exec(`CREATE TRIGGER reject_parent_rebuild BEFORE INSERT ON turn_parent_links
+        BEGIN SELECT RAISE(ABORT, 'History membership must not rebuild linked ancestry'); END`);
+    } finally {
+      db.close();
+    }
+
+    expect(store.hasTaskHistoryTurn("nested-fork", "local")).toBe(true);
+    expect(store.hasTaskHistoryTurn("nested-fork", "branch")).toBe(true);
+    expect(store.hasTaskHistoryTurn("nested-fork", "anchor")).toBe(true);
+    expect(store.hasTaskHistoryTurn("nested-fork", "root")).toBe(true);
+    expect(store.hasTaskHistoryTurn("nested-fork", "missing")).toBe(false);
+  });
+
+  test("preserves legacy Reset and Fork membership without requiring a graph read first", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    const now = Date.now();
+    for (const [turnId, startedAt] of [["root", now - 3_000], ["discarded", now - 2_000], ["reset-branch", now + 1_000]] as const) {
+      store.saveTurnSnapshot(turnId, "source", { status: "completed", startedAt });
+    }
+    store.audit("chat_id:source", "session_reset_to_turn", {
+      localSessionId: "source", resetTurnId: "root",
+    });
+    store.audit("chat_id:fork", "thread_forked", {
+      forkedLocalSessionId: "fork", sourceTurnId: "reset-branch",
+    });
+    store.saveTurnSnapshot("later", "source", { status: "completed", startedAt: now + 2_000 });
+    store.saveTurnSnapshot("running", "fork", { status: "running" });
+    store.saveTurnSnapshot("failed", "fork", { status: "failed" });
+    store.saveTurnSnapshot("unrelated", "other", { status: "completed" });
+
+    for (const [turnId, expected] of [
+      ["reset-branch", true], ["root", true], ["discarded", false], ["later", false],
+      ["running", false], ["failed", false], ["unrelated", false], ["missing", false],
+    ] as const) {
+      expect(store.hasTaskHistoryTurn("fork", turnId), turnId).toBe(expected);
+    }
+    expect(store.listTaskTurnGraph("fork").map((turn) => turn.turnId)).toEqual(["reset-branch", "root"]);
+    expect(store.hasTaskHistoryTurn("source", "discarded")).toBe(true);
+  });
+
+  test("finds legacy cross-session Reset parents without a Fork audit record", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const dbPath = path.join(directory, "state.sqlite");
+    const store = new StateStore(dbPath);
+    stores.push(store);
+    store.saveTurnSnapshot("root", "source", { status: "completed", startedAt: 100 });
+    store.audit("chat_id:reset", "session_reset_to_turn", {
+      localSessionId: "reset", resetTurnId: "root",
+    });
+    store.saveTurnSnapshot("after-reset", "reset", { status: "completed", startedAt: Date.now() + 1_000 });
+    store.saveTurnParent("after-reset", "reset");
+    store.saveTurnSnapshot("later-root", "other", { status: "completed", startedAt: 200 });
+    store.saveTurnSnapshot("later", "reset", { status: "completed", startedAt: Date.now() + 2_000 });
+    store.saveTurnParent("later", "reset", "later-root");
+    const db = new Database(dbPath);
+    try {
+      db.prepare("UPDATE turn_parent_links SET created_at = ? WHERE turn_id = ?")
+        .run("2000-01-01T00:00:00.000Z", "after-reset");
+    } finally {
+      db.close();
+    }
+
+    expect(store.hasTaskHistoryTurn("reset", "root")).toBe(true);
+    expect(store.hasTaskHistoryTurn("reset", "later-root")).toBe(false);
+    expect(store.listTaskTurnGraph("reset").map((turn) => turn.turnId)).toEqual(["later", "after-reset", "root"]);
+  });
+
+  test("stops ancestry membership checks at incomplete, missing, or cyclic parents", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    store.saveTurnSnapshot("target", "source", { status: "completed" });
+    store.saveTurnSnapshot("incomplete", "source", { status: "running" });
+    store.saveTurnParent("incomplete", "source", "target");
+    store.saveTurnSnapshot("cycle-a", "cycle", { status: "completed" });
+    store.saveTurnSnapshot("cycle-b", "cycle", { status: "completed" });
+    store.saveTurnParent("cycle-a", "cycle", "cycle-b");
+    store.saveTurnParent("cycle-b", "cycle", "cycle-a");
+    for (const sourceTurnId of ["incomplete", "missing", "cycle-a"]) {
+      store.audit("chat_id:fork", "thread_forked", {
+        forkedLocalSessionId: `fork-${sourceTurnId}`, sourceTurnId,
+      });
+      expect(store.hasTaskHistoryTurn(`fork-${sourceTurnId}`, "target")).toBe(false);
+    }
+    expect(store.hasTaskHistoryTurn("fork-cycle-a", "cycle-b")).toBe(true);
+  });
+
   test("imports remote completed Turn history without replacing richer local snapshots", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);
