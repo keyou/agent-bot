@@ -26,7 +26,7 @@ export function writeAgentExecutionDefaults(
   if (existingDefaults !== undefined && !isMap(existingDefaults)) {
     throw new Error(`Configuration agents.${agentName}.defaults must contain a YAML mapping: ${configPath}`);
   }
-  if (!isMap(existingDefaults)) agent.set("defaults", {});
+  if (!isMap(existingDefaults)) agent.set("defaults", document.createNode({}));
   const target = agent.get("defaults", true);
   if (!isMap(target)) throw new Error(`Could not create defaults for Agent: ${agentName}`);
 
