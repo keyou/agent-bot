@@ -253,6 +253,8 @@ Private chats, group timelines, and topics keep separate current tasks. A new to
 
 `/release` sends a card for releasing the shared App Server used by the current task's Agent so its tasks can be opened in Codex Desktop. The card lists blocking task names and keeps them updated. Agent Bot never releases automatically: click **Release** when idle, or **Release Now** to interrupt active work and clear queued Prompts. **Cancel** cancels the pending release. Releasing does not archive or delete task history, but it affects every task loaded by that shared App Server.
 
+Topic replies check whether the root message is already in the task's history using lightweight Turn links, without loading the full history before sending the thinking card. Legacy parent links are repaired only when needed.
+
 In a group, `/mute` and `/mute on` make the bot process only messages that mention it. Mention the bot and send `/mute off` to restore automatic responses. The setting applies to every topic in that group.
 
 `/new` and `/newgroup` inherit the current Agent, project, and execution settings. Use `--dir` to choose another directory or `--nodir` to start without a project directory; `~` represents your home directory.
@@ -283,7 +285,9 @@ Set `AGENT_BOT_HOME` to use another user-data directory. See [config.example.yam
 
 Local non-image files and directories referenced in Agent replies become signed, read-only viewer links for source code, Markdown, logs, PDFs, common media files, or downward directory browsing. By default, links open only on the computer running Agent Bot. Setting `fileViewer.host` to `0.0.0.0` automatically selects a LAN address in wired, Wi-Fi, other physical, then VPN order. Use `fileViewer.publicBaseUrl` to override that address for a domain, HTTPS reverse proxy, or port mapping.
 
-Provider, model, reasoning effort, and permission choices apply to the current task and are also saved under that Agent's `defaults`. Future tasks that have no same-Agent settings to inherit start with those saved defaults; each configured Agent keeps its own values.
+Markdown previews keep table cells at their content width. Wide tables scroll horizontally within the preview instead of squeezing columns on narrow screens, and live updates preserve each table's horizontal scroll position.
+
+Provider, model, reasoning effort, and permission choices apply to the current task and are also saved under that Agent's `defaults`. If an older configuration has no `defaults` section for that Agent, it is created automatically on the first change. Future tasks that have no same-Agent settings to inherit start with those saved defaults; each configured Agent keeps its own values.
 
 `feishu.groupNameFormat` defines separate name templates for new Project and Projectless groups, with variables for the operating system, Agent, project, task name, and date. See the [technical reference](docs/technical-reference.md#configuration-model) for the complete format.
 

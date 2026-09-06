@@ -6,6 +6,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Create missing per-Agent defaults as a YAML mapping when saving model, Provider, reasoning, or permission settings in older configurations.
+- Check topic-root membership through lightweight Turn ancestry links instead of loading complete snapshots before displaying the thinking card, while retaining legacy Fork and Reset history compatibility.
+- Keep Markdown preview table columns readable on narrow screens with independent horizontal scrolling, preserving alignment and scroll positions during live updates.
+
 ## [0.1.20-alpha.0] - 2026-09-05
 
 - Require explicit confirmation on App Server release cards instead of releasing automatically, and list the currently running or queued task names while waiting.
