@@ -108,6 +108,63 @@ describe("LocalFileViewerServer", () => {
     expect(script).toContain('viewSwitch.hidden = update.viewMode !== "markdown"');
   });
 
+  test("wraps Markdown tables in scroll regions without squeezing cells or changing alignment", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "progress.md");
+    fs.writeFileSync(filePath, [
+      "| Case | Batch/backend | N | Completed/timeout | Mean/median | Calls | Input/output Token | Uncached |",
+      "|---|---|---:|---:|---:|---:|---:|---:|",
+      "| B05 | previous-online/aha | 4 | 4/0 | 370.1/379.8 | 32.8 | 2,115,023/18,382 | 67,041 |",
+      "",
+      "| Details | Status |",
+      "|---|:---:|",
+      "| **Ready** `<safe>` | [Trace](https://example.com/trace) |",
+      "",
+    ].join("\n"), "utf8");
+    const server = await startServer(directory);
+
+    const page = await (await fetch(server.createFileUrl(filePath)!)).text();
+    expect(page.match(/class="markdown-table-scroll"/gu)).toHaveLength(2);
+    expect(page.match(/<\/table><\/div>/gu)).toHaveLength(2);
+    expect(page).toContain('role="region" aria-label="Markdown 表格" tabindex="0"><table>');
+    expect(page).toContain('<td style="text-align:right">2,115,023/18,382</td>');
+    expect(page).toContain('<td style="text-align:center"><a href="https://example.com/trace">Trace</a></td>');
+    expect(page).toContain("<strong>Ready</strong> <code>&lt;safe&gt;</code>");
+    expect(page).toContain(".markdown-table-scroll { max-width: 100%; margin: 0 0 1em; overflow-x: auto; }");
+    expect(page).toContain("width: max-content; margin: 0; border-collapse: collapse; white-space: nowrap; overflow-wrap: normal; word-break: normal;");
+    expect(page).not.toContain("table { display: block; max-width: 100%");
+  });
+
+  test("streams scrollable Markdown tables with independent horizontal position restoration", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "live.md");
+    fs.writeFileSync(filePath, "| Case | Result |\n|---|---|\n| B05 | running |\n", "utf8");
+    const server = await startServer(directory);
+    const fileUrl = server.createFileUrl(filePath)!;
+    const page = await (await fetch(fileUrl)).text();
+    const eventsLink = /data-events-url="([^"]+)"/u.exec(page)![1]!.replaceAll("&amp;", "&");
+    const script = await (await fetch(new URL("/assets/viewer.js", fileUrl))).text();
+    expect(script).toContain('Array.from(content.querySelectorAll(".markdown-table-scroll"), (table) => table.scrollLeft)');
+    expect(script).toContain("table.scrollLeft = tableScrollLeft[index] ?? 0");
+    expect(script).toContain("restoreScroll(top, left, atBottom, codeScrollLeft, tableScrollLeft)");
+
+    const controller = new AbortController();
+    try {
+      const events = createServerSentEventReader(await fetch(eventsLink, { signal: controller.signal }));
+      const initial = JSON.parse(await events.next("update"));
+      expect(initial.viewMode).toBe("markdown");
+      expect(initial.content).toContain('class="markdown-table-scroll"');
+      expect(initial.content).toContain("<td>running</td>");
+      fs.appendFileSync(filePath, "| B08 | completed |\n", "utf8");
+      const update = JSON.parse(await events.next("update"));
+      expect(update.content).toContain('class="markdown-table-scroll"');
+      expect(update.content).toContain("<td>completed</td>");
+      expect(update.content).toContain('<section data-view-panel="code">');
+    } finally {
+      controller.abort();
+    }
+  }, 10_000);
+
   test("keeps absolute paths readable while escaping query delimiters", async () => {
     const directory = createTemporaryDirectory();
     const nestedDirectory = path.join(directory, "folder & notes");

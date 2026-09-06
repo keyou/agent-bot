@@ -40,6 +40,9 @@ const MARKDOWN_RENDERER = new MarkdownIt({
     return `<pre class="markdown-code-block hljs"><code${languageAttribute}>${highlighted}</code></pre>`;
   },
 });
+MARKDOWN_RENDERER.renderer.rules.table_open = () =>
+  '<div class="markdown-table-scroll" role="region" aria-label="Markdown 表格" tabindex="0"><table>\n';
+MARKDOWN_RENDERER.renderer.rules.table_close = () => '</table></div>\n';
 
 const HIGHLIGHT_LANGUAGE_BY_EXTENSION: Readonly<Record<string, string>> = {
   ".bash": "bash", ".bat": "dos", ".c": "c", ".cc": "cpp", ".cmd": "dos", ".cpp": "cpp",
@@ -133,12 +136,15 @@ const VIEWER_CLIENT_SCRIPT = `(() => {
   requestAnimationFrame(positionHashTarget);
   if (!eventsUrl || typeof EventSource !== "function") return;
 
-  const restoreScroll = (top, left, atBottom, codeScrollLeft) => {
+  const restoreScroll = (top, left, atBottom, codeScrollLeft, tableScrollLeft) => {
     requestAnimationFrame(() => {
       const maxTop = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
       window.scrollTo(left, atBottom ? maxTop : Math.min(top, maxTop));
       const code = content.querySelector(".code");
       if (code) code.scrollLeft = codeScrollLeft;
+      content.querySelectorAll(".markdown-table-scroll").forEach((table, index) => {
+        table.scrollLeft = tableScrollLeft[index] ?? 0;
+      });
     });
   };
   const replaceContent = (nextContent, nextMetadata) => {
@@ -147,11 +153,12 @@ const VIEWER_CLIENT_SCRIPT = `(() => {
     const maxTop = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
     const atBottom = maxTop - top <= 24;
     const codeScrollLeft = content.querySelector(".code")?.scrollLeft ?? 0;
+    const tableScrollLeft = Array.from(content.querySelectorAll(".markdown-table-scroll"), (table) => table.scrollLeft);
     content.innerHTML = nextContent;
     metadata.innerHTML = nextMetadata;
     syncViewMode();
     highlightHashTarget();
-    restoreScroll(top, left, atBottom, codeScrollLeft);
+    restoreScroll(top, left, atBottom, codeScrollLeft, tableScrollLeft);
   };
 
   const source = new EventSource(eventsUrl);
@@ -763,7 +770,9 @@ function renderViewerPage(input: {
     .markdown-body code { padding: .14em .35em; border-radius: 4px; background: #f2f3f5; font-family: var(--viewer-code-font); font-size: .9em; }
     .markdown-body .markdown-code-block { margin: 0 0 1em; padding: 14px 16px; overflow: auto; border-radius: 6px; background: #f6f8fa; line-height: 1.55; }
     .markdown-body .markdown-code-block code { padding: 0; background: transparent; font-size: 13px; }
-    .markdown-body table { display: block; max-width: 100%; overflow: auto; border-collapse: collapse; }
+    .markdown-table-scroll { max-width: 100%; margin: 0 0 1em; overflow-x: auto; }
+    .markdown-table-scroll:focus-visible { outline: 2px solid #1456f0; outline-offset: 2px; }
+    .markdown-body table { width: max-content; margin: 0; border-collapse: collapse; white-space: nowrap; overflow-wrap: normal; word-break: normal; }
     .markdown-body th, .markdown-body td { padding: 7px 12px; border: 1px solid #dfe3e8; text-align: left; }
     .markdown-body th { background: #f5f7fa; }
     .markdown-body img { max-width: 100%; height: auto; }
