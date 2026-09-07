@@ -110,6 +110,8 @@ agentbot task permissions [auto|confirm]
 
 Omit the value to inspect the current setting and available choices. `agent` changes the default Agent for future tasks in that conversation. The other settings affect the specified task from its next request and become the saved defaults for that Agent.
 
+Provider changes require an idle task and verify the actual Provider and model before saving. Wait for active work to finish; do not stop it without the user's request. Switching unloads only the selected thread, not the shared App Server. On failure, previous settings are retained and recovery is attempted. If recovery fails, resolve the reported configuration or ownership issue and retry the Provider switch before sending another prompt. Never replace a forked task with an empty task to work around a switch failure.
+
 ## Goals And Turns
 
 ```powershell
@@ -121,7 +123,7 @@ agentbot task turns
 agentbot task reset <turn-id>
 ```
 
-Use `turns` to obtain a real Turn ID before `reset`. Reset changes conversation context only; it does not revert local files.
+Use `turns` to obtain a real Turn ID before `reset`. Reset changes conversation context only; it does not revert local files. Agent Bot announces an interactive Reset when it starts and queues every new message after its Reaction until the replacement thread is ready.
 
 ## Files And Local Commands
 

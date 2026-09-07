@@ -6,6 +6,15 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Load only necessary Turn history on demand, keep Fork creation lightweight, and require Codex 0.153.4 or later during initialization and runtime startup.
+- Open local file and directory links in rendered Markdown through the signed local viewer.
+- Acknowledge messages arriving during Reset, then wait for the replacement thread binding before processing them.
+- Align Turn history nodes and branch connectors in fixed-width lanes independent of sequence number width, while preserving the compact graph layout.
+- Verify Provider and model changes before saving defaults, reject switches during active turns, and unload only the selected idle thread before resuming with the new Provider. Preserve fork history, handle known empty threads without missing-rollout failures, and restore the previous settings when a switch or persistence fails.
+- Keep Codex's implicit built-in OpenAI Provider available in both Feishu cards and CLI settings after switching to a custom Provider.
+- Preserve Feishu rich-text code blocks and Markdown in Agent Prompts, including quoted and merged-forwarded messages, instead of silently dropping the code.
+- Announce long-running task, Provider, history, status, file, and group operations before their first remote or cross-process call.
+
 ## [0.1.20-alpha.1] - 2026-09-06
 
 - Create missing per-Agent defaults as a YAML mapping when saving model, Provider, reasoning, or permission settings in older configurations.

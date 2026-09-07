@@ -277,11 +277,13 @@ Fork 从未绑定过 Agent Bot 的任务前，Agent Bot 会先读取不含 Turns
 
 每个 turn 只有一张进度卡。普通更新最多每两秒一次，关键更新最短间隔 500 毫秒。完成时先把进度卡更新为终态，再单独发送 Markdown 最终回答。分组思考卡片只在渲染时派生执行组，持久化的时间线活动不依赖布局，因此切换布局或 Worker 重启都不会丢失思考和工具历史。
 
-成功完成的思考卡片包含 `Reset` 操作，其作用提示紧跟在按钮下方。`/turns` 卡片把相同的作用提示放在最上方，按需从 App Server 刷新当前任务的已完成 turn，并在不覆盖 Agent Bot 富内容快照的前提下补齐缺失的本地索引，随后按时间倒序展示，每页 10 条。远端刷新会短暂缓存，卡片翻页不会重复读取同一份完整历史；刷新失败时仍使用已有本地记录。每次 `turn_started` 都会把前一个已完成 turn 保存为父节点；现有任务会结合快照时间和 `session_reset_to_turn` 审计记录回填，因此历史 Reset 后的第一轮会指向所选 turn，而不是时间上相邻的废弃路径。渲染器先基于完整历史计算 lane，再切分页面，从而跨分页正确显示延续和合并；内容缩进到第二列，状态或操作位于第三列。当前对话位置显示“当前”标记，其余 turn 提供 `Reset` 按钮。翻页和成功的 Reset 都会更新同一张卡片、保持与打开卡片时的任务绑定，并把“当前”标记移动到所选 turn；成功提示会用 Prompt 摘要、完成时间和 Turn ID 标明目标轮次。Agent Bot 会持久化每个 turn 原本所属的 App Server thread，从所选 turn fork，并替换当前任务的远端 thread 绑定；本地任务 ID、标题、Agent、项目目录、运行设置和聊天路由保持不变。所选 turn 之后已经完成的快照不会被删除，因此卡片会同时显示旧路径保留的轮次和 Reset 后新分支产生的轮次。当前任务仍在执行时会拒绝 Reset，本地文件修改也不会被回退。
+成功完成的思考卡片包含 `Reset` 操作，其作用提示紧跟在按钮下方。`/turns` 卡片把相同的作用提示放在最上方，按需从 App Server 刷新当前任务的已完成 turn，并在不覆盖 Agent Bot 富内容快照的前提下补齐缺失的本地索引，随后按时间倒序展示，每页 10 条。远端刷新会短暂缓存，卡片翻页不会重复读取同一份完整历史；刷新失败时仍使用已有本地记录。每次 `turn_started` 都会把前一个已完成 turn 保存为父节点；现有任务会结合快照时间和 `session_reset_to_turn` 审计记录回填，因此历史 Reset 后的第一轮会指向所选 turn，而不是时间上相邻的废弃路径。渲染器先基于完整历史计算 lane，再切分页面，从而跨分页正确显示延续和合并；内容缩进到第二列，状态或操作位于第三列。当前对话位置显示“当前”标记，其余 turn 提供 `Reset` 按钮。翻页和成功的 Reset 都会更新同一张卡片、保持与打开卡片时的任务绑定，并把“当前”标记移动到所选 turn；成功提示会用 Prompt 摘要、完成时间和 Turn ID 标明目标轮次。Agent Bot 会持久化每个 turn 原本所属的 App Server thread，从所选 turn fork，并替换当前任务的远端 thread 绑定；本地任务 ID、标题、Agent、项目目录、运行设置和聊天路由保持不变。所选 turn 之后已经完成的快照不会被删除，因此卡片会同时显示旧路径保留的轮次和 Reset 后新分支产生的轮次。当前任务仍在执行时会拒绝 Reset，本地文件修改也不会被回退。Reset 开始时 Agent Bot 会立即发送提示；在 Reset 完成前到达的每条消息都会先获得 Reaction，再等待新的 thread 绑定完成后继续处理。
 
 完成持久化消息去重占位后，Agent Bot 会等待 `OnIt` 表情添加成功，再进行聊天信息持久化、图片下载、队列等待、命令执行或 Runtime 调用。Turn 成功、失败或取消时分别替换为 `DONE`、`ERROR` 或 `CrossMark`。表情操作失败会记录日志，但不会阻塞任务。
 
-富文本图片会下载到输入图片缓存，并以 `localImage` 传给 App Server。纯图片消息使用默认 Prompt `请查看这张图片`。ACP Runtime 不支持图片输入时会明确报错。
+可能等待 App Server、飞书接口、进程控制或文件传输的命令，会在第一次潜在长耗时调用前先发送一句简短提示。范围包括创建与切换任务、Fork 与建群、切换 Provider、读取任务与 Turn、状态与 Goal 操作、修改标题、归档与解散群、停止任务、关闭任务占用进程和上传文件。普通 Prompt、Shell、Reset、App Server Release 和安全重启继续使用已有进度卡或专用启动提示，不重复发送通知。
+
+接收飞书富文本时，`code_block` 节点会转换为带语言标记的 Markdown 代码块，并保留原始缩进；`md` 节点会继续保留 Markdown 格式。引用消息或合并转发中的富文本也使用相同转换。富文本图片会下载到输入图片缓存，并以 `localImage` 传给 App Server。纯图片消息使用默认 Prompt `请查看这张图片`。ACP Runtime 不支持图片输入时会明确报错。
 
 ## 任务、项目与外部 App Server 工作
 
@@ -295,7 +297,7 @@ Fork 从未绑定过 Agent Bot 的任务前，Agent Bot 会先读取不含 Turns
 
 Provider 会与模型、思考强度和权限模式一起保存在任务中；每个 Agent 还可以在 `agents.<name>.defaults` 下分别保存这些默认值。新任务先读取所选 Agent 的默认值，再由显式设置或同 Agent 任务继承值覆盖。Agent Bot 会通过 `thread/start`、`thread/resume` 和 `thread/fork` 传递最终设置，并把运行时返回的实际值保存到任务。
 
-`/provider`、`/model`、`/thinking` 和 `/permissions` 打开同一张 Card 2.0 运行设置卡片，并激活对应的 tab。四个命令都拒绝参数，tab 切换和设置修改只通过卡片回调完成。Provider 选项来自 App Server 的 `config/read`；切换 Provider 时使用当前兼容的模型、思考强度和权限模式恢复 thread。每次成功修改 Provider、模型、思考强度或权限后，Agent Bot 都会更新当前任务，把完整生效设置原子写入该 Agent 在 `config.yaml` 中的默认值，就地刷新卡片，并从下一次请求生效；对应 CLI 任务设置命令使用相同的持久化路径。
+`/provider`、`/model`、`/thinking` 和 `/permissions` 打开同一张 Card 2.0 运行设置卡片，并激活对应的 tab。四个命令都拒绝参数，tab 切换和设置修改只通过卡片回调完成。Provider 选项来自 App Server 的 `config/read`；对于 Codex，即使隐式内置的 `openai` 没有出现在显式 `model_providers` 配置中，Agent Bot 也会保留该选项。切换 Provider 时使用当前兼容的模型、思考强度和权限模式恢复 thread。每次成功修改 Provider、模型、思考强度或权限后，Agent Bot 都会更新当前任务，把完整生效设置原子写入该 Agent 在 `config.yaml` 中的默认值，就地刷新卡片，并从下一次请求生效；对应 CLI 任务设置命令使用相同的持久化路径。
 
 Agent Bot 内部保留本地路由键以关联飞书卡片和投递状态，但对用户展示所属 App Server 的任务 ID。没有明确用户操作时，不会续写、steer、停止或分支其他客户端正在运行的 Agent 工作。
 

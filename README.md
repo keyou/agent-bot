@@ -270,6 +270,8 @@ Fork creation records the source task and branch Turn without synchronizing the 
 
 Ordinary tasks also load history as summary pages on demand. Task lists read only the latest Turn summary; metadata lookups do not request Turns. Status and recovery read at most the latest Turn's complete result and reuse the reconciliation result when available. Local Turn cards read the graph's IDs and timestamps, then only the visible page's Prompt summaries, without loading historical tool outputs. Codex activity detection caches unchanged rollout files and incrementally scans appended content.
 
+Turn history uses fixed-width graph lanes with separate sequence numbers, keeping nodes and branch connectors aligned without adding blank continuation rows.
+
 ## Local Commands
 
 Enter a message beginning with `!` directly in the Feishu chat box to run a local command in the current task directory.
@@ -297,6 +299,8 @@ Markdown previews keep table cells at their content width. Wide tables scroll ho
 Local links in rendered Markdown open signed viewer pages for the referenced files or directories. Relative paths resolve from the Markdown file's directory; absolute paths, `file://` URLs, and line references are supported, and local images load through the same read-only service. Web links and the original code view are unchanged. Sharing a Markdown viewer link also gives its readers access to the local paths referenced in that document, so only share trusted documents.
 
 Provider, model, reasoning effort, and permission choices apply to the current task and are also saved under that Agent's `defaults`. If an older configuration has no `defaults` section for that Agent, it is created automatically on the first change. Future tasks that have no same-Agent settings to inherit start with those saved defaults; each configured Agent keeps its own values.
+
+Provider changes require an idle task. Wait for an active turn to finish, or stop it before switching. Agent Bot unloads only the selected idle thread, resumes it with the requested Provider, and verifies the returned Provider and model before saving settings or reporting success. A known fresh, empty thread may be replaced while keeping its task identity, title, and directory; forked or resumed tasks are not treated as empty merely because they have no new messages. If a switch fails, the previous settings are retained and remote recovery is attempted. If recovery also fails, further turns are blocked until a Provider switch succeeds.
 
 `feishu.groupNameFormat` defines separate name templates for new Project and Projectless groups, with variables for the operating system, Agent, project, task name, and date. See the [technical reference](docs/technical-reference.md#configuration-model) for the complete format.
 
