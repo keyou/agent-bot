@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-09-07
+
 - Load only necessary Turn history on demand, keep Fork creation lightweight, and require Codex 0.153.4 or later during initialization and runtime startup.
 - Open local file and directory links in rendered Markdown through the signed local viewer.
 - Acknowledge messages arriving during Reset, then wait for the replacement thread binding before processing them.

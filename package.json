@@ -1,6 +1,6 @@
 {
   "name": "@keyou007/agent-bot",
-  "version": "0.1.20-alpha.1",
+  "version": "0.1.20",
   "type": "module",
   "description": "Use Codex, TraeX, and compatible coding agents from Lark/Feishu.",
   "license": "GPL-3.0-only",
