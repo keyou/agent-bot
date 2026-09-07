@@ -83,7 +83,26 @@ describe("Markdown file links", () => {
     expect(createUrl).not.toHaveBeenCalled();
   });
 
-  test.each(["file:///bad%00name", "file:///bad%ZZname", "file:///bad%2Fname"])("never emits invalid file URLs: %s", (target) => {
+  test("preserves literal percent signs escaped by the Markdown parser", () => {
+    const filePath = path.resolve("bad%ZZname");
+    const target = pathToFileURL(filePath).href.replace("%25ZZ", "%ZZ");
+    const { html, createUrl } = fixture(`[Report](${target})`);
+    expect(createUrl).toHaveBeenCalledWith(filePath);
+    expect(html).not.toContain('href="file:');
+  });
+
+  test("rejects malformed percent escapes in unnormalized file URL tokens", () => {
+    const renderer = new MarkdownIt();
+    const tokens = renderer.parse("[Invalid](report.md)", {});
+    const link = tokens[1]!.children!.find((token) => token.type === "link_open")!;
+    link.attrSet("href", pathToFileURL(path.resolve("bad%ZZname")).href.replace("%25ZZ", "%ZZ"));
+    const createUrl = vi.fn(() => new URL("https://viewer.example/preview/token"));
+    rewriteMarkdownFileLinks(tokens, path.resolve("index.md"), createUrl);
+    expect(createUrl).not.toHaveBeenCalled();
+    expect(link.attrGet("href")).toBeNull();
+  });
+
+  test.each(["file:///bad%00name", "file:///bad%2Fname"])("never emits invalid file URLs: %s", (target) => {
     const { html, createUrl } = fixture(`[Invalid](${target})`);
     expect(html).not.toContain('href="file:');
     expect(createUrl).not.toHaveBeenCalled();
