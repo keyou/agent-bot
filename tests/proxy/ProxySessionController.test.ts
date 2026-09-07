@@ -1424,8 +1424,10 @@ describe("ProxySessionController", () => {
     expect(firstSerialized).toContain("✅ 当前");
     expect(firstSerialized).toContain("Prompt 12");
     expect(firstSerialized).toContain("Prompt 3");
-    expect(firstSerialized).toContain("<font color='green'>● 1</font>");
-    expect(firstSerialized).toContain("<font color='blue'>● 2</font>");
+    expect(firstSerialized).toContain("<font color='green'>●</font>");
+    expect(firstSerialized).toContain("<font color='green'>1</font>");
+    expect(firstSerialized).toContain("<font color='blue'>●</font>");
+    expect(firstSerialized).toContain("<font color='blue'>2</font>");
     expect(firstSerialized).not.toContain("**1. Prompt 12**");
     expect(firstSerialized).not.toContain("Prompt 2");
     expect(firstSerialized).toContain('"action":"turn_reset_page"');

@@ -1531,18 +1531,9 @@ export class CardRenderer {
     if (view.entries.length === 0) {
       elements.push(markdown("当前任务还没有成功完成的 turn。"));
     } else {
+      const sequenceWidth = `${Math.max(16, ...view.entries.map((entry) => String(entry.sequence).length * 10))}px`;
       view.entries.forEach((entry) => {
-        const action = entry.actions?.[0];
-        elements.push(resetHistoryEntryRow(
-          entry.graphNodeLine,
-          entry.graphConnectorLine,
-          entry.lines,
-          entry.timestamp,
-          action,
-          entry.current === true,
-          entry.running === true,
-          entry.resetting === true,
-        ));
+        elements.push(resetHistoryEntryRow(entry, sequenceWidth));
       });
     }
     if (view.footerLines.length > 0) {
@@ -2825,24 +2816,31 @@ function settingsOptionRow(input: {
 }
 
 function resetHistoryEntryRow(
-  graphNodeLine: string,
-  graphConnectorLine: string | undefined,
-  lines: string[],
-  timestamp: string | undefined,
-  action: TaskListCardAction | undefined,
-  current: boolean,
-  running: boolean,
-  resetting: boolean,
+  entry: ResetHistoryCardEntry,
+  sequenceWidth: string,
 ): Record<string, unknown> {
+  const { graphNodeLine, graphConnectorLine, lines, timestamp, current, running, resetting } = entry;
+  const action = entry.actions?.[0];
   const branchConnectorLine = graphConnectorLine && /[╱╲]/u.test(graphConnectorLine)
     ? graphConnectorLine
     : undefined;
-  const graph = [
-    `<font color='${current ? "green" : running || resetting ? "orange" : "blue"}'>${escapeCardHtml(graphNodeLine)}</font>`,
-    ...(branchConnectorLine
-      ? [`<font color='grey'>${escapeCardHtml(branchConnectorLine)}</font>`]
-      : []),
-  ].join("\n");
+  const color = current ? "green" : running || resetting ? "orange" : "blue";
+  const nodeLanes = graphNodeLine.match(/[●│]/gu) ?? [];
+  const connectorLanes = branchConnectorLine?.split(" ");
+  // Each lane has its own center; shorter connectors and wider turn numbers cannot shift it.
+  const graphColumns = nodeLanes.map((node, lane) => ({
+    tag: "column",
+    width: "16px",
+    vertical_align: "top",
+    padding: "0px",
+    elements: [{
+      ...markdown([
+        `<font color='${color}'>${node}</font>`,
+        ...(connectorLanes?.[lane] ? [`<font color='grey'>${escapeCardHtml(connectorLanes[lane])}</font>`] : []),
+      ].join("\n")),
+      text_align: "center",
+    }],
+  }));
   const trailingElements = current
     ? [markdown("✅ 当前")]
     : resetting
@@ -2863,8 +2861,20 @@ function resetHistoryEntryRow(
         width: "auto",
         vertical_align: "top",
         elements: [{
-          ...markdown(graph),
-          text_align: "center",
+          tag: "column_set",
+          flex_mode: "none",
+          horizontal_spacing: "0px",
+          horizontal_align: "left",
+          columns: [
+            ...graphColumns,
+            {
+              tag: "column",
+              width: sequenceWidth,
+              vertical_align: "top",
+              padding: "0px",
+              elements: [{ ...markdown(`<font color='${color}'>${entry.sequence}</font>`), text_align: "left" }],
+            },
+          ],
         }],
       },
       {

@@ -1228,20 +1228,22 @@ describe("CardRenderer", () => {
       footerLines: ["第 1/1 页 · 共 2 个已完成 turn"],
       pageActions: [],
     });
-    const rows = collectObjects(card).filter((item) =>
+    const elements = (card as { body: { elements: Array<Record<string, unknown>> } }).body.elements;
+    const rows = elements.filter((item) =>
       item.tag === "column_set"
       && item.flex_mode === "none"
       && Array.isArray(item.columns)
       && item.columns.length === 3);
-    const elements = (card as { body: { elements: Array<Record<string, unknown>> } }).body.elements;
 
     expect(rows).toHaveLength(2);
     expect(elements[0]).toMatchObject({ tag: "markdown", text_size: "notation" });
     expect(String(elements[0]?.content)).toContain("不会回退本地文件");
     expect(elements[1]).toEqual({ tag: "hr" });
-    expect(JSON.stringify(rows[0])).toContain("<font color='green'>● 1</font>");
+    expect(JSON.stringify(rows[0])).toContain("<font color='green'>●</font>");
+    expect(JSON.stringify(rows[0])).toContain("<font color='green'>1</font>");
     expect(JSON.stringify(rows[0])).not.toContain("<font color='grey'>│</font>");
-    expect(JSON.stringify(rows[1])).toContain("<font color='blue'>● 2</font>");
+    expect(JSON.stringify(rows[1])).toContain("<font color='blue'>●</font>");
+    expect(JSON.stringify(rows[1])).toContain("<font color='blue'>2</font>");
     expect(JSON.stringify(rows[1])).not.toContain("<font color='grey'>│</font>");
     const promptContents = rows.map((row) => {
       const columns = row.columns as Array<{ elements?: Array<Record<string, unknown>> }>;
@@ -1274,8 +1276,41 @@ describe("CardRenderer", () => {
     });
     const serialized = JSON.stringify(card);
 
-    expect(serialized).toContain("<font color='blue'>│ ● 1</font>");
-    expect(serialized).toContain("<font color='grey'>│ ╱</font>");
+    expect(serialized).toContain("<font color='blue'>│</font>");
+    expect(serialized).toContain("<font color='blue'>●</font>");
+    expect(serialized).toContain("<font color='grey'>│</font>");
+    expect(serialized).toContain("<font color='grey'>╱</font>");
+  });
+
+  test("aligns branch connectors in fixed lanes independently of turn number width", () => {
+    const card = new CardRenderer().renderResetHistoryCard({
+      entries: [{
+        sequence: 9, graphNodeLine: "│ ● 9", graphConnectorLine: "│ ╱", lines: ["Branch prompt"],
+      }, {
+        sequence: 10, graphNodeLine: "● │ 10", graphConnectorLine: "╲ │", lines: ["Another branch"],
+      }, {
+        sequence: 100, graphNodeLine: "│ │ ● 100", graphConnectorLine: "│ │ ╱", lines: ["Deep branch"],
+      }],
+      footerLines: [], pageActions: [],
+    });
+    const graphs = collectObjects(card)
+      .filter((element) => element.tag === "column_set" && element.horizontal_spacing === "0px")
+      .map((row) => row.columns as Array<{
+        width: string; elements: Array<{ content: string; text_align: string }>;
+      }>);
+    expect(graphs.map((columns) => columns.map((column) => column.width))).toEqual([
+      ["16px", "16px", "30px"], ["16px", "16px", "30px"], ["16px", "16px", "16px", "30px"],
+    ]);
+    expect(graphs.map((columns) => columns.slice(0, -1).map((column) => column.elements[0]!.content))).toEqual([
+      ["<font color='blue'>│</font>\n<font color='grey'>│</font>", "<font color='blue'>●</font>\n<font color='grey'>╱</font>"],
+      ["<font color='blue'>●</font>\n<font color='grey'>╲</font>", "<font color='blue'>│</font>\n<font color='grey'>│</font>"],
+      ["<font color='blue'>│</font>\n<font color='grey'>│</font>", "<font color='blue'>│</font>\n<font color='grey'>│</font>",
+        "<font color='blue'>●</font>\n<font color='grey'>╱</font>"],
+    ]);
+    for (const columns of graphs) {
+      expect(columns.slice(0, -1).every((column) => column.elements[0]?.text_align === "center")).toBe(true);
+      expect(columns.at(-1)?.elements[0]?.text_align).toBe("left");
+    }
   });
 
   test("renders a running turn without a Reset action", () => {
@@ -1293,7 +1328,7 @@ describe("CardRenderer", () => {
     });
     const serialized = JSON.stringify(card);
 
-    expect(serialized).toContain("<font color='orange'>● 1</font>");
+    expect(serialized).toContain("<font color='orange'>●</font>");
     expect(serialized).toContain("Active prompt <font color='grey'>08/03 10:00</font>");
     expect(serialized).not.toContain("turn_active");
     expect(serialized).toContain("⏳ 运行中");
@@ -1320,12 +1355,13 @@ describe("CardRenderer", () => {
     });
     const serialized = JSON.stringify(card);
 
-    expect(serialized).toContain("<font color='orange'>● 1</font>");
+    expect(serialized).toContain("<font color='orange'>●</font>");
     expect(serialized).toContain("⏳ 正在 Reset");
     expect(serialized).toContain("正在 Reset 到所选轮次，请稍候…");
     expect(serialized).not.toContain('"action":"turn_reset"');
     expect(serialized).toContain('"action":"turn_reset_page"');
-    const rows = collectObjects(card).filter((item) => item.tag === "column_set" && item.flex_mode === "none");
+    const rows = ((card.body as { elements: Array<Record<string, unknown>> }).elements)
+      .filter((item) => item.tag === "column_set" && item.flex_mode === "none");
     expect(rows).toHaveLength(2);
     expect((rows[1]?.columns as unknown[])).toHaveLength(2);
   });
