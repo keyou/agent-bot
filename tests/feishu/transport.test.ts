@@ -486,6 +486,7 @@ test("extracts text and de-duplicated images from a rich-text message", async ()
           title: "截图问题",
           content: [
             [{ tag: "at", user_id: "ou_bot" }, { tag: "text", text: "请检查 " }, { tag: "a", text: "这个页面" }],
+            [{ tag: "code_block", language: "PYTHON", text: "ref = \"n16\"\nlocator = bu.css(\"input[type=input_email]\")\ntarget = ref or locator  # Prefer ref if known.\nbu.click(target)" }],
             [{ tag: "img", image_key: "img_first" }, { tag: "img", image_key: "img_first" }],
             [{ tag: "text", text: "以及第二张" }, { tag: "img", image_key: "img_second" }],
           ],
@@ -501,8 +502,45 @@ test("extracts text and de-duplicated images from a rich-text message", async ()
     chatId: "oc_post",
     chatType: "p2p",
     userId: "ou_post",
-    text: "截图问题\n请检查 这个页面\n以及第二张",
+    text: "截图问题\n请检查 这个页面\n```python\nref = \"n16\"\nlocator = bu.css(\"input[type=input_email]\")\ntarget = ref or locator  # Prefer ref if known.\nbu.click(target)\n```\n以及第二张",
     images: [{ imageKey: "img_first" }, { imageKey: "img_second" }],
+  }));
+});
+
+test("preserves markdown elements in rich-text messages", async () => {
+  const config = {
+    feishu: {
+      transport: "sdk",
+      appId: "cli_app",
+      appSecret: "secret",
+      useConsoleWhenMissingCredentials: true,
+    },
+  } as AppConfig;
+  const handler = { onMessage: vi.fn(), onCardAction: vi.fn() };
+  const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+  const connector = new FeishuConnector(config, handler, logger);
+
+  await connector.start();
+  await larkSdkMock.handlers["im.message.receive_v1"]({
+    message: {
+      message_id: "om_post_md",
+      chat_id: "oc_post_md",
+      message_type: "post",
+      content: JSON.stringify({
+        title: "",
+        content_v2: [[{ tag: "md", text: "Use `ref` first.\n\n- fallback to locator" }]],
+      }),
+    },
+    sender: { sender_id: { open_id: "ou_post_md" } },
+  });
+
+  await vi.waitFor(() => expect(handler.onMessage).toHaveBeenCalledWith({
+    messageId: "om_post_md",
+    contextKey: "chat_id:oc_post_md",
+    chatId: "oc_post_md",
+    chatType: "p2p",
+    userId: "ou_post_md",
+    text: "Use `ref` first.\n\n- fallback to locator",
   }));
 });
 

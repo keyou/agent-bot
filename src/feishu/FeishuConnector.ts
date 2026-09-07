@@ -3,7 +3,7 @@ import type { WSClient as LarkWsClient, WSConnectionStatus } from "@larksuiteoap
 import type { AppConfig } from "../config/schema.js";
 import { threadContextKey } from "./contextKey.js";
 import { resolveFeishuBotOpenId } from "./FeishuBotIdentity.js";
-import { normalizeFeishuPostText } from "./InboundText.js";
+import { normalizeFeishuPostText, renderFeishuCodeBlock } from "./InboundText.js";
 import { allowsFeishuUser } from "./ownerAccess.js";
 import type { CardAction, ChatUpdatedEvent, FeishuEventHandler, IncomingMessage } from "./types.js";
 
@@ -327,19 +327,29 @@ function parseMessageContent(
   const title = typeof locale.title === "string" ? normalizeFeishuPostText(locale.title) : "";
   if (title) paragraphs.push(title);
   const images: string[] = [];
-  if (Array.isArray(locale.content)) {
-    for (const row of locale.content) {
+  const rows = Array.isArray(locale.content) ? locale.content : locale.content_v2;
+  if (Array.isArray(rows)) {
+    for (const row of rows) {
       if (!Array.isArray(row)) continue;
       let rowText = "";
+      let preserveFormatting = false;
       for (const element of row) {
         if (!isRecord(element)) continue;
         if ((element.tag === "text" || element.tag === "a") && typeof element.text === "string") {
           rowText += element.text;
+        } else if (element.tag === "md" && typeof element.text === "string") {
+          rowText += element.text;
+          preserveFormatting = true;
+        } else if (element.tag === "code_block" && typeof element.text === "string") {
+          rowText += renderFeishuCodeBlock(element.text, element.language);
+          preserveFormatting = true;
         } else if (element.tag === "img" && typeof element.image_key === "string") {
           images.push(element.image_key);
         }
       }
-      const normalizedRow = normalizeFeishuPostText(rowText);
+      const normalizedRow = preserveFormatting
+        ? rowText.replace(/\r\n?/gu, "\n").trim()
+        : normalizeFeishuPostText(rowText);
       if (normalizedRow) paragraphs.push(normalizedRow);
     }
   }
@@ -347,7 +357,7 @@ function parseMessageContent(
 }
 
 function selectPostLocale(content: Record<string, unknown>): Record<string, unknown> | undefined {
-  if (Array.isArray(content.content)) return content;
+  if (Array.isArray(content.content) || Array.isArray(content.content_v2)) return content;
   for (const locale of ["zh_cn", "en_us", "ja_jp"]) {
     if (isRecord(content[locale])) return content[locale];
   }

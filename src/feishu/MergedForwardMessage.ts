@@ -1,4 +1,4 @@
-import { normalizeFeishuPostText } from "./InboundText.js";
+import { normalizeFeishuPostText, renderFeishuCodeBlock } from "./InboundText.js";
 
 export const MAX_MERGED_FORWARD_PROMPT_CHARS = 48_000;
 
@@ -266,10 +266,12 @@ function renderPost(
   const paragraphs: string[] = [];
   const title = normalizeFeishuPostText(textValue(locale.title));
   if (title) paragraphs.push(title);
-  if (!Array.isArray(locale.content)) return paragraphs.join("\n");
-  for (const row of locale.content) {
+  const rows = Array.isArray(locale.content) ? locale.content : locale.content_v2;
+  if (!Array.isArray(rows)) return paragraphs.join("\n");
+  for (const row of rows) {
     if (!Array.isArray(row)) continue;
     let rowText = "";
+    let preserveFormatting = false;
     for (const rawElement of row) {
       if (!isRecord(rawElement)) continue;
       const tag = textValue(rawElement.tag);
@@ -279,6 +281,12 @@ function renderPost(
         const text = textValue(rawElement.text);
         const href = textValue(rawElement.href);
         rowText += href && href !== text ? `${text || href} (${href})` : text || href;
+      } else if (tag === "md") {
+        rowText += textValue(rawElement.text);
+        preserveFormatting = true;
+      } else if (tag === "code_block") {
+        rowText += renderFeishuCodeBlock(textValue(rawElement.text), rawElement.language);
+        preserveFormatting = true;
       } else if (tag === "at") {
         rowText += renderMention(rawElement, mentions);
       } else if (tag === "img") {
@@ -287,7 +295,9 @@ function renderPost(
         rowText += "[媒体]";
       }
     }
-    const normalized = normalizeFeishuPostText(rowText);
+    const normalized = preserveFormatting
+      ? rowText.replace(/\r\n?/gu, "\n").trim()
+      : normalizeFeishuPostText(rowText);
     if (normalized) paragraphs.push(normalized);
   }
   return paragraphs.join("\n");
@@ -314,7 +324,7 @@ function replaceMentions(text: string, mentions: MergedForwardMessageItem["menti
 }
 
 function selectPostLocale(content: Record<string, unknown>): Record<string, unknown> | undefined {
-  if (Array.isArray(content.content)) return content;
+  if (Array.isArray(content.content) || Array.isArray(content.content_v2)) return content;
   for (const locale of ["zh_cn", "en_us", "ja_jp"]) {
     if (isRecord(content[locale])) return content[locale];
   }

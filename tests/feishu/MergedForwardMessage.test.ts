@@ -130,9 +130,11 @@ describe("merged-forward message rendering", () => {
         { tag: "text", text: "截图：" },
         { tag: "img", image_key: "img_post" },
         { tag: "a", text: "Pull request", href: "https://github.com/example/project/pull/1" },
+      ], [
+        { tag: "code_block", language: "TYPESCRIPT", text: "const answer = 42;" },
       ]] } }) },
     }])).toMatchObject({
-      text: "[消息类型：富文本]\n截图：[图片 1]Pull request (https://github.com/example/project/pull/1)",
+      text: "[消息类型：富文本]\n截图：[图片 1]Pull request (https://github.com/example/project/pull/1)\n```typescript\nconst answer = 42;\n```",
       images: [{ messageId: "om_post", imageKey: "img_post" }],
     });
 
