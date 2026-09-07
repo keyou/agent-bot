@@ -27,6 +27,7 @@ Agent Bot runs on your computer and connects a Feishu bot to your local coding a
 
 - Node.js 22 or later
 - At least one supported App Server Agent: Codex or TraeX
+- Codex 0.153.4 or later when using Codex (TraeX and ACP Agents have separate versions)
 - A completed local login for the Agent you plan to use
 
 Check the installed Agents and their login status:
@@ -60,6 +61,8 @@ agentbot init
 ```
 
 Initialization detects Codex and TraeX and reports their installed versions. Missing or outdated Agents are listed with the appropriate install or upgrade commands. Agent Bot saves its configuration to `~/.agent-bot/config.yaml`.
+
+Codex's minimum supported version is checked locally even when the npm registry is unavailable. An older Codex cannot be selected during fresh setup; existing Profiles using it must upgrade before initialization continues. The runtime also checks the actual App Server version at startup and reports an upgrade instruction instead of using legacy full-history fallbacks. Run `codex update` (or `npm install -g @openai/codex@latest`), then safely restart Agent Bot.
 
 In an interactive terminal, initialization uses a guided flow for Agent selection, Lark bot creation, and permissions. After the ordinary one-click authorization is complete, the wizard asks how group messages should be handled. The final permission that requires manually publishing an app version appears only when receiving every group message is selected.
 
@@ -263,6 +266,10 @@ In a group, `/mute` and `/mute on` make the bot process only messages that menti
 
 `/fork` and `/forkgroup` branch from completed work without interrupting a running turn. `/sessions` manages tasks across projects in pages of up to 10 tasks; use each project menu for `New` and `NewGroup`. Expanding a task directly shows the first 50 characters of its latest user Prompt, its update time, and task-specific actions. `/turns` restores conversation context without reverting local files.
 
+Fork creation records the source task and branch Turn without synchronizing the local history list. Agent-side conversation inheritance is unchanged. Opening `/turns` reuses local history first and requests only the Turn-summary pages needed for the selected card page, bounded by the branch Turn. Older history is loaded only when needed for later pages; `agentbot task turns` loads the first page if necessary and returns the available local records. Failed history reads remain retryable, and Agents without summary pagination do not trigger a full-history fallback.
+
+Ordinary tasks also load history as summary pages on demand. Task lists read only the latest Turn summary; metadata lookups do not request Turns. Status and recovery read at most the latest Turn's complete result and reuse the reconciliation result when available. Local Turn cards read the graph's IDs and timestamps, then only the visible page's Prompt summaries, without loading historical tool outputs. Codex activity detection caches unchanged rollout files and incrementally scans appended content.
+
 ## Local Commands
 
 Enter a message beginning with `!` directly in the Feishu chat box to run a local command in the current task directory.
@@ -286,6 +293,8 @@ Set `AGENT_BOT_HOME` to use another user-data directory. See [config.example.yam
 Local non-image files and directories referenced in Agent replies become signed, read-only viewer links for source code, Markdown, logs, PDFs, common media files, or downward directory browsing. By default, links open only on the computer running Agent Bot. Setting `fileViewer.host` to `0.0.0.0` automatically selects a LAN address in wired, Wi-Fi, other physical, then VPN order. Use `fileViewer.publicBaseUrl` to override that address for a domain, HTTPS reverse proxy, or port mapping.
 
 Markdown previews keep table cells at their content width. Wide tables scroll horizontally within the preview instead of squeezing columns on narrow screens, and live updates preserve each table's horizontal scroll position.
+
+Local links in rendered Markdown open signed viewer pages for the referenced files or directories. Relative paths resolve from the Markdown file's directory; absolute paths, `file://` URLs, and line references are supported, and local images load through the same read-only service. Web links and the original code view are unchanged. Sharing a Markdown viewer link also gives its readers access to the local paths referenced in that document, so only share trusted documents.
 
 Provider, model, reasoning effort, and permission choices apply to the current task and are also saved under that Agent's `defaults`. If an older configuration has no `defaults` section for that Agent, it is created automatically on the first change. Future tasks that have no same-Agent settings to inherit start with those saved defaults; each configured Agent keeps its own values.
 

@@ -96,6 +96,8 @@ agentbot task forkgroup [title]
 
 Choose `new` or `newgroup` for fresh context. Choose `fork` or `forkgroup` when the new task must retain conversation history through the latest completed Turn. Forking must not interrupt an active source turn.
 
+Fork creation stores source-task and branch-Turn references without synchronizing the full local Turn list. The Feishu Turn card reuses local records and loads only the summary pages needed for the requested page, not the entire history. `task turns` loads the first page if necessary and returns available local records. This does not change the Agent's inherited context. Retry listing Turns after a temporary history-read failure; unsupported summary pagination never falls back to downloading full history.
+
 ## Change Settings
 
 ```powershell
@@ -167,6 +169,8 @@ agentbot --profile ~/.agent-bot-rescue server status
 ```
 
 Initialization prepares configuration, checks supported Agents, configures Feishu, and starts the server. On first initialization and `init --reset`, let the user choose whether all group messages are accepted or an explicit @ mention is required; only the first choice requests the additional all-group-message permission. Relay authorization links and wait for the user; never choose a response mode, skip authorization, or choose maintenance actions without permission.
+
+Codex requires version 0.153.4 or later. Init checks this locally, and runtime startup validates the actual App Server version. For an unsupported version, show the upgrade instruction (`codex update` or `npm install -g @openai/codex@latest`); do not work around it by reading full history through legacy APIs. Safely restart Agent Bot after an authorized upgrade. This version requirement does not apply to TraeX or ACP Agents.
 
 Use `init --reset` only for an explicitly requested full reset. Without `--profile` it resets the default Profile; pass `--profile <directory>` to reset another Profile. It preserves backups under `.reset-backups`.
 
