@@ -254,7 +254,12 @@ export interface AgentRuntime {
   setModel(sessionId: string, model: string): Promise<void>;
   setReasoningEffort(sessionId: string, effort: string): Promise<void>;
   setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void>;
-  setExecutionSettings?(sessionId: string, settings: RuntimeExecutionSettings): Promise<RuntimeSession>;
+  setExecutionSettings?(
+    sessionId: string,
+    settings: RuntimeExecutionSettings,
+    // Called after remote verification, before releasing the task's operation lock.
+    persist?: (session: RuntimeSession) => Promise<void>,
+  ): Promise<RuntimeSession>;
   respondToApproval(sessionId: string, requestId: string, decision: ApprovalDecision): Promise<void>;
   listModels(): Promise<ModelOption[]>;
   listModelProviders?(): Promise<ModelProviderOption[]>;

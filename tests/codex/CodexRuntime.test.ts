@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import type { RuntimeEvent, RuntimeGoal } from "../../src/runtime/types.js";
+import type { RuntimeEvent, RuntimeExecutionSettings, RuntimeGoal } from "../../src/runtime/types.js";
 import { AppServerRequestError } from "../../src/codex/AppServerConnection.js";
 import { CodexRuntime, type AppServerClientProvider } from "../../src/codex/CodexRuntime.js";
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
@@ -826,6 +826,7 @@ describe("CodexRuntime", () => {
       { id: "openai", displayName: "OpenAI", isDefault: true },
       { id: "azure", displayName: "Azure OpenAI" },
     ]);
+    client.readResult = { thread: { id: "thr_settings", preview: "existing task", status: { type: "idle" } } };
     const session = await runtime.setExecutionSettings("settings", {
       modelProvider: "azure",
       model: "gpt-test",
@@ -849,6 +850,45 @@ describe("CodexRuntime", () => {
       reasoningEffort: "high",
       permissionMode: "confirm",
     });
+  });
+
+  test("keeps the built-in OpenAI Provider available beside custom Codex Providers", async () => {
+    const client = new FakeAppServerClient();
+    client.configResult = {
+      config: {
+        model_providers: {
+          ai_coding: { name: "AI Coding" },
+        },
+      },
+    };
+    const runtime = new CodexRuntime({
+      ...provider(client),
+      getAgentFamily: () => "codex",
+    }, logger());
+
+    await expect(runtime.listModelProviders()).resolves.toEqual([
+      { id: "openai", displayName: "OpenAI", isDefault: true },
+      { id: "ai_coding", displayName: "AI Coding" },
+    ]);
+  });
+
+  test("does not add the Codex OpenAI Provider to TraeX", async () => {
+    const client = new FakeAppServerClient();
+    client.configResult = {
+      config: {
+        model_providers: {
+          trae: { name: "Trae" },
+        },
+      },
+    };
+    const runtime = new CodexRuntime({
+      ...provider(client),
+      getAgentFamily: () => "traex",
+    }, logger());
+
+    await expect(runtime.listModelProviders()).resolves.toEqual([
+      { id: "trae", displayName: "Trae" },
+    ]);
   });
 
   test("resume ignores history and historical notifications", async () => {
@@ -1671,15 +1711,189 @@ describe("CodexRuntime", () => {
   });
 });
 
+describe("Provider switching", () => {
+  const target: RuntimeExecutionSettings = {
+    modelProvider: "azure", model: "gpt-test", reasoningEffort: "high", permissionMode: "confirm",
+  };
+  const oldResponse = { thread: { id: "thr_1" }, modelProvider: "openai", model: "gpt-test" };
+  const targetResponse = { ...oldResponse, modelProvider: "azure" };
+  async function setup(empty = false) {
+    const client = new FakeAppServerClient();
+    client.startResult = oldResponse;
+    client.resumeResult = targetResponse;
+    client.readResult = { thread: { id: "thr_1", preview: empty ? "" : "previous prompt", status: { type: "idle" } } };
+    const runtime = new CodexRuntime(provider(client), logger());
+    const session = await runtime.createSession({ localSessionId: "s", agentName: "codex", cwd: process.cwd(),
+      modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto", title: "Original" });
+    client.requests = [];
+    return { client, runtime, session };
+  }
+
+  test("unloads idle history before resuming and does not read turn contents", async () => {
+    const { client, runtime, session } = await setup();
+    const persist = vi.fn(async () => { expect(session.modelProvider).toBe("openai"); });
+    await runtime.setExecutionSettings("s", target, persist);
+    expect(client.requests.map((r) => r.method)).toEqual([
+      "thread/read", "thread/read", "thread/unsubscribe", "thread/resume",
+    ]);
+    expect(client.requests.at(-1)?.params).toMatchObject({ threadId: "thr_1", excludeTurns: true, modelProvider: "azure" });
+    expect(persist).toHaveBeenCalledWith(expect.objectContaining({ ...target, remoteSessionId: "thr_1" }));
+    expect(session).toMatchObject(target);
+  });
+
+  test("replaces only a proven empty thread and waits for persistence before starting a turn", async () => {
+    const { client, runtime, session } = await setup(true);
+    client.startResult = { ...targetResponse, thread: { id: "replacement" } };
+    let finish!: () => void;
+    const persisted = new Promise<void>((resolve) => { finish = resolve; });
+    const persist = vi.fn(async () => persisted);
+    const switching = runtime.setExecutionSettings("s", target, persist);
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
+    expect(session.remoteSessionId).toBe("thr_1");
+    expect(await runtime.release()).toEqual({ status: "busy", activeSessionIds: ["s"] });
+    const starting = runtime.startTurn("s", "next prompt");
+    expect(client.requests.some((r) => r.method === "turn/start")).toBe(false);
+    finish();
+    await switching;
+    await starting;
+    expect(client.requests).toContainEqual({ method: "thread/turns/list", params: {
+      threadId: "thr_1", limit: 1, sortDirection: "desc", itemsView: "summary",
+    } });
+    expect(client.requests).toContainEqual({ method: "thread/name/set", params: { threadId: "replacement", name: "Original" } });
+    expect(client.requests).toContainEqual({ method: "thread/unsubscribe", params: { threadId: "thr_1" } });
+    expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: {
+      threadId: "replacement", model: "gpt-test", effort: "high", approvalPolicy: "on-request",
+    } });
+    expect(session).toMatchObject({ ...target, remoteSessionId: "replacement", title: "Original", cwd: process.cwd() });
+  });
+
+  test.each(["local", "remote"])("refuses an active %s turn without detaching", async (kind) => {
+    const { client, runtime, session } = await setup();
+    if (kind === "local") session.activeTurnId = "running";
+    else client.readResult = { thread: { id: "thr_1", status: { type: "active" } } };
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow("当前任务正在执行");
+    expect(client.requests.every((r) => r.method === "thread/read")).toBe(true);
+  });
+
+  test("rechecks active status immediately before unloading", async () => {
+    const { client, runtime } = await setup();
+    client.readResults.push(
+      { thread: { id: "thr_1", preview: "history", status: { type: "idle" } } },
+      { thread: { id: "thr_1", status: { type: "active" } } },
+    );
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow("当前任务正在执行");
+    expect(client.requests.some((r) => r.method === "thread/unsubscribe")).toBe(false);
+  });
+
+  test.each(["fork", "resume"])("does not replace a %s thread without its own message", async (kind) => {
+    const { client, runtime } = await setup(true);
+    client.forkResult = oldResponse;
+    client.resumeResult = oldResponse;
+    const input = { localSessionId: "inherited", remoteSessionId: "source", agentName: "codex",
+      cwd: process.cwd(), permissionMode: "auto" as const, modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium" };
+    if (kind === "fork") await runtime.forkSession({ ...input, lastTurnId: "inherited-turn" });
+    else await runtime.resumeSession(input);
+    client.resumeResults.push(new AppServerRequestError("thread/resume", -32600, "invalid paginated history lineage: missing source rollout"));
+    client.requests = [];
+    await expect(runtime.setExecutionSettings("inherited", target)).rejects.toThrow("missing source rollout");
+    expect(client.requests.some((r) => r.method === "thread/start" || r.method === "thread/turns/list")).toBe(false);
+    expect(runtime.getSession("inherited")?.remoteSessionId).toBe("thr_1");
+  });
+
+  test.each([
+    ["old Provider", oldResponse, "Provider 未生效"],
+    ["fallback model", { ...targetResponse, model: "different" }, "模型未生效"],
+    ["unsupported model", new AppServerRequestError("thread/resume", -1, "model gpt-test is not supported"), "不支持当前模型"],
+    ["authentication", new AppServerRequestError("thread/resume", -1, "authentication failed"), "配置和认证"],
+    ["active writer", new AppServerRequestError("thread/resume", -1, "thread already has an active writer"), "原客户端释放任务"],
+  ])("rejects %s and restores the old Provider without persisting", async (_name, response, expected) => {
+    const { client, runtime, session } = await setup();
+    client.resumeResults.push(response, oldResponse);
+    const persist = vi.fn();
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow(String(expected));
+    expect(persist).not.toHaveBeenCalled();
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto" });
+    expect(client.requests.at(-1)).toMatchObject({ method: "thread/resume", params: { modelProvider: "openai" } });
+    expect(client.requests.some((r) => r.method === "thread/start")).toBe(false);
+  });
+
+  test.each([true, false])("preserves settings on persistence failure (empty=%s)", async (empty) => {
+    const { client, runtime, session } = await setup(empty);
+    client.startResult = { ...targetResponse, thread: { id: "unused" } };
+    client.resumeResults.push(targetResponse, oldResponse);
+    await expect(runtime.setExecutionSettings("s", target, async () => { throw new Error("disk full"); })).rejects.toThrow("disk full");
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
+    if (empty) expect(client.requests.at(-1)).toEqual({ method: "thread/unsubscribe", params: { threadId: "unused" } });
+    else expect(client.requests.at(-1)).toMatchObject({ method: "thread/resume", params: { modelProvider: "openai" } });
+  });
+
+  test("blocks the next turn after failed recovery until settings are verified again", async () => {
+    const { client, runtime } = await setup();
+    client.resumeResults.push(oldResponse, new Error("restore failed"));
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow("远端恢复失败");
+    await expect(runtime.startTurn("s", "do not use uncertain settings")).rejects.toThrow("远端恢复失败");
+    expect(client.requests.some((r) => r.method === "turn/start")).toBe(false);
+    await runtime.setExecutionSettings("s", target);
+    await expect(runtime.startTurn("s", "verified")).resolves.toBe("turn_1");
+  });
+
+  test("serializes consecutive switches so the last verified choice wins", async () => {
+    const { client, runtime, session } = await setup();
+    client.resumeResults.push(targetResponse, { ...targetResponse, modelProvider: "third" });
+    const persist = vi.fn(async () => undefined);
+    await Promise.all([
+      runtime.setExecutionSettings("s", target, persist),
+      runtime.setExecutionSettings("s", { ...target, modelProvider: "third" }, persist),
+    ]);
+    expect(persist.mock.calls.map((call) => (call as unknown[])[0])).toMatchObject([
+      { modelProvider: "azure" }, { modelProvider: "third" },
+    ]);
+    expect(session.modelProvider).toBe("third");
+  });
+
+  test("does not unload another client's task", async () => {
+    const { client, runtime } = await setup();
+    client.unsubscribeResult = { status: "notSubscribed" };
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow("其他客户端加载");
+    expect(client.requests.some((r) => r.method === "thread/resume")).toBe(false);
+  });
+
+  test("does not replace a task with a Goal even before its first turn", async () => {
+    const { client, runtime } = await setup(true);
+    await runtime.setGoal("s", { objective: "keep this goal" });
+    client.requests = [];
+    await runtime.setExecutionSettings("s", target);
+    expect(client.requests.some((r) => r.method === "thread/start")).toBe(false);
+    expect(client.goalResult?.objective).toBe("keep this goal");
+  });
+
+  test("refuses a turn detected in local state even if App Server reports idle", async () => {
+    const client = new FakeAppServerClient();
+    const active = vi.spyOn(CodexLocalActivityDetector.prototype, "activeThreads").mockResolvedValue(new Map([["thr_1", "running-turn"]]));
+    try {
+      const runtime = new CodexRuntime({ ...provider(client), getCodexHome: () => os.tmpdir() }, logger());
+      await runtime.createSession({ localSessionId: "s", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+      client.requests = [];
+      await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow("当前任务正在执行");
+      expect(client.requests.some((r) => r.method === "thread/unsubscribe")).toBe(false);
+    } finally {
+      active.mockRestore();
+    }
+  });
+});
+
 class FakeAppServerClient {
   requests: Array<{ method: string; params: unknown }> = [];
   timeouts: Array<{ method: string; timeoutMs: number | undefined }> = [];
   startResult: unknown = { thread: { id: "thr_1" }, model: "gpt-test", reasoningEffort: "medium" };
   resumeResult: unknown = { thread: { id: "thr_1", turns: [] }, model: "gpt-test", reasoningEffort: "medium" };
+  resumeResults: unknown[] = [];
+  unsubscribeResult: unknown = { status: "unsubscribed" };
   forkResult: unknown = { thread: { id: "thr_forked", turns: [] }, model: "gpt-test", reasoningEffort: "medium" };
   forkErrors: Error[] = [];
   readResult: unknown = { thread: { id: "thr_1", name: null, preview: "" } };
   readErrors: Error[] = [];
+  readResults: unknown[] = [];
   turnListResults: unknown[] = [];
   turnListErrors: Error[] = [];
   listResult: unknown = { data: [], nextCursor: null };
@@ -1697,7 +1911,12 @@ class FakeAppServerClient {
     this.requests.push({ method, params });
     this.timeouts.push({ method, timeoutMs });
     if (method === "thread/start") return this.startResult as T;
-    if (method === "thread/resume") return this.resumeResult as T;
+    if (method === "thread/resume") {
+      const result = this.resumeResults.shift() ?? this.resumeResult;
+      if (result instanceof Error) throw result;
+      return result as T;
+    }
+    if (method === "thread/unsubscribe") return this.unsubscribeResult as T;
     if (method === "thread/fork") {
       const error = this.forkErrors.shift();
       if (error) throw error;
@@ -1707,7 +1926,7 @@ class FakeAppServerClient {
       if ((params as { includeTurns?: boolean }).includeTurns) throw new Error("Full history must not be requested");
       const error = this.readErrors.shift();
       if (error) throw error;
-      const result = this.readResult as { thread: Record<string, unknown> };
+      const result = (this.readResults.shift() ?? this.readResult) as { thread: Record<string, unknown> };
       return { thread: { ...result.thread, turns: [] } } as T;
     }
     if (method === "thread/turns/list") {

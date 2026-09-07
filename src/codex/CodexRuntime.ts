@@ -29,6 +29,7 @@ import { mapCodexNotification } from "./CodexEventMapper.js";
 import { CodexLocalActivityDetector } from "./CodexLocalActivityDetector.js";
 import { detectProjectlessWorkspace } from "./ProjectlessWorkspace.js";
 import { threadWriterLockPath } from "./ThreadWriterProcess.js";
+import { assertProviderSettingsApplied, PROVIDER_SWITCH_BUSY, providerSwitchFailure } from "./ProviderSwitch.js";
 
 const WINDOWS_SCREENSHOT_DEVELOPER_INSTRUCTIONS = [
   "When capturing any screenshot on Windows, use one fresh process and make it Per-Monitor DPI Aware V2 before loading System.Windows.Forms, System.Drawing, or UI Automation, and before calling any screen, window, or bounds API.",
@@ -45,6 +46,7 @@ const SYNC_REQUEST_TIMEOUT_MS = 5_000;
 const FORK_SOURCE_TURN_PAGE_SIZE = 20;
 const FORK_SOURCE_REQUEST_TIMEOUT_MS = 15_000;
 const USER_RESUMABLE_THREAD_SOURCE_KINDS = ["cli", "vscode", "exec", "appServer"] as const;
+const BUILT_IN_CODEX_PROVIDER_ID = "openai";
 // A timed-out fork keeps running in App Server and can create an orphan thread.
 // Wait for its response; connection closure still rejects the request.
 const FORK_REQUEST_TIMEOUT_MS = 0;
@@ -76,6 +78,8 @@ interface CodexSession extends RuntimeSession {
   generatedImagePaths: string[];
   messagePhases: Map<string, "commentary" | "final_answer">;
   needsResume: boolean;
+  canReplaceEmptyThread: boolean;
+  settingsRecoveryError?: string;
 }
 
 interface PendingApproval {
@@ -93,6 +97,7 @@ export class CodexRuntime implements AgentRuntime {
   private unsubscribe?: () => void;
   private readonly unsubscribeDisconnect?: () => void;
   private readonly sessionSyncs = new Map<string, Promise<RuntimeSession>>();
+  private readonly sessionOperations = new Map<string, Promise<unknown>>();
   private readonly localActivityDetector?: CodexLocalActivityDetector;
   private readonly codexHome?: string;
   private releaseInFlight?: Promise<RuntimeReleaseResult>;
@@ -119,6 +124,10 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async createSession(input: CreateRuntimeSessionInput): Promise<RuntimeSession> {
+    return this.runSessionOperation(input.localSessionId, () => this.createSessionNow(input));
+  }
+
+  private async createSessionNow(input: CreateRuntimeSessionInput): Promise<RuntimeSession> {
     const client = await this.client();
     const response = await client.request<ThreadResponse>("thread/start", {
       cwd: input.cwd,
@@ -143,6 +152,10 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async resumeSession(input: ResumeRuntimeSessionInput): Promise<RuntimeSession> {
+    return this.runSessionOperation(input.localSessionId, () => this.resumeSessionNow(input));
+  }
+
+  private async resumeSessionNow(input: ResumeRuntimeSessionInput): Promise<RuntimeSession> {
     const client = await this.client();
     const response = await client.request<ThreadResponse>("thread/resume", {
       threadId: input.remoteSessionId,
@@ -160,6 +173,10 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async forkSession(input: ForkRuntimeSessionInput): Promise<RuntimeSession> {
+    return this.runSessionOperation(input.localSessionId, () => this.forkSessionNow(input));
+  }
+
+  private async forkSessionNow(input: ForkRuntimeSessionInput): Promise<RuntimeSession> {
     const client = await this.client();
     const forkParams = {
       threadId: input.remoteSessionId,
@@ -190,9 +207,14 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async startTurn(sessionId: string, prompt: RuntimePrompt): Promise<string> {
+    return this.runSessionOperation(sessionId, () => this.startTurnNow(sessionId, prompt));
+  }
+
+  private async startTurnNow(sessionId: string, prompt: RuntimePrompt): Promise<string> {
     const session = this.requireSession(sessionId);
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
+    session.canReplaceEmptyThread = false;
     const start = () => client.request<{ turn: { id: string } }>("turn/start", {
       threadId: session.remoteSessionId,
       input: codexUserInput(prompt),
@@ -419,7 +441,7 @@ export class CodexRuntime implements AgentRuntime {
   async synchronizeSession(sessionId: string): Promise<RuntimeSession> {
     const existing = this.sessionSyncs.get(sessionId);
     if (existing) return existing;
-    const synchronization = this.synchronizeSessionNow(sessionId);
+    const synchronization = this.runSessionOperation(sessionId, () => this.synchronizeSessionNow(sessionId));
     this.sessionSyncs.set(sessionId, synchronization);
     try {
       return await synchronization;
@@ -455,8 +477,10 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async closeSession(sessionId: string): Promise<void> {
-    const session = this.requireSession(sessionId);
-    await this.archiveRemoteSession(session.remoteSessionId);
+    await this.runSessionOperation(sessionId, async () => {
+      const session = this.requireSession(sessionId);
+      await this.archiveRemoteSession(session.remoteSessionId);
+    });
   }
 
   async archiveRemoteSession(remoteSessionId: string): Promise<void> {
@@ -471,6 +495,10 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async setTitle(sessionId: string, title: string): Promise<void> {
+    return this.runSessionOperation(sessionId, () => this.setTitleNow(sessionId, title));
+  }
+
+  private async setTitleNow(sessionId: string, title: string): Promise<void> {
     const session = this.requireSession(sessionId);
     const normalizedTitle = normalizeTaskTitle(title);
     if (!normalizedTitle) throw new Error("任务标题不能为空。");
@@ -483,6 +511,10 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async getGoal(sessionId: string): Promise<RuntimeGoal | undefined> {
+    return this.runSessionOperation(sessionId, () => this.getGoalNow(sessionId));
+  }
+
+  private async getGoalNow(sessionId: string): Promise<RuntimeGoal | undefined> {
     const session = this.requireSession(sessionId);
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
@@ -495,9 +527,14 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async setGoal(sessionId: string, update: RuntimeGoalUpdate): Promise<RuntimeGoal> {
+    return this.runSessionOperation(sessionId, () => this.setGoalNow(sessionId, update));
+  }
+
+  private async setGoalNow(sessionId: string, update: RuntimeGoalUpdate): Promise<RuntimeGoal> {
     const session = this.requireSession(sessionId);
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
+    session.canReplaceEmptyThread = false;
     const response = await client.request<{ goal: RuntimeGoal }>(
       "thread/goal/set",
       { threadId: session.remoteSessionId, ...update },
@@ -507,6 +544,10 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async clearGoal(sessionId: string): Promise<boolean> {
+    return this.runSessionOperation(sessionId, () => this.clearGoalNow(sessionId));
+  }
+
+  private async clearGoalNow(sessionId: string): Promise<boolean> {
     const session = this.requireSession(sessionId);
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
@@ -519,37 +560,130 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    this.requireSession(sessionId).model = model;
+    await this.runSessionOperation(sessionId, async () => { this.requireSession(sessionId).model = model; });
   }
 
   async setReasoningEffort(sessionId: string, effort: string): Promise<void> {
-    this.requireSession(sessionId).reasoningEffort = effort;
+    await this.runSessionOperation(sessionId, async () => { this.requireSession(sessionId).reasoningEffort = effort; });
   }
 
   async setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
-    this.requireSession(sessionId).permissionMode = mode;
+    await this.runSessionOperation(sessionId, async () => { this.requireSession(sessionId).permissionMode = mode; });
   }
 
   async setExecutionSettings(
     sessionId: string,
     settings: RuntimeExecutionSettings,
+    persist?: (session: RuntimeSession) => Promise<void>,
+  ): Promise<RuntimeSession> {
+    return this.runSessionOperation(sessionId, () => this.setExecutionSettingsNow(sessionId, settings, persist));
+  }
+
+  private async setExecutionSettingsNow(
+    sessionId: string,
+    settings: RuntimeExecutionSettings,
+    persist?: (session: RuntimeSession) => Promise<void>,
   ): Promise<RuntimeSession> {
     const session = this.requireSession(sessionId);
-    const response = await (await this.client()).request<ThreadResponse>("thread/resume", {
-      threadId: session.remoteSessionId,
-      excludeTurns: true,
-      cwd: session.cwd,
-      modelProvider: settings.modelProvider,
-      model: settings.model,
-      ...threadLifecycleParams(session.cwd),
-      ...permissionParams(settings.permissionMode),
-    }, SESSION_REQUEST_TIMEOUT_MS);
-    session.modelProvider = response.modelProvider ?? settings.modelProvider;
-    session.model = response.model ?? settings.model;
-    session.reasoningEffort = settings.reasoningEffort;
-    session.permissionMode = settings.permissionMode;
-    session.needsResume = false;
+    if (session.activeTurnId) throw new Error(PROVIDER_SWITCH_BUSY);
+    const client = await this.client();
+    const metadata = await client.request<ThreadReadResponse>("thread/read", {
+      threadId: session.remoteSessionId, includeTurns: false,
+    }, SYNC_REQUEST_TIMEOUT_MS);
+    const localActive = await this.localActivityDetector?.activeThreads([session.remoteSessionId]);
+    if (metadata.thread.status?.type === "active" || localActive?.has(session.remoteSessionId) || session.activeTurnId) {
+      throw new Error(PROVIDER_SWITCH_BUSY);
+    }
+    let empty = false;
+    if (session.canReplaceEmptyThread && !metadata.thread.forkedFromId && !metadata.thread.preview?.trim()) {
+      try {
+        const turns = await this.readLatestThreadTurns(client, session.remoteSessionId, "summary");
+        empty = turns.length === 0;
+        if (!empty) session.canReplaceEmptyThread = false;
+      } catch (error) {
+        if (!(error instanceof AppServerRequestError) || error.method !== "thread/turns/list"
+          || !/missing source rollout|no rollout found/iu.test(error.serverMessage)) throw error;
+        empty = true;
+      }
+    }
+    const previous = { ...session };
+    let replacementId: string | undefined;
+    let detached = false;
+    try {
+      const params = {
+        cwd: session.cwd, modelProvider: settings.modelProvider, model: settings.model,
+        ...threadLifecycleParams(session.cwd), ...permissionParams(settings.permissionMode),
+      };
+      if (!empty) {
+        await this.detachThreadForSettings(client, session);
+        detached = true;
+      }
+      const response = empty
+        ? await client.request<ThreadResponse>("thread/start", {
+            ...params, threadSource: "user", allowProviderModelFallback: false,
+          }, SESSION_REQUEST_TIMEOUT_MS)
+        : await client.request<ThreadResponse>("thread/resume", {
+            ...params, threadId: session.remoteSessionId, excludeTurns: true,
+          }, SESSION_REQUEST_TIMEOUT_MS);
+      if (empty) replacementId = response.thread.id;
+      assertProviderSettingsApplied(response, settings);
+      if (!empty && response.thread.id !== session.remoteSessionId) throw new Error("App Server 返回了不同的任务 ID，未保存设置。");
+      if (empty && session.title) await client.request("thread/name/set", {
+        threadId: response.thread.id, name: session.title,
+      }, SESSION_REQUEST_TIMEOUT_MS);
+      const candidate = { ...session, ...settings, remoteSessionId: response.thread.id,
+        needsResume: false, settingsRecoveryError: undefined };
+      await persist?.(candidate);
+      Object.assign(session, candidate);
+    } catch (error) {
+      if (replacementId) await this.discardUnusedThread(client, replacementId);
+      let recovery = "原任务设置未更改。";
+      if (detached) {
+        try {
+          await this.detachThreadForSettings(client, previous);
+          const restored = await client.request<ThreadResponse>("thread/resume", {
+            threadId: previous.remoteSessionId, excludeTurns: true, cwd: previous.cwd,
+            modelProvider: previous.modelProvider, model: previous.model,
+            ...threadLifecycleParams(previous.cwd), ...permissionParams(previous.permissionMode),
+          }, SESSION_REQUEST_TIMEOUT_MS);
+          if (previous.modelProvider && previous.model) assertProviderSettingsApplied(restored, {
+            modelProvider: previous.modelProvider, model: previous.model,
+          });
+          if (restored.thread.id !== previous.remoteSessionId) throw new Error("恢复时返回了不同的任务 ID。");
+          session.needsResume = false;
+          session.settingsRecoveryError = undefined;
+        } catch (restoreError) {
+          this.logger.warn({ error: restoreError, sessionId }, "Failed to restore Provider after a rejected settings change.");
+          recovery = "原设置仍保留，但远端恢复失败；请重新切换 Provider，确认成功后再发送消息。";
+          session.settingsRecoveryError = recovery;
+          session.needsResume = true;
+        }
+      }
+      throw new Error(`Provider 切换失败：${providerSwitchFailure(error)} ${recovery}`, { cause: error });
+    }
+    if (replacementId) await this.discardUnusedThread(client, previous.remoteSessionId);
     return session;
+  }
+
+  private async detachThreadForSettings(client: AppServerClient, session: CodexSession): Promise<void> {
+    const current = await client.request<ThreadReadResponse>("thread/read", {
+      threadId: session.remoteSessionId, includeTurns: false,
+    }, SYNC_REQUEST_TIMEOUT_MS);
+    if (session.activeTurnId || current.thread.status?.type === "active") throw new Error(PROVIDER_SWITCH_BUSY);
+    const result = await client.request<{ status: string }>("thread/unsubscribe", {
+      threadId: session.remoteSessionId,
+    }, CONTROL_REQUEST_TIMEOUT_MS);
+    if (result.status !== "unsubscribed" && result.status !== "notLoaded") {
+      throw new Error("当前任务仍由其他客户端加载，无法安全切换 Provider。请先在原客户端释放任务。");
+    }
+  }
+
+  private async discardUnusedThread(client: AppServerClient, threadId: string): Promise<void> {
+    try {
+      await client.request("thread/unsubscribe", { threadId }, CONTROL_REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      this.logger.warn({ error, threadId }, "Failed to release an unused empty Thread after changing Provider.");
+    }
   }
 
   async respondToApproval(
@@ -608,6 +742,13 @@ export class CodexRuntime implements AgentRuntime {
         ...(id === defaultProvider ? { isDefault: true } : {}),
       });
     }
+    if (this.provider.getAgentFamily?.() === "codex" && !providers.has(BUILT_IN_CODEX_PROVIDER_ID)) {
+      providers.set(BUILT_IN_CODEX_PROVIDER_ID, {
+        id: BUILT_IN_CODEX_PROVIDER_ID,
+        displayName: "OpenAI",
+        ...(!defaultProvider ? { isDefault: true } : {}),
+      });
+    }
     if (defaultProvider && !providers.has(defaultProvider)) {
       providers.set(defaultProvider, { id: defaultProvider, isDefault: true });
     }
@@ -624,7 +765,7 @@ export class CodexRuntime implements AgentRuntime {
   async release(options: { force?: boolean } = {}): Promise<RuntimeReleaseResult> {
     if (this.releaseInFlight) return this.releaseInFlight;
     const activeSessionIds = [...this.sessions.values()]
-      .filter((session) => Boolean(session.activeTurnId))
+      .filter((session) => Boolean(session.activeTurnId) || this.sessionOperations.has(session.localSessionId))
       .map((session) => session.localSessionId);
     if (activeSessionIds.length > 0 && options.force !== true) {
       return { status: "busy", activeSessionIds };
@@ -870,6 +1011,7 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   private async ensureSessionResumed(session: CodexSession, client: AppServerClient): Promise<void> {
+    if (session.settingsRecoveryError) throw new Error(session.settingsRecoveryError);
     if (!session.needsResume) return;
     await this.resumeAppServerSession(session, client);
     session.needsResume = false;
@@ -948,6 +1090,7 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   private adoptTurn(session: CodexSession, turnId: string, startedAt: number): void {
+    session.canReplaceEmptyThread = false;
     session.activeTurnId = turnId;
     session.activeTurnStartedAt = startedAt;
     session.finalText = "";
@@ -1039,6 +1182,7 @@ export class CodexRuntime implements AgentRuntime {
       generatedImagePaths: [],
       messagePhases: new Map(),
       needsResume: false,
+      canReplaceEmptyThread: !("remoteSessionId" in input),
     };
   }
 
@@ -1046,6 +1190,17 @@ export class CodexRuntime implements AgentRuntime {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown App Server session: ${sessionId}`);
     return session;
+  }
+
+  private async runSessionOperation<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.sessionOperations.get(sessionId);
+    const current = (previous ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.sessionOperations.set(sessionId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.sessionOperations.get(sessionId) === current) this.sessionOperations.delete(sessionId);
+    }
   }
 
   private requireActiveTurn(sessionId: string, turnId: string): CodexSession {
@@ -1117,6 +1272,7 @@ interface CodexThreadSnapshot {
   updatedAt?: number;
   recencyAt?: number | null;
   status?: { type?: string };
+  forkedFromId?: string | null;
   turns?: CodexTurnSnapshot[];
 }
 

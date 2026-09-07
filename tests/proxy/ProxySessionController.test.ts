@@ -438,9 +438,11 @@ function fixture(
       sessions.get(sessionId)!.reasoningEffort = effort;
     }),
     setPermissionMode: vi.fn(async () => undefined),
-    setExecutionSettings: vi.fn(async (sessionId, settings) => {
+    setExecutionSettings: vi.fn(async (sessionId, settings, persist) => {
       const session = sessions.get(sessionId)!;
-      Object.assign(session, settings);
+      const candidate = { ...session, ...settings };
+      await persist?.(candidate);
+      Object.assign(session, candidate);
       return session;
     }),
     respondToApproval: vi.fn(async () => undefined),
@@ -1386,6 +1388,96 @@ describe("ProxySessionController", () => {
     }));
   });
 
+  test("queues messages received while Reset is replacing the current App Server task", async () => {
+    const { controller, runtime, sessions, remoteSessions, outbound, store, listeners } = fixture();
+    await controller.onMessage(message("build reset history"));
+    const task = store.listSessions("chat_id:c1")[0]!;
+    const sourceRemoteSessionId = task.remoteSessionId!;
+    const sourceRemote = remoteSessions.find((remote) => remote.id === sourceRemoteSessionId)!;
+    sessions.get(task.localSessionId)!.activeTurnId = undefined;
+    sourceRemote.status = "idle";
+    sourceRemote.lastTurnId = "turn_latest";
+    sourceRemote.lastTurnStatus = "completed";
+    store.updateSession(task.localSessionId, { status: "ready" });
+    store.updateRuntimeSession(task.localSessionId, {
+      lastTurnId: "turn_latest",
+      lastTurnStatus: "completed",
+    });
+    store.saveTurnSnapshot("turn_target", task.localSessionId, {
+      sessionId: task.localSessionId,
+      turnId: "turn_target",
+      prompt: "Reset target",
+      status: "completed",
+      startedAt: 1,
+      completedAt: 2,
+    }, "chat_id:c1");
+    store.saveTurnRuntimeOrigin("turn_target", task.localSessionId, task.agentName, sourceRemoteSessionId);
+
+    const forkSession = vi.mocked(runtime.forkSession!);
+    const originalForkSession = forkSession.getMockImplementation()!;
+    let releaseReset!: () => void;
+    const resetGate = new Promise<void>((resolve) => {
+      releaseReset = resolve;
+    });
+    let resetStarted!: () => void;
+    const resetStartedPromise = new Promise<void>((resolve) => {
+      resetStarted = resolve;
+    });
+    forkSession.mockImplementationOnce(async (input) => {
+      resetStarted();
+      await resetGate;
+      return originalForkSession(input);
+    });
+
+    const startTurn = vi.mocked(runtime.startTurn);
+    startTurn.mockClear();
+    vi.mocked(outbound.downloadImage!).mockClear();
+    let startedRemoteSessionId: string | undefined;
+    startTurn.mockImplementationOnce(async (sessionId) => {
+      startedRemoteSessionId = sessions.get(sessionId)?.remoteSessionId;
+      const turnId = "turn_after_reset";
+      for (const listener of listeners) listener({ type: "turn_started", sessionId, turnId, startedAt: 3 });
+      return turnId;
+    });
+
+    const resetAction = controller.onCardAction({
+      actionId: "reset-before-new-message",
+      contextKey: "chat_id:c1",
+      messageId: "om_turn_target",
+      value: { action: "turn_reset", sessionId: task.localSessionId, turnId: "turn_target" },
+    });
+    await resetStartedPromise;
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:c1",
+      "Reset 正在进行，请稍后。期间发送的消息会自动排队。",
+    );
+
+    const queuedMessage = controller.onMessage({
+      messageId: "message-during-reset",
+      contextKey: "chat_id:c1",
+      text: "continue after Reset",
+      images: [{ imageKey: "image-during-reset" }],
+    });
+    await vi.waitFor(() => expect(outbound.addReaction).toHaveBeenCalledWith(
+      "message-during-reset",
+      expect.any(String),
+    ));
+    expect(outbound.downloadImage).not.toHaveBeenCalled();
+    expect(startTurn).not.toHaveBeenCalled();
+
+    releaseReset();
+    await Promise.all([resetAction, queuedMessage]);
+
+    expect(startTurn).toHaveBeenCalledOnce();
+    expect(outbound.downloadImage).toHaveBeenCalledWith(
+      "message-during-reset",
+      "image-during-reset",
+    );
+    expect(startedRemoteSessionId).toBe(`${sourceRemoteSessionId}_fork`);
+    expect(store.getTurnRuntimeOrigin("turn_after_reset")?.remoteSessionId)
+      .toBe(`${sourceRemoteSessionId}_fork`);
+  });
+
   test("shows ten completed turns per Turns card page and keeps later turns after Reset", async () => {
     const { controller, runtime, sessions, remoteSessions, outbound, store } = fixture();
     await controller.onMessage(message("build reset card history"));
@@ -1460,6 +1552,18 @@ describe("ProxySessionController", () => {
     vi.mocked(outbound.updateInteractiveCard).mockClear();
     const forkSession = vi.mocked(runtime.forkSession!);
     const originalForkSession = forkSession.getMockImplementation()!;
+    let releaseResetCard!: () => void;
+    const resetCardGate = new Promise<void>((resolve) => {
+      releaseResetCard = resolve;
+    });
+    let resetCardStarted!: () => void;
+    const resetCardStartedPromise = new Promise<void>((resolve) => {
+      resetCardStarted = resolve;
+    });
+    vi.mocked(outbound.updateInteractiveCard).mockImplementationOnce(async () => {
+      resetCardStarted();
+      await resetCardGate;
+    });
     let releaseReset!: () => void;
     const resetGate = new Promise<void>((resolve) => {
       releaseReset = resolve;
@@ -1482,6 +1586,25 @@ describe("ProxySessionController", () => {
         page: "1",
       },
     });
+    await resetCardStartedPromise;
+    const resetStartNoticeCall = vi.mocked(outbound.sendText).mock.calls.findIndex((call) =>
+      call[1] === "Reset 正在进行，请稍后。期间发送的消息会自动排队。");
+    expect(resetStartNoticeCall).toBeGreaterThanOrEqual(0);
+    expect(vi.mocked(outbound.sendText).mock.invocationCallOrder[resetStartNoticeCall])
+      .toBeLessThan(vi.mocked(outbound.updateInteractiveCard).mock.invocationCallOrder[0]!);
+
+    const interactiveCardCount = vi.mocked(outbound.sendInteractiveCard).mock.calls.length;
+    const queuedHelp = controller.onMessage({
+      messageId: "help-during-history-reset",
+      contextKey: "chat_id:c1",
+      text: "/help",
+    });
+    await vi.waitFor(() => expect(outbound.addReaction).toHaveBeenCalledWith(
+      "help-during-history-reset",
+      expect.any(String),
+    ));
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledTimes(interactiveCardCount);
+
     await vi.waitFor(() => expect(outbound.updateInteractiveCard).toHaveBeenCalledTimes(1));
     const resettingCard = vi.mocked(outbound.updateInteractiveCard).mock.calls[0]?.[1];
     const resettingSerialized = JSON.stringify(resettingCard);
@@ -1490,8 +1613,14 @@ describe("ProxySessionController", () => {
     expect(resettingSerialized).not.toContain('"action":"turn_reset"');
     expect(resettingSerialized).toContain('"action":"turn_reset_page"');
 
+    releaseResetCard();
+    await vi.waitFor(() => expect(forkSession).toHaveBeenCalledWith(expect.objectContaining({
+      lastTurnId: "history_turn_1",
+    })));
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledTimes(interactiveCardCount);
     releaseReset();
-    await resetAction;
+    await Promise.all([resetAction, queuedHelp]);
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledTimes(interactiveCardCount + 1);
     expect(runtime.forkSession).toHaveBeenLastCalledWith(expect.objectContaining({
       localSessionId: task.localSessionId,
       lastTurnId: "history_turn_1",
@@ -2422,6 +2551,14 @@ describe("ProxySessionController", () => {
 
     expect(recordChatContext).toHaveBeenCalledWith("chat_id:reaction_barrier", "group");
     expect(outbound.downloadImage).toHaveBeenCalledWith(incoming.messageId, "img_barrier");
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:reaction_barrier",
+      "正在读取任务列表，请稍后。",
+    );
+    const noticeCall = vi.mocked(outbound.sendText).mock.calls.findIndex((call) =>
+      call[0] === "chat_id:reaction_barrier" && call[1] === "正在读取任务列表，请稍后。");
+    expect(vi.mocked(outbound.sendText).mock.invocationCallOrder[noticeCall])
+      .toBeLessThan(vi.mocked(runtime.listRemoteSessions!).mock.invocationCallOrder[0]!);
     expect(runtime.listRemoteSessions).toHaveBeenCalled();
   });
 
@@ -6169,6 +6306,26 @@ describe("ProxySessionController", () => {
     expect(store.getSession("empty")?.remoteSessionId).toBe("thr_1");
   });
 
+  test.each([
+    ["configuration failure", "thread/resume failed: failed to load configuration", false],
+    ["provider failure", "thread/resume failed: model provider unknown is not configured", false],
+    ["missing inherited lineage", "thread/resume failed: invalid paginated history lineage: missing source rollout", false],
+    ["known fork with no cached last turn", "thread/resume failed: no rollout found for thread id inherited", true],
+  ])("does not recreate a task after %s", async (_name, error, fork) => {
+    const { controller, runtime, store, remoteSessions } = fixture();
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    store.createSession({ localSessionId: "saved", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "ready" });
+    store.updateRuntimeSession("saved", { runtimeKind: "codex", remoteSessionId: "inherited", modelProvider: "openai", model: "gpt-test" });
+    remoteSessions.push({ id: "inherited", cwd: process.cwd(), status: "idle", source: "agent-bot" });
+    if (fork) store.audit("chat_id:c1", "session_forked", {
+      forkedLocalSessionId: "saved", sourceRemoteSessionId: "parent", sourceTurnId: "parent-turn",
+    });
+    vi.mocked(runtime.resumeSession).mockRejectedValueOnce(new Error(String(error)));
+    await expect(controller.controlTaskSettings("saved", "provider", "azure")).rejects.toThrow(String(error));
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(store.getSession("saved")?.remoteSessionId).toBe("inherited");
+  });
+
   test("replaces a resume failure with a dedicated thread-writer conflict card", async () => {
     const owner = threadWriterOwner();
     const threadId = "01a05543-1cfd-75b1-9eba-1ce331ab4230";
@@ -8628,7 +8785,7 @@ describe("ProxySessionController", () => {
   });
 
   test("lists and resets completed turns through targeted CLI controls", async () => {
-    const { controller, runtime, store } = fixture();
+    const { controller, runtime, outbound, store } = fixture();
     await controller.onMessage(groupMessage("origin", "/new Resettable"));
     const sessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
     store.saveTurnSnapshot("turn_old", sessionId, {
@@ -8658,6 +8815,10 @@ describe("ProxySessionController", () => {
       localSessionId: sessionId,
       lastTurnId: "turn_old",
     }));
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:origin",
+      "Reset 正在进行，请稍后。期间发送的消息会自动排队。",
+    );
     expect(reset).toMatchObject({ lastTurnId: "turn_old", lastTurnStatus: "completed" });
   });
 
@@ -8765,6 +8926,84 @@ describe("ProxySessionController", () => {
     expect(outbound.sendInteractiveCard).not.toHaveBeenCalled();
   });
 
+  test("includes the current Provider in CLI settings when the runtime omits it", async () => {
+    const { controller, runtime, store } = fixture();
+    await controller.onMessage(message("/new"));
+    const sessionId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    vi.mocked(runtime.listModelProviders!).mockResolvedValueOnce([
+      { id: "ai_coding", displayName: "AI Coding" },
+    ]);
+
+    const result = await controller.controlTaskSettings(sessionId);
+
+    expect(result.providers).toEqual([
+      { id: "openai" },
+      { id: "ai_coding", displayName: "AI Coding" },
+    ]);
+  });
+
+  test.each(["cli", "card"])("persists a replacement thread ID when switching Provider through %s", async (entry) => {
+    const { controller, runtime, outbound, store, config, persistAgentExecutionDefaults } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const original = runtime.getSession(id)!;
+    vi.mocked(outbound.sendText).mockClear();
+    vi.mocked(runtime.setExecutionSettings!).mockImplementationOnce(async (_id, settings, persist) => {
+      const candidate = { ...original, ...settings, remoteSessionId: "replacement" };
+      await persist?.(candidate);
+      Object.assign(original, candidate);
+      return original;
+    });
+    if (entry === "cli") await controller.controlTaskSettings(id, "provider", "azure");
+    else await controller.onCardAction({ actionId: "switch", contextKey: "chat_id:c1", messageId: "om_provider",
+      value: { action: "settings_provider_select", sessionId: id, contextKey: "chat_id:c1", provider: "azure" } });
+    const noticeCall = vi.mocked(outbound.sendText).mock.calls.findIndex((call) =>
+      call[1] === "正在切换到 Provider azure，请稍后。");
+    expect(noticeCall).toBeGreaterThanOrEqual(0);
+    expect(vi.mocked(outbound.sendText).mock.invocationCallOrder[noticeCall])
+      .toBeLessThan(vi.mocked(runtime.setExecutionSettings!).mock.invocationCallOrder[0]!);
+    expect(store.getSession(id)).toMatchObject({ remoteSessionId: "replacement", modelProvider: "azure" });
+    expect(config.agents.codex?.defaults?.modelProvider).toBe("azure");
+    expect(persistAgentExecutionDefaults).toHaveBeenCalledOnce();
+  });
+
+  test.each(["cli", "card"])("rejects old Provider responses through %s without saving or reporting success", async (entry) => {
+    const { controller, runtime, outbound, store, config, persistAgentExecutionDefaults } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const original = store.getSession(id)!;
+    const defaults = config.agents.codex?.defaults;
+    vi.mocked(runtime.setExecutionSettings!).mockImplementationOnce(async (_id, _settings, persist) => {
+      const unchanged = runtime.getSession(id)!;
+      await persist?.(unchanged);
+      return unchanged;
+    });
+    vi.mocked(outbound.sendText).mockClear();
+    if (entry === "cli") await expect(controller.controlTaskSettings(id, "provider", "azure")).rejects.toThrow("Provider 未生效");
+    else {
+      await controller.onCardAction({ actionId: "switch", contextKey: "chat_id:c1", messageId: "om_provider",
+        value: { action: "settings_provider_select", sessionId: id, contextKey: "chat_id:c1", provider: "azure" } });
+      expect(JSON.stringify(vi.mocked(outbound.sendText).mock.calls)).toContain("Provider 未生效");
+      expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls)).not.toContain("Provider 已切换");
+    }
+    expect(store.getSession(id)).toEqual(original);
+    expect(config.agents.codex?.defaults).toEqual(defaults);
+    expect(persistAgentExecutionDefaults).not.toHaveBeenCalled();
+  });
+
+  test("does not change task settings when saving Provider defaults fails", async () => {
+    const { controller, runtime, store, config, persistAgentExecutionDefaults } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const original = store.getSession(id)!;
+    const defaults = config.agents.codex?.defaults;
+    persistAgentExecutionDefaults.mockRejectedValueOnce(new Error("config is read-only"));
+    await expect(controller.controlTaskSettings(id, "provider", "azure")).rejects.toThrow("config is read-only");
+    expect(store.getSession(id)).toEqual(original);
+    expect(runtime.getSession(id)?.modelProvider).toBe(original.modelProvider);
+    expect(config.agents.codex?.defaults).toEqual(defaults);
+  });
+
   test("switches Provider, Model, Thinking, and Permission through one tabbed card", async () => {
     const { controller, runtime, outbound, store, config, persistAgentExecutionDefaults } = fixture();
     await controller.onMessage(message("/new"));
@@ -8795,7 +9034,7 @@ describe("ProxySessionController", () => {
       model: "gpt-test",
       reasoningEffort: "high",
       permissionMode: "auto",
-    });
+    }, expect.any(Function));
     expect(serialized).toContain("Provider 已切换为 `azure`");
 
     await controller.onCardAction({

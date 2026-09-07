@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Logger } from "pino";
 import { createProjectlessWorkspace, detectProjectlessWorkspace } from "../codex/ProjectlessWorkspace.js";
 import { CodexVersionError } from "../codex/CodexVersion.js";
+import { assertProviderSettingsApplied, isMissingRolloutError } from "../codex/ProviderSwitch.js";
 import {
   SystemThreadWriterProcessController,
   type ThreadWriterProcess,
@@ -65,6 +66,7 @@ import type {
   RemoteSessionSummary,
   RuntimeGoal,
   RuntimeEvent,
+  RuntimeExecutionSettings,
   RuntimePrompt,
   RuntimeSession,
 } from "../runtime/types.js";
@@ -188,6 +190,22 @@ const FORWARD_ATTACHMENT_WINDOW_MS = 800;
 const DEFAULT_MERGED_FORWARD_INSTRUCTION = "请参考以下内容回复用户";
 const DEFAULT_REFERENCED_MESSAGE_INSTRUCTION = "请参考引用消息回复用户";
 const TURN_STOP_REQUESTED_MESSAGE = "已发送停止信号，任务会自动停止。";
+const TURN_RESET_STARTED_MESSAGE = "Reset 正在进行，请稍后。期间发送的消息会自动排队。";
+const CREATE_TASK_STARTED_MESSAGE = "正在创建任务，请稍后。";
+const CREATE_GROUP_STARTED_MESSAGE = "正在创建群聊和任务，请稍后。";
+const FORK_TASK_STARTED_MESSAGE = "正在创建分支任务，请稍后。";
+const FORK_GROUP_STARTED_MESSAGE = "正在创建分支群聊，请稍后。";
+const LIST_SESSIONS_STARTED_MESSAGE = "正在读取任务列表，请稍后。";
+const LIST_TURNS_STARTED_MESSAGE = "正在读取历史轮次，请稍后。";
+const SWITCH_TASK_STARTED_MESSAGE = "正在切换任务，请稍后。";
+const STATUS_STARTED_MESSAGE = "正在读取任务状态，请稍后。";
+const GOAL_STARTED_MESSAGE = "正在处理 Goal，请稍后。";
+const ARCHIVE_TASK_STARTED_MESSAGE = "正在归档任务，请稍后。";
+const DISMISS_GROUP_STARTED_MESSAGE = "正在归档任务并解散群聊，请稍后。";
+const SEND_FILE_STARTED_MESSAGE = "正在发送文件，请稍后。";
+const CHANGE_TITLE_STARTED_MESSAGE = "正在修改任务标题，请稍后。";
+const STOP_TASK_STARTED_MESSAGE = "正在停止任务，请稍后。";
+const CLOSE_WRITER_STARTED_MESSAGE = "正在检查并关闭占用进程，请稍后。";
 const REMOTE_SESSION_REFERENCE_PREFIX = "agent-runtime:";
 const WINDOWS_DRIVES_DIRECTORY = "agentbot://windows-drives";
 const IMAGE_FILE_EXTENSIONS = new Set([
@@ -599,6 +617,7 @@ export class ProxySessionController {
         "Failed to acknowledge the incoming Feishu message with a reaction.",
       );
     }
+    await this.waitForCurrentSessionReset(message.contextKey);
     if (attachmentReservation && this.completeForwardAttachment(message, attachmentReservation)) {
       this.store.audit(message.contextKey, `${attachmentReservation.sourceKind}_attachment_coalesced`, {
         messageId: message.messageId,
@@ -836,10 +855,11 @@ export class ProxySessionController {
         "Processing Agent Bot command.",
       );
     }
-    // Operational and read-only commands must remain available even if a prompt operation is slow.
+    // Operational and read-only commands bypass the prompt queue, but still wait for a Reset binding change.
     if (isQueueIndependentCommand(command)) {
       await this.outbound.withReplyTarget(message.contextKey, replyTarget, async () => {
         try {
+          await this.waitForCurrentSessionReset(message.contextKey);
           if (command.type === "prompt") await this.ensureThreadFork(message);
           await this.execute(
             message.contextKey,
@@ -867,8 +887,9 @@ export class ProxySessionController {
     }
 
     const previous = this.messageQueues.get(message.contextKey) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(() =>
-      this.outbound.withReplyTarget(message.contextKey, replyTarget, async () => {
+    const next = previous.catch(() => undefined).then(async () => {
+      await this.waitForCurrentSessionReset(message.contextKey);
+      return this.outbound.withReplyTarget(message.contextKey, replyTarget, async () => {
         try {
           let executableCommand = command;
           let executableImagePaths = localImagePaths;
@@ -913,8 +934,8 @@ export class ProxySessionController {
             phase: "command_execute",
           });
         }
-      }),
-    );
+      });
+    });
     this.messageQueues.set(message.contextKey, next);
     await next;
     if (this.messageQueues.get(message.contextKey) === next) this.messageQueues.delete(message.contextKey);
@@ -1032,6 +1053,7 @@ export class ProxySessionController {
         } else if (kind === "directory_send_file") {
           const filePath = directoryFileActionPath(scopedAction.value.filePath);
           await this.assertSendableFile(filePath);
+          await this.outbound.sendText(contextKey, SEND_FILE_STARTED_MESSAGE);
           await this.outbound.sendFile(contextKey, filePath);
         } else if (kind === "directory_new_folder_prompt") {
           const directory = directoryActionPath(scopedAction.value.directory);
@@ -1087,10 +1109,12 @@ export class ProxySessionController {
           await this.refreshSessionsCardFromAction(scopedAction);
         } else if (kind === "session_new") {
           const sessionId = String(scopedAction.value.sessionId ?? "");
+          await this.outbound.sendText(contextKey, CREATE_TASK_STARTED_MESSAGE);
           await this.createProjectSessionFromReference(contextKey, sessionId);
           await this.refreshSessionsCardFromAction(scopedAction, { page: 0 });
         } else if (kind === "session_new_group") {
           const sessionId = String(scopedAction.value.sessionId ?? "");
+          await this.outbound.sendText(contextKey, CREATE_GROUP_STARTED_MESSAGE);
           await this.createFeishuGroupFromReference(contextKey, sessionId, scopedAction.userId);
           await this.refreshSessionsCardFromAction(scopedAction);
         } else if (kind === "session_archive") {
@@ -1109,6 +1133,7 @@ export class ProxySessionController {
           );
         } else if (kind === "group_dismiss_confirm") {
           this.assertDismissGroupRequester(scopedAction);
+          await this.outbound.sendText(contextKey, DISMISS_GROUP_STARTED_MESSAGE);
           await this.dismissGroupAndArchiveTask(
             contextKey,
             String(scopedAction.value.sessionId ?? ""),
@@ -1116,10 +1141,12 @@ export class ProxySessionController {
           );
         } else if (kind === "session_stop") {
           const sessionId = String(scopedAction.value.sessionId ?? "");
+          await this.outbound.sendText(contextKey, STOP_TASK_STARTED_MESSAGE);
           await this.stopSessionReference(contextKey, sessionId);
           if (scopedAction.value.cardView === "status") await this.refreshStatusCardFromAction(scopedAction, sessionId);
           else await this.refreshSessionsCardFromAction(scopedAction, { forceSwitchTaskId: sessionId });
         } else if (kind === "session_status") {
+          await this.outbound.sendText(contextKey, STATUS_STARTED_MESSAGE);
           await this.status(contextKey, String(scopedAction.value.sessionId ?? ""));
         } else if (kind === "session_status_refresh") {
           await this.refreshStatusCardFromAction(scopedAction);
@@ -1640,9 +1667,17 @@ export class ProxySessionController {
     permissionModes: PermissionMode[];
   }> {
     const record = this.requireControlSession(localSessionId);
-    const loaded = await this.loadSession(record);
     if (setting && !value?.trim()) throw new Error(`task ${setting} requires a value.`);
     const nextValue = value?.trim();
+    if (setting === "provider" && nextValue) {
+      const contextKey = this.controlSessionContextKey(record);
+      await this.outbound.withReplyTarget(
+        contextKey,
+        this.controlSessionReplyTarget(record),
+        () => this.outbound.sendText(contextKey, `正在切换到 Provider ${nextValue}，请稍后。`),
+      );
+    }
+    const loaded = await this.loadSession(record);
     if (setting === "provider" && nextValue) {
       await this.assertModelProvider(loaded, nextValue);
       const models = await loaded.runtime.listModels();
@@ -1655,18 +1690,11 @@ export class ProxySessionController {
         ? loaded.session.reasoningEffort
         : model.defaultReasoningEffort ?? model.supportedReasoningEfforts[0]?.value;
       if (!effort) throw new Error(`Model ${model.id} has no reasoning effort available for a Provider change.`);
-      if (!loaded.runtime.setExecutionSettings) throw new Error("The current runtime does not support Provider settings.");
-      const updated = await loaded.runtime.setExecutionSettings(record.localSessionId, {
+      await this.changeProviderSettings(loaded, {
         modelProvider: nextValue,
         model: model.id,
         reasoningEffort: effort,
         permissionMode: loaded.session.permissionMode,
-      });
-      this.store.updateRuntimeSession(record.localSessionId, {
-        modelProvider: updated.modelProvider ?? nextValue,
-        model: updated.model ?? model.id,
-        reasoningEffort: updated.reasoningEffort ?? effort,
-        permissionMode: updated.permissionMode,
       });
     } else if (setting === "model" && nextValue) {
       const models = await loaded.runtime.listModels();
@@ -1702,12 +1730,12 @@ export class ProxySessionController {
       this.store.updateRuntimeSession(record.localSessionId, { permissionMode: nextValue });
     }
     const session = this.store.getSession(record.localSessionId) ?? record;
-    if (setting) await this.persistAgentExecutionDefaults(session.localSessionId);
+    if (setting && setting !== "provider") await this.persistAgentExecutionDefaults(session.localSessionId);
     const models = await loaded.runtime.listModels();
     const currentModel = models.find((candidate) => candidate.id === session.model)
       ?? models.find((candidate) => candidate.isDefault);
     const providers = loaded.runtime.listModelProviders
-      ? await loaded.runtime.listModelProviders()
+      ? await this.modelProviderOptions(loaded)
       : [];
     return {
       session,
@@ -1791,15 +1819,10 @@ export class ProxySessionController {
   async controlResetTaskToTurn(localSessionId: string, turnId: string): Promise<SessionRecord> {
     const record = this.requireControlSession(localSessionId);
     const contextKey = this.controlSessionContextKey(record);
-    const previous = this.sessionResets.get(record.localSessionId) ?? Promise.resolve();
-    const reset = previous.catch(() => undefined).then(() =>
-      this.performSessionReset(contextKey, record, turnId, false));
-    this.sessionResets.set(record.localSessionId, reset);
-    try {
-      await reset;
-    } finally {
-      if (this.sessionResets.get(record.localSessionId) === reset) this.sessionResets.delete(record.localSessionId);
-    }
+    await this.runSessionReset(record.localSessionId, async () => {
+      await this.outbound.sendText(contextKey, TURN_RESET_STARTED_MESSAGE);
+      await this.performSessionReset(contextKey, record, turnId, false);
+    });
     return this.store.getSession(record.localSessionId) ?? record;
   }
 
@@ -1956,6 +1979,7 @@ export class ProxySessionController {
         if (command.projectless && this.ensureAgent(context.defaultAgent).kind !== "app-server") {
           throw new Error("/new --nodir 仅支持 App Server Agent。");
         }
+        await this.outbound.sendText(contextKey, CREATE_TASK_STARTED_MESSAGE);
         await this.createSession(
           contextKey,
           context.defaultAgent,
@@ -1976,6 +2000,10 @@ export class ProxySessionController {
         if (command.projectless && this.ensureAgent(context.defaultAgent).kind !== "app-server") {
           throw new Error("/newgroup --nodir 仅支持 App Server Agent。");
         }
+        if (!userId?.startsWith("ou_")) {
+          throw new Error("/newgroup 只能由具有 open_id 的飞书用户消息触发。");
+        }
+        await this.outbound.sendText(contextKey, CREATE_GROUP_STARTED_MESSAGE);
         await this.createFeishuGroup(
           contextKey,
           context.defaultAgent,
@@ -2008,6 +2036,7 @@ export class ProxySessionController {
         await this.enqueueNoSteerPrompt(contextKey, command.text, messageId, replyTarget);
         return;
       case "sessions":
+        await this.outbound.sendText(contextKey, LIST_SESSIONS_STARTED_MESSAGE);
         await this.listSessions(contextKey, command.searchTerm);
         return;
       case "switch":
@@ -2030,9 +2059,11 @@ export class ProxySessionController {
         await this.openDismissGroupCard(contextKey, userId);
         return;
       case "status":
+        await this.outbound.sendText(contextKey, STATUS_STARTED_MESSAGE);
         await this.status(contextKey, command.sessionId);
         return;
       case "goal":
+        await this.outbound.sendText(contextKey, GOAL_STARTED_MESSAGE);
         await this.goal(contextKey, command);
         return;
       case "restart":
@@ -2046,6 +2077,7 @@ export class ProxySessionController {
         await this.setGroupMute(contextKey, command.enabled);
         return;
       case "turns":
+        await this.outbound.sendText(contextKey, LIST_TURNS_STARTED_MESSAGE);
         await this.openResetHistory(contextKey);
         return;
       case "model":
@@ -3005,6 +3037,7 @@ export class ProxySessionController {
   }
 
   private async forkSessionReference(contextKey: string, reference?: string): Promise<void> {
+    await this.outbound.sendText(contextKey, FORK_TASK_STARTED_MESSAGE);
     const plan = await this.prepareForkSession(contextKey, reference);
     const forked = await this.forkSessionIntoContext(contextKey, plan);
     const forkSourceLabel = plan.forkedFromHistoricalTurn
@@ -3958,6 +3991,7 @@ export class ProxySessionController {
     if (!userId?.startsWith("ou_")) {
       throw new Error("/forkgroup 只能由具有 open_id 的飞书用户消息触发。");
     }
+    await this.outbound.sendText(sourceContextKey, FORK_GROUP_STARTED_MESSAGE);
     const prepared = await this.prepareForkGroupSession(sourceContextKey, requestedTitle, incomingMessage);
     await this.forkPreparedSessionToFeishuGroup(
       sourceContextKey,
@@ -3975,6 +4009,7 @@ export class ProxySessionController {
     if (!userId?.startsWith("ou_")) {
       throw new Error("ForkGroup 只能由具有 open_id 的飞书用户触发。");
     }
+    await this.outbound.sendText(sourceContextKey, FORK_GROUP_STARTED_MESSAGE);
     const plan = await this.prepareForkSession(sourceContextKey, reference);
     await this.forkPreparedSessionToFeishuGroup(
       sourceContextKey,
@@ -4127,7 +4162,8 @@ export class ProxySessionController {
           });
         } catch (error) {
           if (activeWriterThreadId(error)) throw error;
-          if (!(agent.kind === "app-server" && !record.lastTurnId && isMissingRolloutError(error))) throw error;
+          if (!(agent.kind === "app-server" && !record.lastTurnId
+            && !this.store.getForkHistorySource(record.localSessionId) && isMissingRolloutError(error))) throw error;
           this.logger.warn({ error, sessionId: record.localSessionId }, "App Server task has no rollout; creating a replacement task.");
           session = await runtime.createSession({
             localSessionId: record.localSessionId,
@@ -4605,6 +4641,7 @@ export class ProxySessionController {
 
   private async cancel(contextKey: string): Promise<void> {
     const record = this.requireCurrentSession(contextKey);
+    await this.outbound.sendText(contextKey, STOP_TASK_STARTED_MESSAGE);
     await this.cancelSession(record);
   }
 
@@ -4680,14 +4717,33 @@ export class ProxySessionController {
     turnId: string,
   ): Promise<void> {
     if (!sessionId || !turnId) throw new Error("无效的 Reset 请求。请使用最新的思考卡片重试。");
+    await this.runSessionReset(sessionId, async () => {
+      await this.outbound.sendText(contextKey, TURN_RESET_STARTED_MESSAGE);
+      await this.performCurrentSessionReset(contextKey, sessionId, turnId);
+    });
+  }
+
+  private async runSessionReset(sessionId: string, operation: () => Promise<void>): Promise<void> {
     const previous = this.sessionResets.get(sessionId) ?? Promise.resolve();
-    const reset = previous.catch(() => undefined).then(() =>
-      this.performCurrentSessionReset(contextKey, sessionId, turnId));
+    const reset = previous.catch(() => undefined).then(operation);
     this.sessionResets.set(sessionId, reset);
     try {
       await reset;
     } finally {
       if (this.sessionResets.get(sessionId) === reset) this.sessionResets.delete(sessionId);
+    }
+  }
+
+  private async waitForCurrentSessionReset(contextKey: string): Promise<void> {
+    const sessionId = this.currentSession(contextKey)?.localSessionId;
+    if (!sessionId) return;
+
+    let reset = this.sessionResets.get(sessionId);
+    while (reset) {
+      await reset.catch(() => undefined);
+      const next = this.sessionResets.get(sessionId);
+      if (!next || next === reset) return;
+      reset = next;
     }
   }
 
@@ -4707,16 +4763,11 @@ export class ProxySessionController {
 
     this.resetHistoryOperations.set(sessionId, turnId);
     try {
-      await this.openResetHistory(contextKey, { expectedSessionId: sessionId, updateMessageId, page });
-    } catch (error) {
-      if (this.resetHistoryOperations.get(sessionId) === turnId) {
-        this.resetHistoryOperations.delete(sessionId);
-      }
-      throw error;
-    }
-
-    try {
-      await this.resetCurrentSessionToTurn(contextKey, sessionId, turnId);
+      await this.runSessionReset(sessionId, async () => {
+        await this.outbound.sendText(contextKey, TURN_RESET_STARTED_MESSAGE);
+        await this.openResetHistory(contextKey, { expectedSessionId: sessionId, updateMessageId, page });
+        await this.performCurrentSessionReset(contextKey, sessionId, turnId);
+      });
     } catch (error) {
       if (this.resetHistoryOperations.get(sessionId) === turnId) {
         this.resetHistoryOperations.delete(sessionId);
@@ -4946,6 +4997,7 @@ export class ProxySessionController {
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
+    await this.outbound.sendText(contextKey, `正在切换到 Provider ${modelProvider}，请稍后。`);
     const loaded = await this.loadSession(record);
     await this.assertModelProvider(loaded, modelProvider);
     const models = await loaded.runtime.listModels();
@@ -4963,7 +5015,7 @@ export class ProxySessionController {
       model: model.id,
       effort,
       mode: loaded.session.permissionMode,
-    }, options);
+    }, options, false);
   }
 
   private async openProviderSelector(
@@ -5056,28 +5108,22 @@ export class ProxySessionController {
     contextKey: string,
     settings: { provider: string; model: string; effort: string; mode: PermissionMode },
     options: ModelCardOptions = {},
+    announceStart = true,
   ): Promise<void> {
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
+    if (announceStart) {
+      await this.outbound.sendText(contextKey, `正在切换到 Provider ${settings.provider}，请稍后。`);
+    }
     const loaded = await this.loadSession(record);
     await this.assertProviderModelSettings(loaded, settings.provider, settings.model, settings.effort);
-    if (!loaded.runtime.setExecutionSettings) {
-      throw new Error("当前运行时不支持 Provider 设置。");
-    }
-    const session = await loaded.runtime.setExecutionSettings(loaded.record.localSessionId, {
+    const session = await this.changeProviderSettings(loaded, {
       modelProvider: settings.provider,
       model: settings.model,
       reasoningEffort: settings.effort,
       permissionMode: settings.mode,
     });
-    this.store.updateRuntimeSession(loaded.record.localSessionId, {
-      modelProvider: session.modelProvider ?? settings.provider,
-      model: session.model ?? settings.model,
-      reasoningEffort: session.reasoningEffort ?? settings.effort,
-      permissionMode: session.permissionMode,
-    });
-    await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
     const notice = [
       `Provider 已切换为 ${cardCode(session.modelProvider ?? settings.provider)}`,
       `模型 ${cardCode(session.model ?? settings.model)}`,
@@ -5094,6 +5140,30 @@ export class ProxySessionController {
     } else {
       await this.outbound.sendText(contextKey, notice.replaceAll("`", ""));
     }
+  }
+
+  private async changeProviderSettings(loaded: LoadedSession, settings: RuntimeExecutionSettings): Promise<RuntimeSession> {
+    if (!loaded.runtime.setExecutionSettings) throw new Error("当前运行时不支持 Provider 设置。");
+    const persist = async (candidate: RuntimeSession): Promise<void> => {
+      assertProviderSettingsApplied(candidate, settings);
+      const agent = this.ensureAgent(loaded.record.agentName);
+      const previousDefaults = agent.defaults;
+      await this.persistAgentExecutionDefaults(loaded.record.localSessionId, candidate);
+      try {
+        this.store.updateRuntimeSession(loaded.record.localSessionId, {
+          remoteSessionId: candidate.remoteSessionId,
+          modelProvider: candidate.modelProvider,
+          model: candidate.model,
+          reasoningEffort: candidate.reasoningEffort,
+          permissionMode: candidate.permissionMode,
+        });
+      } catch (error) {
+        await this.lifecycle?.persistAgentExecutionDefaults?.(loaded.record.agentName, previousDefaults ?? {});
+        agent.defaults = previousDefaults;
+        throw error;
+      }
+    };
+    return loaded.runtime.setExecutionSettings(loaded.record.localSessionId, settings, persist);
   }
 
   private async assertProviderModelSettings(
@@ -5516,7 +5586,9 @@ export class ProxySessionController {
   private async setTitle(contextKey: string, title: string): Promise<void> {
     const normalizedTitle = normalizeTaskTitle(title);
     if (!normalizedTitle) throw new Error("任务标题不能为空。");
-    const loaded = await this.loadSession(this.requireCurrentSession(contextKey));
+    const current = this.requireCurrentSession(contextKey);
+    await this.outbound.sendText(contextKey, CHANGE_TITLE_STARTED_MESSAGE);
+    const loaded = await this.loadSession(current);
     if (loaded.runtime.setTitle) await loaded.runtime.setTitle(loaded.record.localSessionId, normalizedTitle);
     else loaded.session.title = normalizedTitle;
     this.store.updateRuntimeSession(loaded.record.localSessionId, { title: normalizedTitle });
@@ -5966,6 +6038,7 @@ export class ProxySessionController {
     const record = this.requireCurrentSession(contextKey);
     const filePath = resolveUserPath(requestedFilePath, record.cwd);
     await this.assertSendableFile(filePath);
+    await this.outbound.sendText(contextKey, SEND_FILE_STARTED_MESSAGE);
     await this.outbound.sendFile(contextKey, filePath);
   }
 
@@ -6314,6 +6387,7 @@ export class ProxySessionController {
     if (direct?.status === "closed") {
       throw new Error(`找不到任务：${taskId}`);
     }
+    await this.outbound.sendText(contextKey, SWITCH_TASK_STARTED_MESSAGE);
     const existing = direct ?? this.findStoredSessionByReference(taskId);
     if (existing) {
       const runtime = this.runtimes.forAgent(existing.agentName);
@@ -6420,6 +6494,10 @@ export class ProxySessionController {
     }
     if (local && this.store.countQueuedPrompts(local.localSessionId) > 0) {
       throw new Error("任务仍有排队消息，无法归档。请先处理或取消排队消息。");
+    }
+
+    if (options.source !== "dismiss") {
+      await this.outbound.sendText(contextKey, ARCHIVE_TASK_STARTED_MESSAGE);
     }
 
     const remoteReference = local
@@ -6947,9 +7025,10 @@ export class ProxySessionController {
     return agent;
   }
 
-  private async persistAgentExecutionDefaults(localSessionId: string): Promise<void> {
-    const session = this.store.getSession(localSessionId);
-    if (!session) throw new Error(`找不到任务：${localSessionId}`);
+  private async persistAgentExecutionDefaults(localSessionId: string, candidate?: RuntimeSession): Promise<void> {
+    const record = this.store.getSession(localSessionId);
+    if (!record) throw new Error(`找不到任务：${localSessionId}`);
+    const session = candidate ?? record;
     const agent = this.ensureAgent(session.agentName);
     const observed: AgentExecutionDefaults = {
       ...(session.modelProvider?.trim() ? { modelProvider: session.modelProvider } : {}),
@@ -7384,6 +7463,7 @@ export class ProxySessionController {
     const lockPath = runtime.getThreadWriterLockPath?.(threadId);
     if (!lockPath) throw new Error("当前 Agent 不支持自动关闭占用程序。");
 
+    await this.outbound.sendText(contextKey, CLOSE_WRITER_STARTED_MESSAGE);
     let owners = await this.threadWriterProcesses.inspect(lockPath);
     const expectedOwner = owners.length === 1 && threadWriterMatches(
       owners[0],
@@ -7841,11 +7921,6 @@ function bindSessionCardAction(
 
 function runtimeErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isMissingRolloutError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /no rollout found|rollout[^\n]*(?:not found|missing)|thread\/resume failed/i.test(message);
 }
 
 function isUnmaterializedCodexThreadError(error: unknown): boolean {
