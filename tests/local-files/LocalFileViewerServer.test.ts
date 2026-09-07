@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
 
@@ -160,6 +161,95 @@ describe("LocalFileViewerServer", () => {
       expect(update.content).toContain('class="markdown-table-scroll"');
       expect(update.content).toContain("<td>completed</td>");
       expect(update.content).toContain('<section data-view-panel="code">');
+    } finally {
+      controller.abort();
+    }
+  }, 10_000);
+
+  test("opens relative, absolute, file-URL, reference-style, and directory links from rendered Markdown", async () => {
+    const directory = createTemporaryDirectory();
+    const docs = path.join(directory, "docs");
+    const nested = path.join(docs, "nested");
+    fs.mkdirSync(nested, { recursive: true });
+    const child = path.join(nested, "报告 (final).md");
+    const outside = path.join(directory, "outside.txt");
+    fs.writeFileSync(child, "# Child report\n", "utf8");
+    fs.writeFileSync(outside, "first\nsecond\nthird\n", "utf8");
+    const filePath = path.join(docs, "index.md");
+    const childRelative = "nested/" + encodeURIComponent(path.basename(child));
+    const source = [
+      `[**Child**](${childRelative} "Report title")`,
+      "[Parent](../outside.txt:2:4)",
+      `[Absolute](<${outside.replaceAll("\\", "/")}>)`,
+      `[File URL](${pathToFileURL(outside).href}#L3-L4)`,
+      "[Directory](nested/)",
+      "[Reference][report]",
+      "",
+      `[report]: ${childRelative}`,
+      "",
+      `\`[Example](${childRelative})\``,
+      "```markdown",
+      `[Sample](${childRelative})`,
+      "```",
+    ].join("\n");
+    fs.writeFileSync(filePath, source, "utf8");
+    const server = await startServer(path.join(directory, "state"));
+    const page = await (await fetch(server.createFileUrl(filePath)!)).text();
+    const childHref = server.createFileUrl(child)!.replaceAll("&", "&amp;");
+    expect(page).toContain(`<a href="${childHref}" title="Report title"><strong>Child</strong></a>`);
+    expect(page).toContain(`<a href="${childHref}">Reference</a>`);
+    expect(page).toContain(`<a href="${server.createFileUrl(outside, ":2")!.replaceAll("&", "&amp;")}">Parent</a>`);
+    expect(page).toContain(`<a href="${server.createFileUrl(outside)!.replaceAll("&", "&amp;")}">Absolute</a>`);
+    expect(page).toContain(`<a href="${server.createFileUrl(outside, ":3")!.replaceAll("&", "&amp;")}">File URL</a>`);
+    expect(page).toContain(`<a href="${server.createFileUrl(nested)!.replaceAll("&", "&amp;")}">Directory</a>`);
+    expect(page).toContain(`<code>[Example](${childRelative})</code>`);
+    const childPage = await (await fetch(server.createFileUrl(child)!)).text();
+    expect(childPage).toContain("<h1>Child report</h1>");
+    expect(await (await fetch(server.createFileUrl(nested)!)).text()).toContain(path.basename(child));
+    const original = new URL(server.createFileUrl(filePath)!);
+    original.searchParams.set("raw", "1");
+    expect(await (await fetch(original)).text()).toBe(source);
+  });
+
+  test("loads local Markdown images from signed raw URLs and handles missing linked files", async () => {
+    const directory = createTemporaryDirectory();
+    const imagePath = path.join(directory, "sample.png");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+    fs.writeFileSync(imagePath, png);
+    const filePath = path.join(directory, "index.md");
+    fs.writeFileSync(filePath, "![Sample](sample.png)\n[Missing](missing.md)\n", "utf8");
+    const server = await startServer(path.join(directory, "state"));
+    const page = await (await fetch(server.createFileUrl(filePath)!)).text();
+    const imageLink = /<img src="([^"]+)" alt="Sample"/u.exec(page)![1]!.replaceAll("&amp;", "&");
+    const raw = await fetch(imageLink);
+    expect(raw.headers.get("content-type")).toBe("image/png");
+    expect(Buffer.from(await raw.arrayBuffer())).toEqual(png);
+    const missingLink = /<a href="([^"]+)">Missing<\/a>/u.exec(page)![1]!.replaceAll("&amp;", "&");
+    const missing = await fetch(missingLink);
+    expect(missing.status).toBe(404);
+    expect(await missing.text()).toContain("文件不存在");
+    const tampered = new URL(missingLink);
+    tampered.searchParams.set("path", filePath);
+    expect((await fetch(tampered)).status).toBe(403);
+  });
+
+  test("converts Markdown links on live updates using each document's directory", async () => {
+    const directory = createTemporaryDirectory();
+    const child = path.join(directory, "child.txt");
+    fs.writeFileSync(child, "child\n", "utf8");
+    const filePath = path.join(directory, "index.md");
+    fs.writeFileSync(filePath, "# Live\n", "utf8");
+    const server = await startServer(path.join(directory, "state"));
+    const fileUrl = server.createFileUrl(filePath)!;
+    const page = await (await fetch(fileUrl)).text();
+    const eventsUrl = /data-events-url="([^"]+)"/u.exec(page)![1]!.replaceAll("&amp;", "&");
+    const controller = new AbortController();
+    try {
+      const events = createServerSentEventReader(await fetch(eventsUrl, { signal: controller.signal }));
+      await events.next("update");
+      fs.appendFileSync(filePath, "\n[Child](child.txt#L1)\n", "utf8");
+      const update = JSON.parse(await events.next("update"));
+      expect(update.content).toContain(`<a href="${server.createFileUrl(child, ":1")!.replaceAll("&", "&amp;")}">Child</a>`);
     } finally {
       controller.abort();
     }

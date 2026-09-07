@@ -7,6 +7,7 @@ import dos from "highlight.js/lib/languages/dos";
 import dockerfile from "highlight.js/lib/languages/dockerfile";
 import powershell from "highlight.js/lib/languages/powershell";
 import MarkdownIt from "markdown-it";
+import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 import {
   selectPreferredNetworkAddress,
   type NetworkConnectionKind,
@@ -43,6 +44,8 @@ const MARKDOWN_RENDERER = new MarkdownIt({
 MARKDOWN_RENDERER.renderer.rules.table_open = () =>
   '<div class="markdown-table-scroll" role="region" aria-label="Markdown 表格" tabindex="0"><table>\n';
 MARKDOWN_RENDERER.renderer.rules.table_close = () => '</table></div>\n';
+const validateMarkdownLink = MARKDOWN_RENDERER.validateLink.bind(MARKDOWN_RENDERER);
+MARKDOWN_RENDERER.validateLink = (url) => isFileUrl(url) || validateMarkdownLink(url);
 
 const HIGHLIGHT_LANGUAGE_BY_EXTENSION: Readonly<Record<string, string>> = {
   ".bash": "bash", ".bat": "dos", ".c": "c", ".cc": "cpp", ".cmd": "dos", ".cpp": "cpp",
@@ -132,7 +135,10 @@ const VIEWER_CLIENT_SCRIPT = `(() => {
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(updateHeaderOffset).observe(header);
   }
-  window.addEventListener("hashchange", () => requestAnimationFrame(positionHashTarget));
+  window.addEventListener("hashchange", () => {
+    if (/^#L\\d+$/u.test(window.location.hash)) setViewMode("code");
+    else requestAnimationFrame(positionHashTarget);
+  });
   requestAnimationFrame(positionHashTarget);
   if (!eventsUrl || typeof EventSource !== "function") return;
 
@@ -496,7 +502,7 @@ export class LocalFileViewerServer {
     if (classification.kind === "text") {
       const preview = readTextPreview(filePath, stat.size, classification.encoding);
       const previewContent = isMarkdownFile(filePath)
-        ? renderMarkdownDocument(preview.text, filePath)
+        ? renderMarkdownDocument(preview.text, filePath, (target) => this.createPreviewUrl(target))
         : renderText(preview.text, filePath);
       content = `${preview.truncated ? '<div class="notice">文件较大，仅显示开头 2 MiB。可使用下方按钮查看或下载完整文件。</div>' : ""}${previewContent}`;
     } else if (contentType.startsWith("image/")) {
@@ -1084,8 +1090,12 @@ function renderText(value: string, filePath: string): string {
   }).join("")}</code></pre>`;
 }
 
-function renderMarkdownDocument(value: string, filePath: string): string {
-  return `<article class="markdown-body" data-view-panel="rendered">${MARKDOWN_RENDERER.render(value)}</article><section data-view-panel="code">${renderText(value, filePath)}</section>`;
+function renderMarkdownDocument(value: string, filePath: string, createPreviewUrl: (filePath: string) => URL): string {
+  const environment = {};
+  const tokens = MARKDOWN_RENDERER.parse(value, environment);
+  rewriteMarkdownFileLinks(tokens, filePath, createPreviewUrl);
+  const rendered = MARKDOWN_RENDERER.renderer.render(tokens, MARKDOWN_RENDERER.options, environment);
+  return `<article class="markdown-body" data-view-panel="rendered">${rendered}</article><section data-view-panel="code">${renderText(value, filePath)}</section>`;
 }
 
 function isMarkdownFile(filePath: string): boolean {
