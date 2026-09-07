@@ -483,7 +483,7 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
         ),
       };
     case "task_turns":
-      return { ok: true, data: controller.controlListTaskTurns(request.localSessionId) };
+      return { ok: true, data: await controller.controlListTaskTurns(request.localSessionId) };
     case "task_reset":
       return { ok: true, data: await controller.controlResetTaskToTurn(request.localSessionId, request.turnId) };
     case "task_mute":

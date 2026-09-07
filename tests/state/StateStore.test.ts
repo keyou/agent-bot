@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { StateStore } from "../../src/state/StateStore.js";
 
 const tempDirectories: string[] = [];
@@ -18,6 +18,32 @@ afterEach(() => {
 });
 
 describe("StateStore runtime metadata", () => {
+  test("reads graph indexes and prompt summaries without parsing complete snapshots", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    store.getOrCreateUserContext("chat_id:test", "codex");
+    store.createSession({ localSessionId: "large", contextKey: "chat_id:test", agentName: "codex", cwd: directory, status: "ready" });
+    for (let i = 1; i <= 20; i++) {
+      store.saveTurnSnapshot(`turn_${i}`, "large", {
+        turnId: `turn_${i}`, status: "completed", prompt: `Prompt ${i}`,
+        startedAt: i, completedAt: i + 1, activities: [{ output: "large-output".repeat(10_000) }],
+      }, "chat_id:test");
+    }
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const index = store.listTaskTurnGraphIndex("large");
+      expect(index).toHaveLength(20);
+      expect(index[0]).toMatchObject({ turnId: "turn_20", parentTurnId: "turn_19" });
+      expect(index[0]).not.toHaveProperty("snapshot");
+      expect(store.getTurnPromptSummary("turn_20")).toMatchObject({ prompt: "Prompt 20", completedAt: 21 });
+      expect(parse.mock.calls.some(([value]) => value.includes("large-output"))).toBe(false);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
   test("persists and replaces compact card action bindings", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);
@@ -662,6 +688,9 @@ describe("StateStore runtime metadata", () => {
     }, "chat_id:c2");
 
     expect(store.countCompletedTurnSnapshots("session_1", "chat_id:c1")).toBe(12);
+    expect(store.findLatestCompletedTurnId("session_1", "chat_id:c1")).toBe("turn_12");
+    expect(store.findLatestCompletedTurnId("session_1")).toBe("turn_other_context");
+    expect(store.findLatestCompletedTurnId("missing_session")).toBeUndefined();
     expect(store.listCompletedTurnSnapshots("session_1", "chat_id:c1", 10).map((turn) => turn.turnId))
       .toEqual(["turn_12", "turn_11", "turn_10", "turn_9", "turn_8", "turn_7", "turn_6", "turn_5", "turn_4", "turn_3"]);
     expect(store.listCompletedTurnSnapshots("session_1", "chat_id:c1", 10, 10).map((turn) => turn.turnId))

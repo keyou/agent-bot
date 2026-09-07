@@ -338,6 +338,9 @@ async function initCommand(
     );
     const configuredAgents = readConfiguredAgentSelection(paths.config.path).agents.map((agent) => agent.name);
     const configuredAgentNames = new Set(configuredAgents);
+    for (const agent of inspectedAgents) {
+      if (configuredAgentNames.has(agent.id) && agent.compatibilityIssue) throw new Error(agent.compatibilityIssue);
+    }
     const agents = inspectedAgents.map((agent) => ({
       ...agent,
       configured: configuredAgentNames.has(agent.id),
@@ -554,6 +557,8 @@ async function configureAgentsAndDefault(
 
   const choices = selectableDefaultAgents(configured.agents, inspections);
   if (choices.length === 0) {
+    const issue = inspections.find((inspection) => inspection.compatibilityIssue)?.compatibilityIssue;
+    if (issue) throw new Error(issue);
     throw new Error(cliText(
       "No installed supported Agent was detected. Install Codex or TraeX, then run agentbot init again.",
       "没有检测到已安装且受支持的 Agent。请安装 Codex 或 TraeX，然后重新运行 agentbot init。",
@@ -679,6 +684,10 @@ function printInteractiveAgentInspection(
   inspection: SupportedAgentInspection,
   ui: InitUi,
 ): void {
+  if (inspection.compatibilityIssue) {
+    ui.warn(inspection.compatibilityIssue);
+    return;
+  }
   if (inspection.state === "missing") {
     ui.info(cliText(
       `${inspection.name}: not installed`,
@@ -710,6 +719,10 @@ function printAgentInspection(
   inspection: SupportedAgentInspection,
   output: NodeJS.WriteStream,
 ): void {
+  if (inspection.compatibilityIssue) {
+    output.write(`  ${inspection.compatibilityIssue}\n`);
+    return;
+  }
   if (inspection.state === "missing") {
     output.write(cliText(
       `  ${inspection.name}: not installed\n`,

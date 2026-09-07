@@ -12,7 +12,7 @@ export function selectableDefaultAgents(
   const supported = new Map(inspections.map((inspection) => [inspection.id, inspection]));
   return configured.flatMap((agent) => {
     const inspection = supported.get(agent.name as SupportedAgentInspection["id"]);
-    if (!inspection?.installedVersion) return [];
+    if (!inspection?.installedVersion || inspection.compatibilityIssue) return [];
     return [{
       ...agent,
       installedVersion: inspection.installedVersion,

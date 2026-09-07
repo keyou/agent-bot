@@ -11,12 +11,15 @@ import {
 } from "../runtime/agentEnvironment.js";
 import type { AgentProcessInfo } from "../runtime/types.js";
 import { spawnStdioCommand } from "../utils/spawnCommand.js";
+import { assertSupportedCodexVersion } from "./CodexVersion.js";
 
 export class CodexProcessManager implements AppServerClientProvider {
   private static readonly RELEASE_TIMEOUT_MS = 5_000;
   private client?: AppServerConnection;
   private child?: ChildProcessWithoutNullStreams;
   private version?: string;
+  private agentFamily?: "codex" | "traex";
+  private initializing?: Promise<AppServerClient>;
   private readonly disconnectListeners = new Set<(error: Error) => void>();
 
   constructor(
@@ -28,7 +31,18 @@ export class CodexProcessManager implements AppServerClientProvider {
   ) {}
 
   async getClient(): Promise<AppServerClient> {
+    if (this.initializing) return this.initializing;
     if (this.client) return this.client;
+    const initialization = this.startClient();
+    this.initializing = initialization;
+    try {
+      return await initialization;
+    } finally {
+      if (this.initializing === initialization) this.initializing = undefined;
+    }
+  }
+
+  private async startClient(): Promise<AppServerClient> {
     this.version = undefined;
     const environmentContext = this.environmentContext();
     const child = spawnStdioCommand(
@@ -52,13 +66,25 @@ export class CodexProcessManager implements AppServerClientProvider {
       const error = new Error(`App Server exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`);
       for (const listener of this.disconnectListeners) listener(error);
     });
-    const initializeResult = await client.request("initialize", {
-      clientInfo: { name: "agent-bot", title: "Agent Bot", version: "0.1.0" },
-      capabilities: { experimentalApi: true },
-    });
-    this.version = initializedAgentVersion(initializeResult);
-    client.notify("initialized", {});
-    return client;
+    try {
+      const initializeResult = await client.request("initialize", {
+        clientInfo: { name: "agent-bot", title: "Agent Bot", version: "0.1.0" },
+        capabilities: { experimentalApi: true },
+      });
+      this.version = initializedAgentVersion(initializeResult);
+      const userAgent = initializeResult && typeof initializeResult === "object"
+        ? (initializeResult as Record<string, unknown>).userAgent : undefined;
+      if (!this.getAgentFamily() && typeof userAgent === "string") {
+        if (/^codex(?:-cli)?[ /]/iu.test(userAgent)) this.agentFamily = "codex";
+        else if (/^trae(?:cli|x)?[ /]/iu.test(userAgent)) this.agentFamily = "traex";
+      }
+      if (this.getAgentFamily() === "codex") assertSupportedCodexVersion(this.version);
+      client.notify("initialized", {});
+      return client;
+    } catch (error) {
+      if (this.client === client) this.close();
+      throw error;
+    }
   }
 
   getProcessInfo(): AgentProcessInfo {
@@ -68,6 +94,17 @@ export class CodexProcessManager implements AppServerClientProvider {
       pid,
       ...(this.version ? { version: this.version } : {}),
     };
+  }
+
+  getAgentFamily(): "codex" | "traex" | undefined {
+    if (this.agentFamily) return this.agentFamily;
+    const candidates = [this.command, this.args[0], this.environmentContext().agentName];
+    for (const value of candidates) {
+      const executable = value?.replaceAll("\\", "/").split("/").at(-1) ?? "";
+      if (/^codex(?:\.(?:exe|cmd|bat|m?js))?$/iu.test(executable)) return "codex";
+      if (/^(?:traex|traecli)(?:\.(?:exe|cmd|bat|m?js))?$/iu.test(executable)) return "traex";
+    }
+    return undefined;
   }
 
   getCodexHome(): string {

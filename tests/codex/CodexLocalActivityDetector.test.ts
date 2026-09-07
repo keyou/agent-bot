@@ -1,17 +1,53 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
 
 const temporaryDirectories: string[] = [];
+const reads = vi.hoisted(() => ({ bytes: 0 }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...original, open: async (...args: Parameters<typeof original.open>) => {
+    const file = await original.open(...args);
+    const read = file.read.bind(file);
+    file.read = ((...input: unknown[]) => {
+      if (typeof input[2] === "number") reads.bytes += input[2];
+      return Reflect.apply(read, file, input);
+    }) as typeof file.read;
+    return file;
+  } };
+});
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
 describe("CodexLocalActivityDetector", () => {
+  test("reuses unchanged rollouts and scans only appended bytes without losing active state", async () => {
+    const home = await createCodexHome();
+    const rollout = path.join(home, "sessions", "incremental.jsonl");
+    await writeFile(rollout, `${event("task_started")}\n${"x".repeat(300_000)}\n`);
+    createStateDatabase(home, [{ id: "incremental", rolloutPath: rollout }]);
+    const detector = new CodexLocalActivityDetector(home);
+    expect((await detector.activeThreadIds(["incremental"])).has("incremental")).toBe(true);
+    reads.bytes = 0;
+    expect((await detector.activeThreadIds(["incremental"])).has("incremental")).toBe(true);
+    expect(reads.bytes).toBe(0);
+    await appendFile(rollout, `${"y".repeat(2_000)}\n`);
+    expect((await detector.activeThreadIds(["incremental"])).has("incremental")).toBe(true);
+    expect(reads.bytes).toBeLessThan(10_000);
+    await appendFile(rollout, `${event("task_complete")}\n`);
+    expect((await detector.activeThreadIds(["incremental"])).size).toBe(0);
+    await writeFile(rollout, `${event("task_started")}\n`);
+    expect((await detector.activeThreadIds(["incremental"])).has("incremental")).toBe(true);
+    await rm(rollout);
+    expect((await detector.activeThreadIds(["incremental"])).size).toBe(0);
+    await writeFile(rollout, `${event("task_complete")}\n`);
+    expect((await detector.activeThreadIds(["incremental"])).size).toBe(0);
+  });
+
   test("detects an unpaired task_started event without modifying Codex state", async () => {
     const home = await createCodexHome();
     const activeRollout = await createRollout(home, "active", ["task_complete", "task_started"]);

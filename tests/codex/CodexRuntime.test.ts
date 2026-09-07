@@ -7,6 +7,47 @@ import { CodexRuntime, type AppServerClientProvider } from "../../src/codex/Code
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
 
 describe("CodexRuntime", () => {
+  test("treats a new unmaterialized task as empty without masking pagination failures", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    client.turnListErrors.push(new AppServerRequestError("thread/turns/list", -32600,
+      "thread empty is not materialized yet; thread/turns/list is unavailable before first user message"));
+    expect((await runtime.readRemoteSession("empty")).completedTurns).toEqual([]);
+    client.turnListErrors.push(new AppServerRequestError("thread/turns/list", -32601, "Unknown method"));
+    await expect(runtime.listRemoteTurnSummaries("empty", { limit: 10 })).rejects.toThrow("Unknown method");
+    expect(client.requests.filter((r) => r.method === "thread/read")).toEqual([
+      { method: "thread/read", params: { threadId: "empty", includeTurns: false } },
+    ]);
+  });
+
+  test("uses TraeX's explicit updated_at sorting without a failed Codex-protocol probe", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime({ ...provider(client), getAgentFamily: () => "traex" }, logger());
+    await runtime.listRemoteSessions();
+    expect(client.requests).toEqual([{ method: "thread/list", params: expect.objectContaining({ sortKey: "updated_at" }) }]);
+  });
+
+  test("status fetches one full turn while metadata fetches none, even with thousands of turns", async () => {
+    const client = new FakeAppServerClient();
+    client.readResult = { thread: {
+      id: "large", status: { type: "idle" },
+      turns: Array.from({ length: 2_000 }, (_, i) => ({
+        id: `turn_${i}`, status: "completed",
+        items: [{ type: "agentMessage", phase: "final_answer", text: `Result ${i}` }],
+      })),
+    } };
+    const runtime = new CodexRuntime(provider(client), logger());
+    expect((await runtime.readRemoteSession("large", "metadata")).lastTurnId).toBeUndefined();
+    expect(client.requests.map((r) => r.method)).toEqual(["thread/read"]);
+    const result = await runtime.readRemoteSession("large", "latest-full");
+    expect(result.finalResponse).toBe("Result 1999");
+    expect(result.completedTurns).toHaveLength(1);
+    expect(client.requests.at(-1)).toEqual({
+      method: "thread/turns/list",
+      params: { threadId: "large", limit: 1, sortDirection: "desc", itemsView: "full" },
+    });
+  });
+
   test("refreshes only the current thread and retries once when turn/start rejects a stale cwd", async () => {
     const client = new FakeAppServerClient();
     const testLogger = logger();
@@ -272,7 +313,7 @@ describe("CodexRuntime", () => {
     });
   });
 
-  test("retries a fork without excludeTurns when an older App Server rejects the field", async () => {
+  test("does not retry a fork with a full-history response when excludeTurns is rejected", async () => {
     const client = new FakeAppServerClient();
     client.forkErrors.push(new AppServerRequestError(
       "thread/fork",
@@ -283,23 +324,18 @@ describe("CodexRuntime", () => {
     const testLogger = logger();
     const runtime = new CodexRuntime(provider(client), testLogger);
 
-    await runtime.forkSession({
+    await expect(runtime.forkSession({
       localSessionId: "fallback_local",
       remoteSessionId: "thr_source",
       lastTurnId: "turn_anchor",
       agentName: "codex",
       cwd: process.cwd(),
       permissionMode: "auto",
-    });
+    })).rejects.toThrow("Invalid params");
 
     const requests = client.requests.filter((request) => request.method === "thread/fork");
-    expect(requests).toHaveLength(2);
+    expect(requests).toHaveLength(1);
     expect(requests[0]?.params).toEqual(expect.objectContaining({ excludeTurns: true }));
-    expect(requests[1]?.params).not.toHaveProperty("excludeTurns");
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      { error: expect.any(AppServerRequestError) },
-      "App Server does not support thread/fork excludeTurns; retrying without it.",
-    );
   });
 
   test("does not retry a fork after an ambiguous failure", async () => {
@@ -1320,7 +1356,7 @@ describe("CodexRuntime", () => {
     expect(client.requests.filter((request) => request.method === "thread/resume")).toHaveLength(0);
     expect(client.requests).toContainEqual({
       method: "thread/read",
-      params: { threadId: "external_1", includeTurns: true },
+      params: { threadId: "external_1", includeTurns: false },
     });
     expect(client.requests).toContainEqual(expect.objectContaining({
       method: "thread/list",
@@ -1350,7 +1386,7 @@ describe("CodexRuntime", () => {
     };
     const runtime = new CodexRuntime(provider(client), logger());
 
-    await expect(runtime.readRemoteSession("active_with_history")).resolves.toEqual(expect.objectContaining({
+    await expect(runtime.readRemoteForkSource("active_with_history")).resolves.toEqual(expect.objectContaining({
       lastTurnId: "turn_running",
       lastCompletedTurnId: "turn_completed_2",
       lastTurnStatus: "inProgress",
@@ -1438,13 +1474,29 @@ describe("CodexRuntime", () => {
     expect(client.requests.filter((request) => request.method === "thread/turns/list")).toHaveLength(2);
   });
 
-  test("reads paginated thread history through thread/turns/list", async () => {
+  test("reads only one requested page of Turn summaries without fetching complete history", async () => {
     const client = new FakeAppServerClient();
-    client.readErrors.push(new AppServerRequestError(
-      "thread/read",
-      -32602,
-      "paginated threads do not support thread/read(includeTurns=true)",
-    ));
+    client.turnListResults.push({
+      data: [
+        { id: "running", status: "inProgress", items: [] },
+        { id: "done_2", status: "completed", items: [{ type: "userMessage", content: [{ type: "text", text: "Second" }] }] },
+        { id: "done_1", status: "completed", items: [{ type: "userMessage", content: [{ type: "text", text: "First" }] }] },
+      ],
+      nextCursor: "older",
+    });
+    const runtime = new CodexRuntime(provider(client), logger());
+    await expect(runtime.listRemoteTurnSummaries("large_thread", { cursor: "page_2", limit: 3 })).resolves.toEqual({
+      turns: [expect.objectContaining({ id: "done_2", prompt: "Second" }), expect.objectContaining({ id: "done_1", prompt: "First" })],
+      nextCursor: "older",
+    });
+    expect(client.requests).toEqual([{
+      method: "thread/turns/list",
+      params: { threadId: "large_thread", cursor: "page_2", limit: 3, sortDirection: "desc", itemsView: "summary" },
+    }]);
+  });
+
+  test("reads only the latest turn and does not follow its history cursor", async () => {
+    const client = new FakeAppServerClient();
     client.readResult = {
       thread: {
         id: "paginated_thread",
@@ -1458,9 +1510,9 @@ describe("CodexRuntime", () => {
     client.turnListResults.push(
       {
         data: [{
-          id: "turn_1",
+          id: "turn_2",
           status: "completed",
-          items: [{ type: "userMessage", content: [{ type: "text", text: "First request" }] }],
+          items: [{ type: "userMessage", content: [{ type: "text", text: "Latest request" }] }],
         }],
         nextCursor: "page_2",
       },
@@ -1481,15 +1533,10 @@ describe("CodexRuntime", () => {
       lastCompletedTurnId: "turn_2",
       lastUserPrompt: "Latest request",
       completedTurns: [
-        expect.objectContaining({ id: "turn_1", prompt: "First request" }),
         expect.objectContaining({ id: "turn_2", prompt: "Latest request" }),
       ],
     }));
-    expect(client.requests).toEqual(expect.arrayContaining([
-      {
-        method: "thread/read",
-        params: { threadId: "paginated_thread", includeTurns: true },
-      },
+    expect(client.requests).toEqual([
       {
         method: "thread/read",
         params: { threadId: "paginated_thread", includeTurns: false },
@@ -1498,31 +1545,17 @@ describe("CodexRuntime", () => {
         method: "thread/turns/list",
         params: {
           threadId: "paginated_thread",
-          limit: 100,
-          sortDirection: "asc",
-          itemsView: "full",
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "summary",
         },
       },
-      {
-        method: "thread/turns/list",
-        params: {
-          threadId: "paginated_thread",
-          cursor: "page_2",
-          limit: 100,
-          sortDirection: "asc",
-          itemsView: "full",
-        },
-      },
-    ]));
+    ]);
+    expect(client.turnListResults).toHaveLength(1);
   });
 
   test("reads metadata without Turns for an unmaterialized thread", async () => {
     const client = new FakeAppServerClient();
-    client.readErrors.push(new AppServerRequestError(
-      "thread/read",
-      -32602,
-      "thread empty_thread is not materialized yet; includeTurns is unavailable before first user message",
-    ));
     client.readResult = {
       thread: {
         id: "empty_thread",
@@ -1535,7 +1568,7 @@ describe("CodexRuntime", () => {
     };
     const runtime = new CodexRuntime(provider(client), logger());
 
-    await expect(runtime.readRemoteSession("empty_thread")).resolves.toEqual(expect.objectContaining({
+    await expect(runtime.readRemoteSession("empty_thread", "metadata")).resolves.toEqual(expect.objectContaining({
       id: "empty_thread",
       title: "Empty task",
       completedTurns: [],
@@ -1547,7 +1580,7 @@ describe("CodexRuntime", () => {
     expect(client.requests.some((request) => request.method === "thread/turns/list")).toBe(false);
   });
 
-  test("falls back to updated_at when an App Server rejects recency_at sorting", async () => {
+  test("does not retry unsupported legacy thread sorting", async () => {
     const client = new FakeAppServerClient();
     client.listErrors.push(new AppServerRequestError(
       "thread/list",
@@ -1557,18 +1590,11 @@ describe("CodexRuntime", () => {
     const testLogger = logger();
     const runtime = new CodexRuntime(provider(client), testLogger);
 
-    await expect(runtime.listRemoteSessions()).resolves.toEqual({ sessions: [], nextCursor: undefined });
-    await expect(runtime.listRemoteSessions()).resolves.toEqual({ sessions: [], nextCursor: undefined });
+    await expect(runtime.listRemoteSessions()).rejects.toThrow("unknown variant recency_at");
 
     const requests = client.requests.filter((request) => request.method === "thread/list");
-    expect(requests).toHaveLength(3);
+    expect(requests).toHaveLength(1);
     expect(requests[0]?.params).toEqual(expect.objectContaining({ sortKey: "recency_at" }));
-    expect(requests[1]?.params).toEqual(expect.objectContaining({ sortKey: "updated_at" }));
-    expect(requests[2]?.params).toEqual(expect.objectContaining({ sortKey: "updated_at" }));
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      { error: expect.any(AppServerRequestError) },
-      "App Server does not support thread/list recency_at sorting; retrying with updated_at.",
-    );
   });
 
   test("enriches external task reads with locally persisted execution settings", async () => {
@@ -1639,8 +1665,8 @@ describe("CodexRuntime", () => {
       nextCursor: undefined,
     });
     expect(client.requests).toContainEqual({
-      method: "thread/read",
-      params: { threadId: "stale_external", includeTurns: true },
+      method: "thread/turns/list",
+      params: { threadId: "stale_external", limit: 1, sortDirection: "desc", itemsView: "summary" },
     });
   });
 });
@@ -1655,6 +1681,7 @@ class FakeAppServerClient {
   readResult: unknown = { thread: { id: "thr_1", name: null, preview: "" } };
   readErrors: Error[] = [];
   turnListResults: unknown[] = [];
+  turnListErrors: Error[] = [];
   listResult: unknown = { data: [], nextCursor: null };
   listErrors: Error[] = [];
   turnStartErrors: Error[] = [];
@@ -1677,12 +1704,18 @@ class FakeAppServerClient {
       return this.forkResult as T;
     }
     if (method === "thread/read") {
+      if ((params as { includeTurns?: boolean }).includeTurns) throw new Error("Full history must not be requested");
       const error = this.readErrors.shift();
       if (error) throw error;
-      return this.readResult as T;
+      const result = this.readResult as { thread: Record<string, unknown> };
+      return { thread: { ...result.thread, turns: [] } } as T;
     }
     if (method === "thread/turns/list") {
-      return (this.turnListResults.shift() ?? { data: [], nextCursor: null }) as T;
+      const error = this.turnListErrors.shift();
+      if (error) throw error;
+      const turns = (this.readResult as { thread: { turns?: unknown[] } }).thread.turns ?? [];
+      const limit = (params as { limit: number }).limit;
+      return (this.turnListResults.shift() ?? { data: turns.slice().reverse().slice(0, limit), nextCursor: null }) as T;
     }
     if (method === "thread/list") {
       const error = this.listErrors.shift();

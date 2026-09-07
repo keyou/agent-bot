@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { codexVersionIssue, MINIMUM_CODEX_VERSION } from "../codex/CodexVersion.js";
+import { compareSemanticVersions } from "../utils/semanticVersion.js";
+export { compareSemanticVersions } from "../utils/semanticVersion.js";
 
 export type SupportedAgentId = "codex" | "traex";
 export type SupportedAgentState = "missing" | "outdated" | "ready";
@@ -29,6 +32,8 @@ export interface SupportedAgentInspection {
   installedVersion?: string;
   latestVersion?: string;
   latestCheckFailed?: boolean;
+  minimumVersion?: string;
+  compatibilityIssue?: string;
   action?: {
     kind: AgentMaintenanceKind;
     command: string;
@@ -99,6 +104,15 @@ async function inspectCodex(
   const installed = await run(capturedCommand("codex", ["--version"], platform, env, 5_000));
   const installedVersion = commandVersion(installed);
   if (!installedVersion) return missingInspection("codex", "Codex", platform, env);
+
+  const compatibilityIssue = codexVersionIssue(installedVersion);
+  if (compatibilityIssue) {
+    return {
+      id: "codex", name: "Codex", state: "outdated", installedVersion,
+      minimumVersion: MINIMUM_CODEX_VERSION, compatibilityIssue,
+      action: maintenanceAction("codex", "upgrade", platform, env),
+    };
+  }
 
   const latest = await run(capturedCommand(
     "npm",
@@ -292,46 +306,6 @@ function commandOutput(result: AgentCommandResult): string {
 
 function versionInText(value: string): string | undefined {
   return /\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\b/u.exec(value)?.[1];
-}
-
-export function compareSemanticVersions(left: string, right: string): number {
-  const leftVersion = parseSemanticVersion(left);
-  const rightVersion = parseSemanticVersion(right);
-  if (!leftVersion || !rightVersion) return 0;
-  for (let index = 0; index < 3; index += 1) {
-    const difference = leftVersion.core[index]! - rightVersion.core[index]!;
-    if (difference !== 0) return difference;
-  }
-  if (!leftVersion.prerelease && !rightVersion.prerelease) return 0;
-  if (!leftVersion.prerelease) return 1;
-  if (!rightVersion.prerelease) return -1;
-  const length = Math.max(leftVersion.prerelease.length, rightVersion.prerelease.length);
-  for (let index = 0; index < length; index += 1) {
-    const leftPart = leftVersion.prerelease[index];
-    const rightPart = rightVersion.prerelease[index];
-    if (leftPart === undefined) return -1;
-    if (rightPart === undefined) return 1;
-    if (leftPart === rightPart) continue;
-    const leftNumber = /^\d+$/u.test(leftPart) ? Number(leftPart) : undefined;
-    const rightNumber = /^\d+$/u.test(rightPart) ? Number(rightPart) : undefined;
-    if (leftNumber !== undefined && rightNumber !== undefined) return leftNumber - rightNumber;
-    if (leftNumber !== undefined) return -1;
-    if (rightNumber !== undefined) return 1;
-    return leftPart.localeCompare(rightPart);
-  }
-  return 0;
-}
-
-function parseSemanticVersion(value: string): {
-  core: [number, number, number];
-  prerelease?: string[];
-} | undefined {
-  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u.exec(value);
-  if (!match) return undefined;
-  return {
-    core: [Number(match[1]), Number(match[2]), Number(match[3])],
-    ...(match[4] ? { prerelease: match[4].split(".") } : {}),
-  };
 }
 
 export function runAgentCommand(command: AgentCommandSpec): Promise<AgentCommandResult> {

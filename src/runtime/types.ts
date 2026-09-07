@@ -113,6 +113,11 @@ export interface RemoteCompletedTurnSummary {
   completedAt?: number;
 }
 
+export interface RemoteTurnPage {
+  turns: RemoteCompletedTurnSummary[];
+  nextCursor?: string;
+}
+
 export interface RemoteSessionSummary {
   id: string;
   title?: string;
@@ -163,6 +168,8 @@ export interface RuntimeSession {
   reasoningEffort?: string;
   permissionMode: PermissionMode;
   activeTurnId?: string;
+  // Returned by reconciliation so status callers can reuse the same observation.
+  remoteSummary?: RemoteSessionSummary;
 }
 
 export interface CreateRuntimeSessionInput {
@@ -229,8 +236,9 @@ export interface AgentRuntime {
   getSession(localSessionId: string): RuntimeSession | undefined;
   readSessionMetadata(remoteSessionId: string): Promise<RuntimeSessionMetadata>;
   listRemoteSessions?(input?: { searchTerm?: string; cursor?: string; limit?: number }): Promise<RemoteSessionPage>;
-  readRemoteSession?(remoteSessionId: string): Promise<RemoteSessionSummary>;
+  readRemoteSession?(remoteSessionId: string, view?: "metadata" | "latest" | "latest-full"): Promise<RemoteSessionSummary>;
   readRemoteForkSource?(remoteSessionId: string): Promise<RemoteSessionSummary>;
+  listRemoteTurnSummaries?(remoteSessionId: string, input: { cursor?: string; limit: number }): Promise<RemoteTurnPage>;
   inspectRemoteSessionActivity?(remoteSessionId: string): Promise<RemoteSessionActivity>;
   synchronizeSession(sessionId: string): Promise<RuntimeSession>;
   startTurn(sessionId: string, prompt: RuntimePrompt): Promise<string>;

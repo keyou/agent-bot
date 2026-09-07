@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Logger } from "pino";
+import { CodexVersionError } from "../../src/codex/CodexVersion.js";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type {
   ThreadWriterProcess,
@@ -14,7 +15,7 @@ import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
 import { OutboundRouter } from "../../src/presentation/OutboundRouter.js";
 import { ProxySessionController } from "../../src/proxy/ProxySessionController.js";
 import { AgentRuntimeRegistry } from "../../src/runtime/AgentRuntimeRegistry.js";
-import type { AgentRuntime, RemoteSessionSummary, RuntimeEvent, RuntimeGoal, RuntimeSession } from "../../src/runtime/types.js";
+import type { AgentRuntime, RemoteSessionSummary, RemoteTurnPage, RuntimeEvent, RuntimeGoal, RuntimeSession } from "../../src/runtime/types.js";
 import type {
   ShellCommandJobManagerLike,
   ShellCommandJobSnapshot,
@@ -366,6 +367,16 @@ function fixture(
       const session = remoteSessions.find((candidate) => candidate.id === id);
       if (!session) throw new Error(`Unknown remote session: ${id}`);
       return session;
+    }),
+    listRemoteTurnSummaries: vi.fn(async (id, { cursor, limit }) => {
+      const session = remoteSessions.find((candidate) => candidate.id === id);
+      if (!session) throw new Error(`Unknown remote session: ${id}`);
+      const turns = (session.completedTurns ?? []).slice().reverse();
+      const offset = Number(cursor ?? 0);
+      return {
+        turns: turns.slice(offset, offset + limit),
+        nextCursor: offset + limit < turns.length ? String(offset + limit) : undefined,
+      };
     }),
     inspectRemoteSessionActivity: vi.fn(async (id: string) => {
       const session = remoteSessions.find((candidate) => candidate.id === id);
@@ -1564,7 +1575,8 @@ describe("ProxySessionController", () => {
 
     await controller.onMessage(message("/turns"));
 
-    expect(runtime.readRemoteSession).toHaveBeenCalledWith("remote_partial_history");
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledWith("remote_partial_history", { cursor: undefined, limit: 10 });
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
     const card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1];
     const serialized = JSON.stringify(card);
     expect(serialized).toContain("Missing first Prompt");
@@ -1577,6 +1589,70 @@ describe("ProxySessionController", () => {
       "remote_turn_1",
     ]);
   });
+
+  test("reuses the status reconciliation result instead of reading the remote task twice", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("/new Status reuse"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    store.updateSession(id, { status: "running" });
+    vi.mocked(runtime.synchronizeSession).mockImplementation(async () => ({
+      ...runtime.getSession(id)!, remoteSummary: {
+        id: runtime.getSession(id)!.remoteSessionId, cwd: process.cwd(), source: "appServer", status: "idle",
+        lastTurnId: "finished", lastTurnStatus: "completed", finalResponse: "Recovered final result",
+      },
+    }));
+    vi.mocked(runtime.readRemoteSession!).mockClear();
+    await controller.onMessage({ ...message("/status"), messageId: "status-reuse" });
+    expect(runtime.synchronizeSession).toHaveBeenCalledOnce();
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1])).toContain("Recovered final result");
+    controller.close();
+  });
+
+  test("shows an unsupported Codex version instead of silently displaying cached status", async () => {
+    const { controller, runtime, outbound } = fixture();
+    await controller.onMessage(message("/new Version check"));
+    vi.mocked(runtime.readRemoteSession!).mockRejectedValue(new CodexVersionError("Codex >= 0.153.4; run codex update"));
+    await controller.onMessage({ ...message("/status"), messageId: "old-codex-status" });
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("codex update"));
+    controller.close();
+  });
+
+  test("paginates ordinary task history and reads only current-page prompts locally", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    store.createSession({ localSessionId: "large_plain", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "ready" });
+    store.updateRuntimeSession("large_plain", { runtimeKind: "codex", remoteSessionId: "plain_remote", lastTurnId: "plain_40", lastTurnStatus: "completed" });
+    store.setCurrentSession("chat_id:c1", "large_plain");
+    remoteSessions.push({
+      id: "plain_remote", cwd: process.cwd(), source: "appServer", status: "idle",
+      completedTurns: Array.from({ length: 40 }, (_, i) => ({
+        id: `plain_${i + 1}`, prompt: `Plain prompt ${i + 1}`, startedAt: i * 10, completedAt: i * 10 + 1,
+      })),
+    });
+    const summaries = vi.spyOn(store, "getTurnPromptSummary");
+    const fullGraph = vi.spyOn(store, "listTaskTurnGraph");
+    await controller.onMessage(message("/turns"));
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledExactlyOnceWith("plain_remote", { cursor: undefined, limit: 10 });
+    expect(summaries).toHaveBeenCalledTimes(10);
+    expect(fullGraph).not.toHaveBeenCalled();
+    expect(store.getTurnSnapshot("plain_30")).toBeUndefined();
+    summaries.mockClear();
+    await controller.onCardAction({
+      actionId: "plain-page-2", contextKey: "chat_id:c1", messageId: "plain-card",
+      value: { action: "turn_reset_page", sessionId: "large_plain", contextKey: "chat_id:c1", page: "1" },
+    });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenLastCalledWith("plain_remote", { cursor: "10", limit: 10 });
+    expect(summaries).toHaveBeenCalledTimes(10);
+    expect(summaries.mock.calls.map(([id]) => id)).toEqual(Array.from({ length: 10 }, (_, i) => `plain_${30 - i}`));
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1])).toContain("Plain prompt 30");
+    await controller.onMessage({ ...message("/turns"), messageId: "plain-again" });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(2);
+    expect(store.getTurnSnapshot("plain_20")).toBeUndefined();
+    controller.close();
+  });
+
 
   test("shows the currently running turn at the top of the Turns card without Reset", async () => {
     const { controller, outbound, store } = fixture();
@@ -3507,6 +3583,9 @@ describe("ProxySessionController", () => {
       expect(store.findTurnAnchorByMessageId("om_forkgroup_source")?.turnId).toBe("turn_1");
     });
     (runtime.forkSession as ReturnType<typeof vi.fn>).mockClear();
+    vi.mocked(runtime.readRemoteSession!).mockClear();
+    vi.mocked(runtime.readRemoteSession!).mockRejectedValue(new Error("Full history must not block Fork"));
+    const importHistory = vi.spyOn(store, "importCompletedTurnHistory");
 
     await controller.onMessage({
       ...threadMessage(
@@ -3527,6 +3606,8 @@ describe("ProxySessionController", () => {
     expect(store.getUserContext("chat_id:c1:thread_id:omt_forkgroup_unbound")?.currentSessionId)
       .toBeUndefined();
     expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBeDefined();
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(importHistory).not.toHaveBeenCalled();
   });
 
   test("forkgroup in a bound topic with no completed topic turn falls back to the original turn", async () => {
@@ -3723,7 +3804,7 @@ describe("ProxySessionController", () => {
       "chat_id:c1",
       "已从当前任务创建分支并切换到新任务：build the source task（分支 1）（thr_1_fork）",
     );
-    expect(controller.controlListTaskTurns(forkedSessionId!).turns).toEqual([
+    expect((await controller.controlListTaskTurns(forkedSessionId!)).turns).toEqual([
       expect.objectContaining({ turnId: "turn_1", prompt: "build the source task", current: true }),
     ]);
 
@@ -3867,6 +3948,10 @@ describe("ProxySessionController", () => {
     vi.mocked(runtime.readRemoteSession!).mockRejectedValue(
       new Error("App Server request timed out: thread/read"),
     );
+    const graphRead = vi.spyOn(store, "listTaskTurnGraph").mockImplementation(() => {
+      throw new Error("Fork must not load the complete local graph");
+    });
+    const importHistory = vi.spyOn(store, "importCompletedTurnHistory");
 
     await controller.onMessage({
       messageId: "fork-running-group-with-local-history",
@@ -3878,6 +3963,10 @@ describe("ProxySessionController", () => {
     });
 
     expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.readRemoteForkSource).not.toHaveBeenCalled();
+    expect(graphRead).not.toHaveBeenCalled();
+    expect(importHistory).not.toHaveBeenCalled();
+    expect(runtime.cancelTurn).not.toHaveBeenCalled();
     expect(runtime.forkSession).toHaveBeenCalledWith(expect.objectContaining({
       remoteSessionId: "thr_1",
       lastTurnId: "turn_1",
@@ -3891,7 +3980,7 @@ describe("ProxySessionController", () => {
   });
 
   test("shows every inherited remote Turn in the new group's Turn card without local source snapshots", async () => {
-    const { controller, remoteSessions, store, outbound } = fixture();
+    const { controller, runtime, remoteSessions, store, outbound } = fixture();
     const sourceSessionId = "source-without-turn-snapshot";
     const sourceRemoteSessionId = "thr_external";
     const sourceTurnId = "turn_external_3";
@@ -3939,6 +4028,19 @@ describe("ProxySessionController", () => {
       userId: "ou_current_user",
       text: "/forkgroup External branch",
     });
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.readRemoteForkSource).not.toHaveBeenCalled();
+    expect(store.getTurnSnapshot(sourceTurnId)).toBeUndefined();
+    const forkedSessionId = store.getUserContext("chat_id:oc_new_group")?.currentSessionId;
+    expect(store.getForkHistorySource(forkedSessionId!)).toMatchObject({
+      sourceLocalSessionId: sourceSessionId,
+      sourceRemoteSessionId,
+      sourceTurnId,
+      sourceTurnHistoryCount: undefined,
+    });
+    remoteSessions.find((session) => session.id === sourceRemoteSessionId)!.completedTurns!.push({
+      id: "turn_external_after_fork", prompt: "Not inherited", startedAt: 7_000, completedAt: 8_000,
+    });
     await controller.onMessage({
       messageId: "fork-external-group-turns",
       contextKey: "chat_id:oc_new_group",
@@ -3952,16 +4054,25 @@ describe("ProxySessionController", () => {
     expect(serialized).toContain("Inspect the external task");
     expect(serialized).toContain("Compare the results");
     expect(serialized).toContain("Collect the evidence");
+    expect(serialized).not.toContain("Not inherited");
     expect(serialized).not.toContain("当前任务还没有成功完成的 turn");
-    const forkedSessionId = store.getUserContext("chat_id:oc_new_group")?.currentSessionId;
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledExactlyOnceWith(sourceRemoteSessionId, {
+      cursor: undefined, limit: 10,
+    });
     expect(store.listTaskTurnGraph(forkedSessionId!).map((turn) => turn.turnId)).toEqual([
       "turn_external_3",
       "turn_external_2",
       "turn_external_1",
     ]);
+    const turns = await controller.controlListTaskTurns(forkedSessionId!);
+    expect(turns.turns.map((turn) => turn.turnId)).toEqual([
+      "turn_external_3", "turn_external_2", "turn_external_1",
+    ]);
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(1);
   });
 
-  test("hydrates every inherited Turn when opening an Alpha 4 Fork task created before history import", async () => {
+  test.each([undefined, 0, 1])("hydrates legacy Fork history with an unverified import count of %s", async (sourceTurnHistoryCount) => {
     const { controller, runtime, remoteSessions, store, outbound } = fixture();
     store.createSession({
       localSessionId: "legacy_source",
@@ -3995,6 +4106,7 @@ describe("ProxySessionController", () => {
       sourceLocalSessionId: "legacy_source",
       sourceRemoteSessionId: "thread_legacy_source",
       sourceTurnId: "legacy_turn_3",
+      sourceTurnHistoryCount,
       forkedLocalSessionId: "legacy_fork",
       forkedRemoteSessionId: "thread_legacy_fork",
     });
@@ -4021,7 +4133,7 @@ describe("ProxySessionController", () => {
       text: "/turns",
     });
 
-    expect(runtime.readRemoteSession).toHaveBeenCalledWith("thread_legacy_source");
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledWith("thread_legacy_source", { cursor: undefined, limit: 10 });
     expect(store.hasImportedForkTurnHistory("legacy_fork")).toBe(true);
     expect(store.listTaskTurnGraph("legacy_fork").map((turn) => turn.turnId)).toEqual([
       "legacy_turn_3",
@@ -4034,7 +4146,7 @@ describe("ProxySessionController", () => {
     expect(serialized).toContain("Legacy second");
     expect(serialized).toContain("Legacy third");
 
-    vi.mocked(runtime.readRemoteSession!).mockClear();
+    vi.mocked(runtime.listRemoteTurnSummaries!).mockClear();
     await controller.onMessage({
       messageId: "legacy-fork-turns-again",
       contextKey: "chat_id:legacy_fork",
@@ -4042,6 +4154,243 @@ describe("ProxySessionController", () => {
       chatType: "group",
       text: "/turns",
     });
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+  });
+
+  test("defers history through consecutive empty Forks and reuses the original source when opening Turns", async () => {
+    const { controller, runtime, remoteSessions, store, outbound } = fixture();
+    remoteSessions.push({
+      id: "desktop_root", title: "Desktop root", cwd: process.cwd(), source: "codex-desktop",
+      status: "idle", lastTurnId: "root_2", lastTurnStatus: "completed",
+      completedTurns: [
+        { id: "root_1", prompt: "First root turn", startedAt: 1, completedAt: 2 },
+        { id: "root_2", prompt: "Second root turn", startedAt: 3, completedAt: 4 },
+      ],
+    });
+    await controller.onMessage(message("/fork desktop_root"));
+    const first = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    expect(store.getTurnSnapshot("root_2")).toBeUndefined();
+    // The next Fork can use provenance even when the intermediate task's first turn failed.
+    store.updateRuntimeSession(first, { lastTurnId: "failed_first_turn", lastTurnStatus: "failed" });
+    const graphRead = vi.spyOn(store, "listTaskTurnGraph");
+    const importHistory = vi.spyOn(store, "importCompletedTurnHistory");
+    await controller.onMessage({
+      ...message("/forkgroup Nested branch"), chatId: "c1", chatType: "p2p", userId: "ou_current_user",
+    });
+    const second = store.getUserContext("chat_id:oc_new_group")!.currentSessionId!;
+    expect(runtime.forkSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      remoteSessionId: "desktop_root_fork", lastTurnId: "root_2",
+    }));
+    expect(runtime.readRemoteForkSource).toHaveBeenCalledExactlyOnceWith("desktop_root");
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(graphRead).not.toHaveBeenCalled();
+    expect(importHistory).not.toHaveBeenCalled();
+    expect(store.getForkHistorySource(second)?.sourceLocalSessionId).toBe(first);
+
+    await controller.onMessage(groupMessage("oc_new_group", "/turns"));
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledExactlyOnceWith("desktop_root", { cursor: undefined, limit: 10 });
+    expect(store.hasImportedForkTurnHistory(first)).toBe(true);
+    expect(store.hasImportedForkTurnHistory(second)).toBe(true);
+    expect(store.listTaskTurnGraph(second).map((turn) => turn.turnId)).toEqual(["root_2", "root_1"]);
+    const card = (outbound.sendInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(card)).toContain("First root turn");
+    expect(JSON.stringify(card)).toContain("Second root turn");
+    await controller.onMessage({ ...groupMessage("oc_new_group", "/turns"), messageId: "nested-turns-again" });
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["failure", "missing-anchor"])("retries deferred history after %s without marking a partial import complete", async (failure) => {
+    const { controller, runtime, remoteSessions, store, outbound } = fixture();
+    remoteSessions.push({
+      id: "retry_source", title: "Retry source", cwd: process.cwd(), source: "codex-desktop",
+      status: "idle", lastTurnId: "retry_2", lastTurnStatus: "completed",
+      completedTurns: [
+        { id: "retry_1", prompt: "Retry first turn", startedAt: 1, completedAt: 2 },
+        { id: "retry_2", prompt: "Retry second turn", startedAt: 3, completedAt: 4 },
+      ],
+    });
+    await controller.onMessage(message("/fork retry_source"));
+    const forkedId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    store.saveTurnSnapshot("retry_2", forkedId, {
+      sessionId: forkedId, turnId: "retry_2", status: "completed",
+      prompt: "Retry second turn", startedAt: 3, completedAt: 4,
+    }, "chat_id:c1");
+    const readRemote = vi.mocked(runtime.listRemoteTurnSummaries!);
+    if (failure === "failure") readRemote.mockRejectedValueOnce(new Error("Connection closed"));
+    else readRemote.mockResolvedValueOnce({
+      turns: [
+        { id: "retry_1", prompt: "Retry first turn", startedAt: 1, completedAt: 2 },
+      ],
+    });
+    await controller.onMessage(message("/turns"));
+    expect(store.hasImportedForkTurnHistory(forkedId)).toBe(false);
+    expect(store.getTurnSnapshot("retry_1")).toBeUndefined();
+    const card = (outbound.sendInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(card)).toContain("Retry second turn");
+
+    const turns = await controller.controlListTaskTurns(forkedId);
+    expect(turns.turns.map((turn) => turn.turnId)).toEqual(["retry_2", "retry_1"]);
+    expect(store.hasImportedForkTurnHistory(forkedId)).toBe(true);
+    expect(readRemote.mock.calls.filter(([id]) => id === "retry_source")).toHaveLength(2);
+  });
+
+  test("coalesces concurrent on-demand history reads", async () => {
+    const { controller, runtime, remoteSessions, store } = fixture();
+    const remote: RemoteSessionSummary = {
+      id: "concurrent_source", title: "Concurrent source", cwd: process.cwd(), source: "codex-desktop",
+      status: "idle", lastTurnId: "concurrent_1", lastTurnStatus: "completed",
+      completedTurns: [{ id: "concurrent_1", prompt: "Concurrent first turn", startedAt: 1, completedAt: 2 }],
+    };
+    remoteSessions.push(remote);
+    await controller.onMessage(message("/fork concurrent_source"));
+    const forkedId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    let resolveRead!: (value: RemoteTurnPage) => void;
+    vi.mocked(runtime.listRemoteTurnSummaries!).mockReturnValueOnce(new Promise((resolve) => { resolveRead = resolve; }));
+    const first = controller.controlListTaskTurns(forkedId);
+    const second = controller.controlListTaskTurns(forkedId);
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledOnce();
+    resolveRead({ turns: remote.completedTurns! });
+    expect((await first).turns).toEqual((await second).turns);
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledOnce();
+  });
+
+  test.each([false, true])("loads only the requested Fork page with sparse local source history: %s", async (sparseLocalSource) => {
+    const { controller, runtime, remoteSessions, store, outbound } = fixture();
+    remoteSessions.push({
+      id: "large_source", title: "Large source", cwd: process.cwd(), source: "codex-desktop",
+      status: "idle", lastTurnId: "large_40", lastTurnStatus: "completed",
+      completedTurns: Array.from({ length: 40 }, (_, index) => ({
+        id: `large_${index + 1}`, prompt: `Large prompt ${index + 1}`,
+        startedAt: index * 10, completedAt: index * 10 + 1,
+      })),
+    });
+    if (sparseLocalSource) {
+      store.createSession({
+        localSessionId: "sparse_source", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "ready",
+      });
+      store.updateRuntimeSession("sparse_source", {
+        runtimeKind: "codex", remoteSessionId: "large_source", lastTurnId: "large_40", lastTurnStatus: "completed",
+      });
+      for (const index of [1, 40]) {
+        store.saveTurnSnapshot(`large_${index}`, "sparse_source", {
+          sessionId: "sparse_source", turnId: `large_${index}`, status: "completed",
+          prompt: `Large prompt ${index}`, startedAt: (index - 1) * 10, completedAt: (index - 1) * 10 + 1,
+        }, "chat_id:c1");
+      }
+      store.saveTurnParent("large_40", "sparse_source", "large_1");
+    }
+    await controller.onMessage(message("/fork large_source"));
+    const forkedId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+    await controller.onMessage(message("/turns"));
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledExactlyOnceWith("large_source", {
+      cursor: undefined, limit: 10,
+    });
+    expect(store.listTaskTurnGraph(forkedId).slice(0, 10).map((turn) => turn.turnId)).toEqual(
+      Array.from({ length: 10 }, (_, index) => `large_${40 - index}`),
+    );
+    expect(store.getTurnSnapshot("large_30")).toBeUndefined();
+    expect(store.hasImportedForkTurnHistory(forkedId)).toBe(false);
+    const firstCard = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(firstCard)).toContain("Large prompt 40");
+    expect(JSON.stringify(firstCard)).toContain("Large prompt 31");
+    expect(JSON.stringify(firstCard)).toContain("<font color='blue'>Next</font>");
+    await controller.onMessage({ ...message("/turns"), messageId: "large-turns-again" });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(1);
+
+    await controller.onCardAction({
+      actionId: "load-fork-page-2", contextKey: "chat_id:c1", messageId: "om_fork_turns",
+      value: { action: "turn_reset_page", sessionId: forkedId, contextKey: "chat_id:c1", page: "1" },
+    });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenLastCalledWith("large_source", { cursor: "10", limit: 10 });
+    expect(store.listTaskTurnGraph(forkedId).slice(0, 20).map((turn) => turn.turnId)).toEqual(
+      Array.from({ length: 20 }, (_, index) => `large_${40 - index}`),
+    );
+    expect(store.getTurnSnapshot("large_20")).toBeUndefined();
+    const secondCard = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(secondCard)).toContain("Large prompt 30");
+    expect(JSON.stringify(secondCard)).toContain("Large prompt 21");
+    expect(store.getTurnParent("large_31", sparseLocalSource ? "sparse_source" : forkedId)).toBe("large_30");
+
+    await controller.onMessage({ ...message("/turns"), messageId: "large-return-first-page" });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(2);
+    await controller.onCardAction({
+      actionId: "load-fork-last-page", contextKey: "chat_id:c1", messageId: "om_fork_turns",
+      value: { action: "turn_reset_page", sessionId: forkedId, contextKey: "chat_id:c1", page: "3" },
+    });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(4);
+    expect(store.hasImportedForkTurnHistory(forkedId)).toBe(true);
+    const lastCard = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(lastCard)).toContain("Large prompt 10");
+    expect(JSON.stringify(lastCard)).not.toContain("<font color='blue'>Next</font>");
+  });
+
+  test("does not fetch remote history when the local source already satisfies the requested page", async () => {
+    const { controller, runtime, store } = fixture();
+    await controller.onMessage(message("/new Cached source"));
+    const sourceId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    for (let index = 1; index <= 12; index += 1) {
+      store.saveTurnSnapshot(`cached_${index}`, sourceId, {
+        sessionId: sourceId, turnId: `cached_${index}`, status: "completed", prompt: `Cached ${index}`,
+        startedAt: index, completedAt: index,
+      }, "chat_id:c1");
+    }
+    store.updateRuntimeSession(sourceId, { lastTurnId: "cached_12", lastTurnStatus: "completed" });
+    await controller.onMessage(message("/fork"));
+    await controller.onMessage(message("/turns"));
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+  });
+
+  test("never falls back to full history when summary pagination is unavailable", async () => {
+    const { controller, runtime, remoteSessions, store } = fixture();
+    remoteSessions.push({
+      id: "old_server", cwd: process.cwd(), source: "app-server", status: "idle",
+      lastTurnId: "old_turn", lastTurnStatus: "completed",
+    });
+    await controller.onMessage(message("/fork old_server"));
+    vi.mocked(runtime.listRemoteTurnSummaries!).mockRejectedValue(new Error("Unknown method thread/turns/list"));
+    await controller.onMessage(message("/turns"));
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(store.hasImportedForkTurnHistory(store.getUserContext("chat_id:c1")!.currentSessionId!)).toBe(false);
+  });
+
+  test("loads missing Desktop continuations from the branch without reloading its completed source history", async () => {
+    const { controller, runtime, remoteSessions, store, outbound } = fixture();
+    const inherited = [
+      { id: "before_fork", prompt: "Original work", startedAt: 1, completedAt: 2 },
+    ];
+    remoteSessions.push({
+      id: "desktop_continue_source", cwd: process.cwd(), source: "codex-desktop", status: "idle",
+      lastTurnId: "before_fork", lastTurnStatus: "completed", completedTurns: inherited,
+    });
+    await controller.onMessage(message("/fork desktop_continue_source"));
+    const forkedId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    await controller.onMessage(message("/turns"));
+    expect(store.hasImportedForkTurnHistory(forkedId)).toBe(true);
+    const child = remoteSessions.find((session) => session.id === "desktop_continue_source_fork")!;
+    child.completedTurns = [...inherited, ...Array.from({ length: 15 }, (_, index) => ({
+      id: `desktop_${index + 1}`, prompt: `Desktop work ${index + 1}`,
+      startedAt: 10 + index * 2, completedAt: 11 + index * 2,
+    }))];
+    store.updateRuntimeSession(forkedId, { lastTurnId: "desktop_15", lastTurnStatus: "completed" });
+    vi.mocked(runtime.listRemoteTurnSummaries!).mockClear();
+
+    await controller.onMessage({ ...message("/turns"), messageId: "turns-after-desktop-work" });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledExactlyOnceWith(child.id, { cursor: undefined, limit: 10 });
+    expect(store.getTurnSnapshot("desktop_6")).toBeDefined();
+    expect(store.getTurnSnapshot("desktop_5")).toBeUndefined();
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(card)).toContain("Desktop work 15");
+    await controller.onCardAction({
+      actionId: "desktop-next", contextKey: "chat_id:c1", messageId: "om_desktop_turns",
+      value: { action: "turn_reset_page", sessionId: forkedId, contextKey: "chat_id:c1", page: "1" },
+    });
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenLastCalledWith(child.id, { cursor: "10", limit: 10 });
+    expect(store.getTurnSnapshot("desktop_1")).toBeDefined();
     expect(runtime.readRemoteSession).not.toHaveBeenCalled();
   });
 
@@ -6392,7 +6741,7 @@ describe("ProxySessionController", () => {
       value: { action: "session_switch", sessionId: "agent-runtime:traex:shared_task" },
     });
 
-    expect(traexRead).toHaveBeenCalledWith("shared_task");
+    expect(traexRead).toHaveBeenCalledWith("shared_task", "latest");
     expect(runtime.readRemoteSession).not.toHaveBeenCalled();
     const currentId = store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId;
     expect(store.getSession(currentId!)?.agentName).toBe("traex");
@@ -8298,7 +8647,7 @@ describe("ProxySessionController", () => {
     }, "chat_id:origin");
     store.updateRuntimeSession(sessionId, { lastTurnId: "turn_new", lastTurnStatus: "completed" });
 
-    const turns = controller.controlListTaskTurns(sessionId);
+    const turns = await controller.controlListTaskTurns(sessionId);
     expect(turns.turns).toHaveLength(2);
     expect(turns.turns.find((turn) => turn.turnId === "turn_new")?.current).toBe(true);
 

@@ -9,6 +9,16 @@ const TASK_COMPLETE = Buffer.from('"type":"task_complete"');
 const TURN_ABORTED = Buffer.from('"type":"turn_aborted"');
 const PATTERN_OVERLAP = Math.max(TASK_STARTED.length, TASK_COMPLETE.length, TURN_ABORTED.length) - 1;
 
+interface RolloutState {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  ino: number;
+  dev: number;
+  tail: Buffer;
+  task: { active: boolean; turnId?: string };
+}
+
 interface ThreadPathRow {
   id: string;
   rollout_path: string;
@@ -35,6 +45,7 @@ export interface CodexLocalThreadSettings {
  * even while Codex Desktop is actively appending events to its rollout.
  */
 export class CodexLocalActivityDetector {
+  private readonly rollouts = new Map<string, RolloutState>();
   constructor(private readonly codexHome: string) {}
 
   async activeThreadIds(threadIds: string[]): Promise<Set<string>> {
@@ -64,7 +75,7 @@ export class CodexLocalActivityDetector {
 
     const active = new Map<string, string | undefined>();
     for (const row of rows) {
-      const task = await latestTask(row.rollout_path);
+      const task = await latestTask(row.rollout_path, this.rollouts);
       if (task.active) active.set(row.id, task.turnId);
     }
     return active;
@@ -104,16 +115,31 @@ export class CodexLocalActivityDetector {
   }
 }
 
-async function latestTask(rolloutPath: string): Promise<{ active: boolean; turnId?: string }> {
+async function latestTask(rolloutPath: string, cache: Map<string, RolloutState>): Promise<{ active: boolean; turnId?: string }> {
   let file;
   try {
     file = await open(rolloutPath, "r");
-    const size = (await file.stat()).size;
+    const { size, mtimeMs, ctimeMs, ino, dev } = await file.stat();
+    const previous = cache.get(rolloutPath);
+    const sameFile = previous?.ino === ino && previous.dev === dev;
+    if (sameFile && previous.size === size && previous.mtimeMs === mtimeMs && previous.ctimeMs === ctimeMs) {
+      return previous.task;
+    }
+    let stopAt = 0;
+    let task: RolloutState["task"] = { active: false };
+    if (sameFile && size > previous.size) {
+      const boundary = Buffer.alloc(previous.tail.length);
+      await file.read(boundary, 0, boundary.length, previous.size - boundary.length);
+      if (boundary.equals(previous.tail)) {
+        stopAt = Math.max(0, previous.size - PATTERN_OVERLAP);
+        task = previous.task;
+      }
+    }
     let position = size;
     let laterPrefix = Buffer.alloc(0);
 
-    while (position > 0) {
-      const length = Math.min(READ_CHUNK_SIZE, position);
+    while (position > stopAt) {
+      const length = Math.min(READ_CHUNK_SIZE, position - stopAt);
       position -= length;
       const chunk = Buffer.allocUnsafe(length);
       await file.read(chunk, 0, length, position);
@@ -123,14 +149,20 @@ async function latestTask(rolloutPath: string): Promise<{ active: boolean; turnI
       const abortedAt = searchable.lastIndexOf(TURN_ABORTED);
       const terminalAt = Math.max(completedAt, abortedAt);
       if (startedAt >= 0 || terminalAt >= 0) {
-        if (startedAt <= terminalAt) return { active: false };
-        const absoluteOffset = position + startedAt;
-        return { active: true, turnId: await readTurnId(file, absoluteOffset, size) };
+        task = startedAt <= terminalAt ? { active: false }
+          : { active: true, turnId: await readTurnId(file, position + startedAt, size) };
+        break;
       }
       laterPrefix = chunk.subarray(0, Math.min(PATTERN_OVERLAP, chunk.length));
     }
-    return { active: false };
+    const tail = Buffer.alloc(Math.min(1_024, size));
+    await file.read(tail, 0, tail.length, size - tail.length);
+    cache.delete(rolloutPath);
+    cache.set(rolloutPath, { size, mtimeMs, ctimeMs, ino, dev, tail, task });
+    if (cache.size > 512) cache.delete(cache.keys().next().value!);
+    return task;
   } catch {
+    cache.delete(rolloutPath);
     return { active: false };
   } finally {
     await file?.close();

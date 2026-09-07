@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Logger } from "pino";
 import { createProjectlessWorkspace, detectProjectlessWorkspace } from "../codex/ProjectlessWorkspace.js";
+import { CodexVersionError } from "../codex/CodexVersion.js";
 import {
   SystemThreadWriterProcessController,
   type ThreadWriterProcess,
@@ -409,7 +410,6 @@ interface ForkSessionPlan {
   sourceTurnPrompt?: string;
   sourceTurnStartedAt?: number;
   sourceTurnCompletedAt?: number;
-  sourceCompletedTurns?: RemoteCompletedTurnSummary[];
   sourceWasRunning: boolean;
   forkedFromHistoricalTurn: boolean;
 }
@@ -417,6 +417,14 @@ interface ForkSessionPlan {
 interface ForkSessionResult {
   record: SessionRecord;
   session: RuntimeSession;
+}
+
+interface ForkHistoryCursor {
+  cursor?: string;
+  anchorFound: boolean;
+  tailTurnId?: string;
+  loadedCount?: number;
+  complete: boolean;
 }
 
 interface ForkGroupSessionPlan {
@@ -489,6 +497,8 @@ export class ProxySessionController {
   private readonly sessionResets = new Map<string, Promise<void>>();
   private readonly resetHistoryOperations = new Map<string, string>();
   private readonly remoteTurnHistoryRefreshes = new Map<string, number>();
+  private readonly turnHistoryHydrations = new Map<string, Promise<boolean>>();
+  private readonly forkHistoryCursors = new Map<string, ForkHistoryCursor>();
   private readonly lastSessionListings = new Map<string, string[]>();
   private readonly threadInitializations = new Map<string, Promise<void>>();
   private readonly llmRetryingSessions = new Set<string>();
@@ -1247,6 +1257,8 @@ export class ProxySessionController {
     this.sessionResets.clear();
     this.resetHistoryOperations.clear();
     this.remoteTurnHistoryRefreshes.clear();
+    this.forkHistoryCursors.clear();
+    this.turnHistoryHydrations.clear();
     for (const pending of this.pendingMergedForwards.values()) pending.resolveAttachment(undefined);
     this.pendingMergedForwards.clear();
     for (const pending of this.pendingResourceForwards.values()) pending.resolveAttachment(undefined);
@@ -1326,8 +1338,9 @@ export class ProxySessionController {
       const runtime = this.runtimes.forAgent(record.agentName);
       if (runtime.readRemoteSession) {
         try {
-          remote = await runtime.readRemoteSession(record.remoteSessionId);
+          remote = await runtime.readRemoteSession(record.remoteSessionId, "latest-full");
         } catch (error) {
+          if (error instanceof CodexVersionError) throw error;
           this.logger.warn({ error, sessionId: record.localSessionId }, "Failed to inspect App Server task status for CLI.");
         }
       }
@@ -1738,7 +1751,7 @@ export class ProxySessionController {
     };
   }
 
-  controlListTaskTurns(localSessionId: string): {
+  async controlListTaskTurns(localSessionId: string): Promise<{
     session: SessionRecord;
     turns: Array<{
       sequence: number;
@@ -1749,17 +1762,18 @@ export class ProxySessionController {
       completedAt?: number;
       current: boolean;
     }>;
-  } {
+  }> {
     const session = this.requireControlSession(localSessionId);
     if (!session.remoteSessionId || !this.isCodexSession(session)) {
       throw new Error("The task is not an App Server task that can be reset.");
     }
-    const rows = this.store.listTaskTurnGraph(session.localSessionId);
+    await this.hydrateTaskTurnHistory(session);
+    const rows = this.store.listTaskTurnGraphIndex(session.localSessionId);
     const graph = buildTurnGraphRows(rows.map((turn) => ({ turnId: turn.turnId, parentTurnId: turn.parentTurnId })));
     return {
       session,
       turns: rows.flatMap((turn, index) => {
-        const snapshot = turnViewSnapshot(turn.snapshot);
+        const snapshot = this.store.getTurnPromptSummary(turn.turnId);
         if (!snapshot) return [];
         return [{
           sequence: graph[index]!.sequence,
@@ -2309,6 +2323,7 @@ export class ProxySessionController {
       try {
         remote = await runtime.readRemoteSession(session.remoteSessionId);
       } catch (error) {
+        if (error instanceof CodexVersionError) throw error;
         this.logger.warn(
           { error, attemptId: attempt.attemptId, remoteSessionId: session.remoteSessionId },
           "Failed to read the remote task during startup recovery; treating the old local execution as interrupted.",
@@ -3050,35 +3065,24 @@ export class ProxySessionController {
     if (!runtime.readRemoteSession && !source) {
       throw new Error("当前 App Server Agent 不支持读取指定任务。");
     }
-    const persistedCompletedTurns = source ? this.localForkCompletedTurns(source) : [];
+    const persistedCompletedTurnId = source
+      ? this.store.findLatestCompletedTurnId(source.localSessionId)
+      : undefined;
     const sourceLastSnapshot = turnViewSnapshot(
       source?.lastTurnId ? this.store.getTurnSnapshot(source.lastTurnId) : undefined,
     );
-    const localCompletedTurns = persistedCompletedTurns.length > 0
-      ? persistedCompletedTurns
-      : source?.lastTurnId
+    const localCompletedTurnId = persistedCompletedTurnId
+      ?? (source?.lastTurnId
           && (source.lastTurnStatus === "completed" || sourceLastSnapshot?.status === "completed")
-        ? [{
-            id: source.lastTurnId,
-            prompt: latestUserPromptFromTurnView(sourceLastSnapshot) ?? source.title,
-            startedAt: sourceLastSnapshot?.startedAt ?? parseIsoTimestamp(source.updatedAt),
-            completedAt: sourceLastSnapshot?.completedAt
-              ?? sourceLastSnapshot?.startedAt
-              ?? parseIsoTimestamp(source.updatedAt),
-          }]
-        : [];
-    if (!remote && runtime.readRemoteSession && (!source || persistedCompletedTurns.length === 0)) {
-      try {
-        remote = await runtime.readRemoteSession(remoteSessionId);
-      } catch (error) {
-        if (localCompletedTurns.length === 0) throw error;
-        this.logger.warn(
-          { error, contextKey, remoteSessionId, sourceTurnId: localCompletedTurns.at(-1)?.id },
-          "Failed to read the complete source task before Fork; using the locally persisted completed Turn.",
-        );
-      }
+        ? source.lastTurnId
+        : undefined)
+      ?? (source ? this.store.getForkHistorySource(source.localSessionId)?.sourceTurnId : undefined);
+    if (!remote && !localCompletedTurnId) {
+      remote = runtime.readRemoteForkSource
+        ? await runtime.readRemoteForkSource(remoteSessionId)
+        : await runtime.readRemoteSession?.(remoteSessionId);
     }
-    const latestTurnId = remote?.lastTurnId ?? source?.lastTurnId ?? localCompletedTurns.at(-1)?.id;
+    const latestTurnId = remote?.lastTurnId ?? source?.lastTurnId ?? localCompletedTurnId;
     const latestSnapshot = turnViewSnapshot(latestTurnId ? this.store.getTurnSnapshot(latestTurnId) : undefined);
     const isRunning = remote
       ? isRemoteSessionActive(remote)
@@ -3089,7 +3093,7 @@ export class ProxySessionController {
       );
     const lastTurnId = remote?.lastCompletedTurnId
       ?? (remote?.lastTurnStatus === "completed" ? remote.lastTurnId : undefined)
-      ?? localCompletedTurns.at(-1)?.id;
+      ?? localCompletedTurnId;
     if (!lastTurnId) {
       if (isRunning) {
         throw new Error(`${sourceLabel}正在执行，且还没有已完成轮次可供 fork。请等待当前轮次完成后重试。`);
@@ -3098,8 +3102,7 @@ export class ProxySessionController {
     }
     const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(lastTurnId));
     const forkedFromHistoricalTurn = lastTurnId !== latestTurnId;
-    const completedTurn = (remote?.completedTurns ?? localCompletedTurns)
-      .find((turn) => turn.id === lastTurnId);
+    const completedTurn = remote?.completedTurns?.find((turn) => turn.id === lastTurnId);
 
     const cwd = remote?.cwd || source?.cwd;
     if (!cwd) throw new Error("指定的 App Server 任务没有可用的工作目录，暂时不能 fork。");
@@ -3145,27 +3148,9 @@ export class ProxySessionController {
       sourceTurnPrompt,
       sourceTurnStartedAt: snapshot?.startedAt ?? sourceTurnCompletedAt,
       sourceTurnCompletedAt,
-      sourceCompletedTurns: remote?.completedTurns
-        ?? (persistedCompletedTurns.length > 0 ? [] : localCompletedTurns),
       sourceWasRunning: isRunning,
       forkedFromHistoricalTurn,
     };
-  }
-
-  private localForkCompletedTurns(source: SessionRecord): RemoteCompletedTurnSummary[] {
-    return this.store.listTaskTurnGraph(source.localSessionId)
-      .slice()
-      .reverse()
-      .map((record) => {
-        const snapshot = turnViewSnapshot(record.snapshot);
-        const startedAt = snapshot?.startedAt ?? parseIsoTimestamp(record.updatedAt);
-        return {
-          id: record.turnId,
-          prompt: latestUserPromptFromTurnView(snapshot),
-          startedAt,
-          completedAt: snapshot?.completedAt ?? startedAt,
-        };
-      });
   }
 
   private async prepareForkGroupSession(
@@ -3270,7 +3255,6 @@ export class ProxySessionController {
     contextKey: string,
     plan: ForkSessionPlan,
   ): Promise<ForkSessionResult> {
-    const sourceCompletedTurns = await this.resolveForkSourceCompletedTurns(plan);
     const localSessionId = createId("sess");
     const record = this.store.createSession({
       localSessionId,
@@ -3313,12 +3297,6 @@ export class ProxySessionController {
         plan.cwd,
         this.agentLabel(plan.agentName),
       );
-      const sourceTurnHistoryCount = this.persistForkSourceHistory(
-        contextKey,
-        localSessionId,
-        plan,
-        sourceCompletedTurns,
-      );
       this.store.audit(contextKey, "session_forked", {
         sourceLocalSessionId: plan.source?.localSessionId,
         sourceRemoteSessionId: plan.remoteSessionId,
@@ -3326,7 +3304,6 @@ export class ProxySessionController {
         sourceTurnPrompt: plan.sourceTurnPrompt,
         sourceTurnStartedAt: plan.sourceTurnStartedAt,
         sourceTurnCompletedAt: plan.sourceTurnCompletedAt,
-        sourceTurnHistoryCount,
         sourceWasRunning: plan.sourceWasRunning,
         forkedLocalSessionId: localSessionId,
         forkedRemoteSessionId: forked.remoteSessionId,
@@ -3342,54 +3319,6 @@ export class ProxySessionController {
     }
   }
 
-  private async resolveForkSourceCompletedTurns(
-    plan: ForkSessionPlan,
-  ): Promise<RemoteCompletedTurnSummary[]> {
-    let completedTurns = plan.sourceCompletedTurns;
-    if (completedTurns === undefined && plan.runtime.readRemoteSession) {
-      try {
-        completedTurns = (await plan.runtime.readRemoteSession(plan.remoteSessionId)).completedTurns ?? [];
-      } catch (error) {
-        this.logger.warn(
-          { error, remoteSessionId: plan.remoteSessionId, sourceTurnId: plan.lastTurnId },
-          "Failed to read the source task Turn history before Fork; keeping the Fork anchor fallback.",
-        );
-      }
-    }
-    if (!completedTurns?.length) return [];
-    const anchorIndex = completedTurns.findIndex((turn) => turn.id === plan.lastTurnId);
-    if (anchorIndex < 0) {
-      this.logger.warn(
-        { remoteSessionId: plan.remoteSessionId, sourceTurnId: plan.lastTurnId },
-        "The source task Turn history did not include the Fork anchor; keeping the Fork anchor fallback.",
-      );
-      return [];
-    }
-    return completedTurns.slice(0, anchorIndex + 1);
-  }
-
-  private persistForkSourceHistory(
-    contextKey: string,
-    forkedLocalSessionId: string,
-    plan: ForkSessionPlan,
-    completedTurns: RemoteCompletedTurnSummary[],
-  ): number {
-    if (completedTurns.length === 0) return 0;
-    const localSessionId = plan.source?.localSessionId ?? forkedLocalSessionId;
-    const historyContextKey = plan.source?.contextKey ?? contextKey;
-    const fallbackStart = plan.sourceTurnStartedAt
-      ?? plan.sourceTurnCompletedAt
-      ?? Date.now() - completedTurns.length;
-    return this.persistCompletedTurnHistory({
-      localSessionId,
-      contextKey: historyContextKey,
-      agentName: plan.agentName,
-      remoteSessionId: plan.remoteSessionId,
-      completedTurns,
-      fallbackStart,
-    });
-  }
-
   private persistCompletedTurnHistory(input: {
     localSessionId: string;
     contextKey: string;
@@ -3397,6 +3326,7 @@ export class ProxySessionController {
     remoteSessionId: string;
     completedTurns: RemoteCompletedTurnSummary[];
     fallbackStart: number;
+    replaceParents?: boolean;
   }): number {
     try {
       this.store.importCompletedTurnHistory({
@@ -3404,6 +3334,7 @@ export class ProxySessionController {
         contextKey: input.contextKey,
         agentName: input.agentName,
         remoteSessionId: input.remoteSessionId,
+        replaceParents: input.replaceParents,
         turns: input.completedTurns.map((turn, index) => {
           const startedAt = turn.startedAt ?? input.fallbackStart + index;
           const completedAt = turn.completedAt ?? startedAt;
@@ -3437,82 +3368,202 @@ export class ProxySessionController {
     }
   }
 
-  private async hydrateLegacyForkTurnHistory(
+  private async hydrateTaskTurnHistory(
+    current: SessionRecord,
+    requiredCount = RESET_HISTORY_PAGE_SIZE,
+  ): Promise<boolean> {
+    const existing = this.turnHistoryHydrations.get(current.localSessionId);
+    if (existing) await existing;
+    const hydration = (async () => {
+      if (this.store.getForkHistorySource(current.localSessionId)) {
+        return this.hydrateForkTurnHistory(current.contextKey, current, requiredCount);
+      }
+      return this.hydrateRemoteTurnHistory(current.contextKey, current, requiredCount);
+    })();
+    this.turnHistoryHydrations.set(current.localSessionId, hydration);
+    try {
+      return await hydration;
+    } finally {
+      if (this.turnHistoryHydrations.get(current.localSessionId) === hydration) {
+        this.turnHistoryHydrations.delete(current.localSessionId);
+      }
+    }
+  }
+
+  private async hydrateForkTurnHistory(
     contextKey: string,
     current: SessionRecord,
-  ): Promise<void> {
-    const source = this.store.getForkHistorySource(current.localSessionId);
-    if (!source || source.sourceTurnHistoryCount !== undefined
-      || this.store.hasImportedForkTurnHistory(current.localSessionId)) return;
-    if (!source.sourceRemoteSessionId) return;
-    const runtime = this.runtimes.forAgent(current.agentName);
-    if (runtime.kind !== "codex" || !runtime.readRemoteSession) return;
-    try {
-      const remote = await runtime.readRemoteSession(source.sourceRemoteSessionId);
-      const completedTurns = remote.completedTurns ?? [];
-      const anchorIndex = completedTurns.findIndex((turn) => turn.id === source.sourceTurnId);
-      if (anchorIndex < 0) return;
-      const inheritedTurns = completedTurns.slice(0, anchorIndex + 1);
-      const sourceSession = source.sourceLocalSessionId
-        ? this.store.getSession(source.sourceLocalSessionId)
-        : undefined;
-      const imported = this.persistCompletedTurnHistory({
-        localSessionId: sourceSession?.localSessionId ?? current.localSessionId,
-        contextKey: sourceSession?.contextKey ?? contextKey,
-        agentName: current.agentName,
-        remoteSessionId: source.sourceRemoteSessionId,
-        completedTurns: inheritedTurns,
-        fallbackStart: source.sourceTurnStartedAt
-          ?? source.sourceTurnCompletedAt
-          ?? Date.now() - inheritedTurns.length,
-      });
-      if (imported > 0) {
+    requiredCount: number,
+    visited = new Set<string>(),
+  ): Promise<boolean> {
+    if (visited.has(current.localSessionId)) return false;
+    visited.add(current.localSessionId);
+    let source = this.store.getForkHistorySource(current.localSessionId);
+    if (!source) return false;
+    const completedHead = current.lastTurnStatus === "completed"
+      ? current.lastTurnId
+      : this.store.findLatestCompletedTurnId(current.localSessionId);
+    if (completedHead && completedHead !== source.sourceTurnId && current.remoteSessionId) {
+      // Once the branch has its own completed work, its remote history is the
+      // authority for missing local turns, including work continued in Desktop.
+      source = {
+        sourceLocalSessionId: current.localSessionId,
+        sourceRemoteSessionId: current.remoteSessionId,
+        sourceTurnId: completedHead,
+        createdAt: current.createdAt,
+      };
+    }
+    if (this.store.hasImportedForkTurnHistory(current.localSessionId, source.sourceRemoteSessionId, source.sourceTurnId)) return false;
+    const localTurns = this.store.listTaskTurnGraphIndex(current.localSessionId);
+    const availableCount = localTurns.length;
+    const key = JSON.stringify([current.agentName, source.sourceRemoteSessionId, source.sourceTurnId]);
+    let state = this.forkHistoryCursors.get(key) ?? { anchorFound: false, complete: false };
+    const localAnchorIndex = localTurns.findIndex((turn) => turn.turnId === source.sourceTurnId);
+    const ownTurnCount = source.sourceLocalSessionId === current.localSessionId
+      ? Math.max(0, localAnchorIndex)
+      : localAnchorIndex >= 0 ? localAnchorIndex : availableCount;
+    const neededInheritedCount = Math.max(0, requiredCount - ownTurnCount);
+    if (localAnchorIndex >= 0 && availableCount >= requiredCount
+      && (!state.anchorFound || (state.loadedCount ?? 0) >= neededInheritedCount)) return !state.complete;
+    const sourceSession = source.sourceLocalSessionId
+      ? this.store.getSession(source.sourceLocalSessionId)
+      : undefined;
+    // A branch with no new turns can reuse its ancestor's history, even before
+    // the Agent materializes that intermediate branch.
+    if (sourceSession && sourceSession.localSessionId !== current.localSessionId
+      && this.store.getForkHistorySource(sourceSession.localSessionId)?.sourceTurnId === source.sourceTurnId) {
+      const hasMore = await this.hydrateForkTurnHistory(
+        sourceSession.contextKey, sourceSession,
+        this.store.listTaskTurnGraphIndex(sourceSession.localSessionId).length + requiredCount - availableCount,
+        visited,
+      );
+      if (!hasMore && this.store.hasImportedForkTurnHistory(sourceSession.localSessionId)) {
         this.store.audit(contextKey, "fork_turn_history_imported", {
           forkedLocalSessionId: current.localSessionId,
           sourceRemoteSessionId: source.sourceRemoteSessionId,
           sourceTurnId: source.sourceTurnId,
-          importedTurnCount: imported,
+          reusedLocalSessionId: sourceSession.localSessionId,
         });
       }
+      return hasMore;
+    }
+    if (!source.sourceRemoteSessionId) return false;
+    const runtime = this.runtimes.forAgent(current.agentName);
+    if (runtime.kind !== "codex" || !runtime.listRemoteTurnSummaries) return false;
+    const seenCursors = new Set<string>();
+    try {
+      while (!state.complete && (state.loadedCount ?? 0) < neededInheritedCount) {
+        const remaining = neededInheritedCount - (state.loadedCount ?? 0);
+        const page = await runtime.listRemoteTurnSummaries(source.sourceRemoteSessionId, {
+          cursor: state.cursor, limit: Math.min(RESET_HISTORY_PAGE_SIZE, remaining),
+        });
+        if (page.nextCursor && (page.nextCursor === state.cursor || seenCursors.has(page.nextCursor))) {
+          throw new Error("App Server repeated a Turn history cursor.");
+        }
+        const anchorIndex = state.anchorFound ? 0 : page.turns.findIndex((turn) => turn.id === source.sourceTurnId);
+        const inheritedTurns = anchorIndex >= 0 ? page.turns.slice(anchorIndex) : [];
+        const anchorFound = state.anchorFound || anchorIndex >= 0;
+        if (!anchorFound && !page.nextCursor) {
+          this.forkHistoryCursors.delete(key);
+          throw new Error("The Fork source Turn was not found in the available history.");
+        }
+        if (inheritedTurns.length > 0) {
+          const ownerId = sourceSession?.localSessionId ?? current.localSessionId;
+          const imported = this.persistCompletedTurnHistory({
+            localSessionId: ownerId,
+            contextKey: sourceSession?.contextKey ?? contextKey,
+            agentName: current.agentName,
+            remoteSessionId: source.sourceRemoteSessionId,
+            completedTurns: inheritedTurns.slice().reverse(),
+            // Adjacent remote summaries repair gaps in locally inferred ancestry.
+            replaceParents: true,
+            fallbackStart: (source.sourceTurnStartedAt ?? source.sourceTurnCompletedAt
+              ?? parseIsoTimestamp(source.createdAt) ?? 0) - (state.loadedCount ?? 0) - inheritedTurns.length,
+          });
+          if (imported === 0) throw new Error("Failed to persist the requested Turn history page.");
+          if (state.tailTurnId) {
+            this.store.saveTurnParent(state.tailTurnId, ownerId, inheritedTurns[0]!.id, true);
+          }
+        }
+        state = {
+          cursor: page.nextCursor,
+          anchorFound,
+          tailTurnId: inheritedTurns.at(-1)?.id ?? state.tailTurnId,
+          loadedCount: (state.loadedCount ?? 0) + inheritedTurns.length,
+          complete: !page.nextCursor,
+        };
+        this.forkHistoryCursors.set(key, state);
+        if (page.nextCursor) seenCursors.add(page.nextCursor);
+      }
+      if (state.complete) {
+        this.store.audit(contextKey, "fork_turn_history_imported", {
+          forkedLocalSessionId: current.localSessionId,
+          sourceRemoteSessionId: source.sourceRemoteSessionId,
+          sourceTurnId: source.sourceTurnId,
+        });
+      }
+      return !state.complete;
     } catch (error) {
+      if (error instanceof CodexVersionError) throw error;
       this.logger.warn(
         { error, localSessionId: current.localSessionId, sourceRemoteSessionId: source.sourceRemoteSessionId },
-        "Failed to hydrate legacy Fork Turn history; rendering the locally available history.",
+        "Failed to load the requested Fork Turn history page; rendering the locally available history.",
       );
     }
+    return true;
   }
 
   private async hydrateRemoteTurnHistory(
     contextKey: string,
     current: SessionRecord,
-  ): Promise<void> {
-    if (!current.remoteSessionId) return;
+    requiredCount: number,
+  ): Promise<boolean> {
+    if (!current.remoteSessionId) return false;
+    const key = JSON.stringify([current.agentName, current.remoteSessionId, "turn-card"]);
     const refreshedAt = this.remoteTurnHistoryRefreshes.get(current.localSessionId);
-    if (refreshedAt !== undefined && Date.now() - refreshedAt < REMOTE_TURN_HISTORY_REFRESH_INTERVAL_MS) return;
-    const forkSource = this.store.getForkHistorySource(current.localSessionId);
-    if (forkSource?.sourceTurnId === current.lastTurnId
-      && this.store.hasImportedForkTurnHistory(current.localSessionId)) return;
+    let state = this.forkHistoryCursors.get(key);
+    if (refreshedAt === undefined || Date.now() - refreshedAt >= REMOTE_TURN_HISTORY_REFRESH_INTERVAL_MS) state = undefined;
+    state ??= { anchorFound: true, complete: false };
     const runtime = this.runtimes.forAgent(current.agentName);
-    if (runtime.kind !== "codex" || !runtime.readRemoteSession) return;
+    if (runtime.kind !== "codex" || !runtime.listRemoteTurnSummaries) return false;
+    const seen = new Set<string>();
     try {
-      const remote = await runtime.readRemoteSession(current.remoteSessionId);
-      this.remoteTurnHistoryRefreshes.set(current.localSessionId, Date.now());
-      const completedTurns = remote.completedTurns ?? [];
-      if (completedTurns.length === 0) return;
-      this.persistCompletedTurnHistory({
-        localSessionId: current.localSessionId,
-        contextKey,
-        agentName: current.agentName,
-        remoteSessionId: current.remoteSessionId,
-        completedTurns,
-        fallbackStart: parseIsoTimestamp(current.createdAt) ?? Date.now() - completedTurns.length,
-      });
+      while (!state.complete && (state.loadedCount ?? 0) < requiredCount) {
+        const page = await runtime.listRemoteTurnSummaries(current.remoteSessionId, {
+          cursor: state.cursor,
+          limit: Math.min(RESET_HISTORY_PAGE_SIZE, requiredCount - (state.loadedCount ?? 0)),
+        });
+        if (page.nextCursor && (page.nextCursor === state.cursor || seen.has(page.nextCursor))) {
+          throw new Error("App Server repeated a Turn history cursor.");
+        }
+        if (page.turns.length) {
+          const imported = this.persistCompletedTurnHistory({
+            localSessionId: current.localSessionId, contextKey, agentName: current.agentName,
+            remoteSessionId: current.remoteSessionId,
+            completedTurns: page.turns.slice().reverse(), replaceParents: true,
+            fallbackStart: (parseIsoTimestamp(current.createdAt) ?? 0) - (state.loadedCount ?? 0) - page.turns.length,
+          });
+          if (!imported) throw new Error("Failed to persist the requested Turn history page.");
+          if (state.tailTurnId) this.store.saveTurnParent(state.tailTurnId, current.localSessionId, page.turns[0]!.id, true);
+        }
+        state = {
+          anchorFound: true, cursor: page.nextCursor, complete: !page.nextCursor,
+          loadedCount: (state.loadedCount ?? 0) + page.turns.length,
+          tailTurnId: page.turns.at(-1)?.id ?? state.tailTurnId,
+        };
+        this.forkHistoryCursors.set(key, state);
+        this.remoteTurnHistoryRefreshes.set(current.localSessionId, Date.now());
+        if (page.nextCursor) seen.add(page.nextCursor);
+      }
+      return !state.complete;
     } catch (error) {
+      if (error instanceof CodexVersionError) throw error;
       this.logger.warn(
         { error, localSessionId: current.localSessionId, remoteSessionId: current.remoteSessionId },
         "Failed to hydrate App Server Turn history; rendering the locally available history.",
       );
     }
+    return true;
   }
 
   private async createProjectSessionFromReference(contextKey: string, reference: string): Promise<void> {
@@ -3559,7 +3610,7 @@ export class ProxySessionController {
       agentName = source.agentName;
       runtime = this.runtimes.forAgent(agentName);
     } else {
-      const resolved = await this.resolveRemoteCodexSession(taskId);
+      const resolved = await this.resolveRemoteCodexSession(taskId, { view: "metadata" });
       agentName = resolved.agentName;
       runtime = resolved.runtime;
       remote = resolved.remote;
@@ -3568,9 +3619,9 @@ export class ProxySessionController {
     const remoteSessionId = source?.remoteSessionId ?? remote?.id ?? taskId;
     if (!remote && runtime.readRemoteSession && remoteSessionId) {
       try {
-        remote = await runtime.readRemoteSession(remoteSessionId);
+        remote = await runtime.readRemoteSession(remoteSessionId, "metadata");
       } catch (error) {
-        if (!source) throw error;
+        if (!source || error instanceof CodexVersionError) throw error;
         this.logger.warn(
           { error, contextKey, taskId: remoteSessionId },
           "Failed to refresh the source task before creating a project task; using the local project path.",
@@ -4566,6 +4617,7 @@ export class ProxySessionController {
           const goal = await runtime.getGoal(record.localSessionId);
           if (goal?.status === "active") await runtime.setGoal(record.localSessionId, { status: "paused" });
         } catch (error) {
+          if (error instanceof CodexVersionError) throw error;
           this.logger.warn(
             { error, sessionId: record.localSessionId },
             "Failed to pause the active Agent goal before interrupting its turn.",
@@ -4580,6 +4632,7 @@ export class ProxySessionController {
             ? remote.lastTurnId
             : undefined;
         } catch (error) {
+          if (error instanceof CodexVersionError) throw error;
           this.logger.warn(
             { error, sessionId: record.localSessionId, remoteSessionId: record.remoteSessionId },
             "Failed to inspect the current App Server turn before interrupting; using the locally tracked turn.",
@@ -4707,9 +4760,9 @@ export class ProxySessionController {
       throw new Error("当前任务不是可 Reset 的 App Server 任务。");
     }
 
-    const historyTurn = this.store.listTaskTurnGraph(current.localSessionId)
+    const historyTurn = this.store.listTaskTurnGraphIndex(current.localSessionId)
       .find((turn) => turn.turnId === turnId);
-    const snapshot = turnViewSnapshot(historyTurn?.snapshot);
+    const snapshot = historyTurn ? this.store.getTurnPromptSummary(turnId) : undefined;
     if (!snapshot || snapshot.status !== "completed") {
       throw new Error("只能将当前任务 Reset 到已成功完成的轮次。");
     }
@@ -5596,9 +5649,9 @@ export class ProxySessionController {
     if (!current.remoteSessionId || !this.isCodexSession(current)) {
       throw new Error("当前任务不是可 Reset 的 App Server 任务。");
     }
-    await this.hydrateLegacyForkTurnHistory(contextKey, current);
-    await this.hydrateRemoteTurnHistory(contextKey, current);
-    const completedTurns = this.store.listTaskTurnGraph(current.localSessionId);
+    const requestedPage = Math.max(0, Math.trunc(options.page ?? 0));
+    const hasMoreHistory = await this.hydrateTaskTurnHistory(current, (requestedPage + 1) * RESET_HISTORY_PAGE_SIZE);
+    const completedTurns = this.store.listTaskTurnGraphIndex(current.localSessionId);
     const completedTurnIds = new Set(completedTurns.map((turn) => turn.turnId));
     const runningTurnId = current.lastTurnStatus === "running" && current.lastTurnId
       && !completedTurnIds.has(current.lastTurnId)
@@ -5640,13 +5693,13 @@ export class ProxySessionController {
       parentTurnId: turn.parentTurnId,
     })));
     const total = allTurns.length;
-    const totalPages = Math.max(1, Math.ceil(total / RESET_HISTORY_PAGE_SIZE));
+    const totalPages = Math.max(1, Math.ceil(total / RESET_HISTORY_PAGE_SIZE)) + (hasMoreHistory ? 1 : 0);
     const page = Math.max(0, Math.min(Math.trunc(options.page ?? 0), totalPages - 1));
     const offset = page * RESET_HISTORY_PAGE_SIZE;
     const turns = allTurns.slice(offset, offset + RESET_HISTORY_PAGE_SIZE);
     const resettingTurnId = this.resetHistoryOperations.get(current.localSessionId);
     const entries: ResetHistoryCardEntry[] = turns.flatMap((turn, index) => {
-      const snapshot = turnViewSnapshot(turn.snapshot);
+      const snapshot = turn.turnId === runningTurnId ? runningSnapshot : this.store.getTurnPromptSummary(turn.turnId);
       if (!snapshot) return [];
       const graph = graphRows[offset + index]!;
       const summary = truncateText(
@@ -5701,7 +5754,9 @@ export class ProxySessionController {
     const card = this.cardRenderer.renderResetHistoryCard({
       entries,
       footerLines: [
-        runningTurn
+        hasMoreHistory
+          ? `第 ${page + 1} 页 · 已加载 ${total} 个 turn`
+          : runningTurn
           ? `第 ${page + 1}/${totalPages} 页 · 共 ${total} 个 turn（${completedTurns.length} 个已完成，1 个运行中）`
           : `第 ${page + 1}/${totalPages} 页 · 共 ${total} 个已完成 turn`,
         ...(resettingTurnId ? ["正在 Reset 到所选轮次，请稍候…"] : []),
@@ -6215,7 +6270,7 @@ export class ProxySessionController {
 
   private async resolveRemoteCodexSession(
     reference: string,
-    options: { forFork?: boolean } = {},
+    options: { forFork?: boolean; view?: "metadata" | "latest" | "latest-full" } = {},
   ): Promise<AgentRemoteSession> {
     const scoped = parseRemoteSessionReference(reference);
     const candidates = scoped
@@ -6233,7 +6288,7 @@ export class ProxySessionController {
         runtime,
         remote: options.forFork && runtime.readRemoteForkSource
           ? await runtime.readRemoteForkSource(remoteSessionId)
-          : await runtime.readRemoteSession(remoteSessionId),
+          : await runtime.readRemoteSession(remoteSessionId, options.view ?? "latest"),
       } satisfies AgentRemoteSession;
     }));
     const matches = reads
@@ -6598,27 +6653,28 @@ export class ProxySessionController {
       current = context.currentSessionId ? this.store.getSession(context.currentSessionId) : undefined;
     }
 
-    if (current && current.status === "running") {
-      try {
-        const runtime = this.runtimes.forAgent(current.agentName);
-        if (runtime.getSession(current.localSessionId)) {
-          await runtime.synchronizeSession(current.localSessionId);
+    let remote: RemoteSessionSummary | undefined;
+    if (current?.status === "running") {
+      const runtime = this.runtimes.forAgent(current.agentName);
+      if (runtime.getSession(current.localSessionId)) {
+        try {
+          remote = (await runtime.synchronizeSession(current.localSessionId)).remoteSummary;
           current = this.store.getSession(current.localSessionId) ?? current;
+        } catch (error) {
+          if (error instanceof CodexVersionError) throw error;
+          this.logger.warn({ error, sessionId: current.localSessionId }, "Failed to synchronize task status.");
         }
-      } catch (error) {
-        this.logger.warn({ error, sessionId: current.localSessionId }, "Failed to synchronize task status.");
       }
     }
-
     const localCurrent = current;
-    let remote: RemoteSessionSummary | undefined;
     let goal: RuntimeGoal | undefined;
     if (current?.remoteSessionId) {
       const runtime = this.runtimes.forAgent(current.agentName);
-      if (runtime.readRemoteSession) {
+      if (!remote && runtime.readRemoteSession) {
         try {
-          remote = await runtime.readRemoteSession(current.remoteSessionId);
+          remote = await runtime.readRemoteSession(current.remoteSessionId, "latest-full");
         } catch (error) {
+          if (error instanceof CodexVersionError) throw error;
           this.logger.warn({ error, sessionId: current.localSessionId }, "Failed to inspect App Server task status.");
         }
       }
@@ -6729,7 +6785,7 @@ export class ProxySessionController {
     reference: string,
     options: StatusCardOptions = {},
   ): Promise<void> {
-    const { agentName, remote } = await this.resolveRemoteCodexSession(reference);
+    const { agentName, remote } = await this.resolveRemoteCodexSession(reference, { view: "latest-full" });
     const actionReference = remoteSessionReference(agentName, remote.id);
     const sections: CardSection[] = [
       {
