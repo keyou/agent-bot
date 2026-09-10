@@ -44,6 +44,13 @@ export interface SessionRecord {
   updatedAt: string;
 }
 
+export type CreateSessionInput = Omit<SessionRecord, "acpSessionId" | "createdAt" | "updatedAt">;
+
+export interface SessionCreationAudit {
+  eventType: string;
+  payload: unknown;
+}
+
 export type MessageReactionStatus = "pending" | "updating" | "completed" | "failed" | "cancelled";
 
 export interface MessageReactionRecord {
@@ -870,43 +877,68 @@ export class StateStore {
       .run(localSessionId ?? null, localSessionId ?? null, now, contextKey);
   }
 
-  createSession(input: {
-    localSessionId: string;
-    contextKey: string;
-    agentName: string;
-    cwd: string;
-    status: SessionStatus;
-  }): SessionRecord {
+  createSession(input: CreateSessionInput): SessionRecord {
+    return this.db.transaction(() => this.insertSession(input))();
+  }
+
+  createSessionAsCurrent(
+    input: CreateSessionInput,
+    audit: SessionCreationAudit,
+  ): SessionRecord {
+    return this.db.transaction(() => {
+      const record = this.insertSession(input);
+      this.setCurrentSession(input.contextKey, input.localSessionId);
+      this.audit(input.contextKey, audit.eventType, audit.payload);
+      return record;
+    })();
+  }
+
+  private insertSession(input: CreateSessionInput): SessionRecord {
     const now = new Date().toISOString();
-    const create = this.db.transaction(() => {
-      this.db.prepare(
-        `
-        INSERT INTO sessions (
-          local_session_id,
-          context_key,
-          agent_name,
-          cwd,
-          acp_session_id,
-          status,
-          created_at,
-          updated_at
-        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
-        `,
-      ).run(
-        input.localSessionId,
-        input.contextKey,
-        input.agentName,
-        input.cwd,
-        input.status,
-        now,
-        now,
-      );
-      this.db.prepare(`
-        INSERT INTO context_sessions (context_key, local_session_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?)
-      `).run(input.contextKey, input.localSessionId, now, now);
-    });
-    create();
+    this.db.prepare(
+      `
+      INSERT INTO sessions (
+        local_session_id,
+        context_key,
+        agent_name,
+        cwd,
+        acp_session_id,
+        runtime_kind,
+        remote_session_id,
+        title,
+        model_provider,
+        model,
+        reasoning_effort,
+        permission_mode,
+        last_turn_id,
+        last_turn_status,
+        status,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+    ).run(
+      input.localSessionId,
+      input.contextKey,
+      input.agentName,
+      input.cwd,
+      input.runtimeKind ?? null,
+      input.remoteSessionId ?? null,
+      input.title ?? null,
+      input.modelProvider ?? null,
+      input.model ?? null,
+      input.reasoningEffort ?? null,
+      input.permissionMode ?? null,
+      input.lastTurnId ?? null,
+      input.lastTurnStatus ?? null,
+      input.status,
+      now,
+      now,
+    );
+    this.db.prepare(`
+      INSERT INTO context_sessions (context_key, local_session_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?)
+    `).run(input.contextKey, input.localSessionId, now, now);
 
     return {
       ...input,
@@ -1785,6 +1817,21 @@ export class StateStore {
     return row ? { ...mapSession(row), ...(contextKey ? { contextKey } : {}) } : undefined;
   }
 
+  findSessionByRemoteSessionIdIncludingClosed(
+    remoteSessionId: string,
+    agentName: string,
+  ): SessionRecord | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM sessions
+        WHERE remote_session_id = ? AND agent_name = ?
+        ORDER BY created_at ASC
+        LIMIT 1
+      `)
+      .get(remoteSessionId, agentName) as SessionRow | undefined;
+    return row ? mapSession(row) : undefined;
+  }
+
   getTurnContextKey(turnId: string): string | undefined {
     const row = this.db.prepare("SELECT context_key FROM turn_snapshots WHERE turn_id = ?")
       .get(turnId) as { context_key: string | null } | undefined;
@@ -1800,6 +1847,15 @@ export class StateStore {
         `,
       )
       .run(contextKey, eventType, JSON.stringify(payload), new Date().toISOString());
+  }
+
+  hasAuditEvent(contextKey: string, eventType: string): boolean {
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM audit_events
+      WHERE context_key = ? AND event_type = ?
+      LIMIT 1
+    `).get(contextKey, eventType));
   }
 
   hasInjectedTopicRoot(localSessionId: string, rootMessageId: string): boolean {

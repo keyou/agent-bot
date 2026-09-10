@@ -6,10 +6,11 @@ export interface TaskNewGroupOptions {
   cwd?: string;
   agentName?: string;
   projectless: boolean;
+  sessionId?: string;
   json: boolean;
 }
 
-export type TaskNewOptions = TaskNewGroupOptions;
+export type TaskNewOptions = Omit<TaskNewGroupOptions, "sessionId">;
 
 export interface TaskForkGroupOptions {
   reference: string;
@@ -21,7 +22,7 @@ export function parseTaskNewGroupOptions(
   input: string[],
   language: CliLanguage = cliLanguage,
 ): TaskNewGroupOptions {
-  return parseTaskNewOptions(input, "newgroup", language);
+  return parseTaskCreationOptions(input, "newgroup", language);
 }
 
 export function parseTaskNewOptions(
@@ -29,10 +30,24 @@ export function parseTaskNewOptions(
   action: "new" | "newgroup" = "new",
   language: CliLanguage = cliLanguage,
 ): TaskNewOptions {
+  const { sessionId: _sessionId, ...options } = parseTaskCreationOptions(
+    input,
+    action,
+    language,
+  );
+  return options;
+}
+
+function parseTaskCreationOptions(
+  input: string[],
+  action: "new" | "newgroup",
+  language: CliLanguage,
+): TaskNewGroupOptions {
   const positionals: string[] = [];
   let cwd: string | undefined;
   let agentName: string | undefined;
   let projectless = false;
+  let sessionId: string | undefined;
   let json = false;
   for (let index = 0; index < input.length; index += 1) {
     const argument = input[index]!;
@@ -75,17 +90,39 @@ export function parseTaskNewOptions(
       index += 1;
       continue;
     }
+    if (argument === "--session" && action === "newgroup") {
+      if (sessionId !== undefined) throw optionError(action, "--session", language);
+      const reference = input[index + 1];
+      if (!reference || reference.startsWith("--")) {
+        throw new Error(cliText(
+          "task newgroup requires an App Server Session ID after --session.",
+          "task newgroup 需要在 --session 后指定 App Server Session ID。",
+          language,
+        ));
+      }
+      sessionId = reference;
+      index += 1;
+      continue;
+    }
     if (argument.startsWith("--")) throw unsupportedOption(action, argument, language);
     positionals.push(argument);
   }
   const [reference, ...titleParts] = positionals;
   requireTaskReference(action, reference, language);
+  if (sessionId && (cwd !== undefined || projectless)) {
+    throw new Error(cliText(
+      "task newgroup cannot combine --session with --dir or --nodir.",
+      "task newgroup 的 --session 不能和 --dir 或 --nodir 一起使用。",
+      language,
+    ));
+  }
   return {
     reference,
     title: titleParts.join(" ").trim() || undefined,
     cwd,
     ...(agentName ? { agentName } : {}),
     projectless,
+    ...(sessionId ? { sessionId } : {}),
     json,
   };
 }
@@ -128,7 +165,7 @@ function requireTaskReference(
 
 function optionError(
   action: "new" | "newgroup",
-  option: "--agent" | "--dir" | "--nodir",
+  option: "--agent" | "--dir" | "--nodir" | "--session",
   language: CliLanguage,
 ): Error {
   return new Error(cliText(

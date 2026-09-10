@@ -27,7 +27,7 @@ export function renderCliHelp(version: string, language: CliLanguage = cliLangua
   task status|chat [任务]           显示任务状态或绑定的飞书会话
   task prompt [任务] <提示词>       向任务发送提示词；send 是别名
   task new [任务] [标题]            在同一会话新建任务；支持 --agent、--dir、--nodir
-  task newgroup [任务] [标题]       创建新群；支持 --agent、--dir、--nodir
+  task newgroup [任务] [标题]       创建新群；支持创建参数或 --session <ID> [--agent <名称>]
   task fork [任务]                  从任务最近完成的 Turn 创建分支
   task forkgroup [任务] [标题]      从任务 Fork 新群
   task switch [任务] [目标任务]     切换会话任务；--previous 切回上一任务
@@ -120,7 +120,7 @@ Task commands:
   task status|chat [task]           Show task status or its Lark chat binding
   task prompt [task] <prompt>       Send a Prompt to a task; send is an alias
   task new [task] [title]           Create a task in the same conversation; supports --agent, --dir, --nodir
-  task newgroup [task] [title]      Create a group; supports --agent, --dir, --nodir
+  task newgroup [task] [title]      Create a group; supports creation options or --session <ID> [--agent <name>]
   task fork [task]                  Fork the task's latest completed Turn
   task forkgroup [task] [title]     Fork a task into a new group
   task switch [task] [target]       Switch the conversation task; --previous selects the prior task

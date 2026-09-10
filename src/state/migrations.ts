@@ -30,6 +30,8 @@ export const migrations = [
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS idx_audit_events_context_type
+    ON audit_events(context_key, event_type);
   `,
   `
   CREATE TABLE IF NOT EXISTS turn_snapshots (

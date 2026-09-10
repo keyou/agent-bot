@@ -189,12 +189,20 @@ function parseNewCommand(args: string[]): Extract<Command, { type: "new" }> {
 }
 
 function parseNewGroupCommand(args: string[]): Extract<Command, { type: "newgroup" }> {
-  const options = parseNewTaskOptions("/newgroup", args, "项目目录", "~/dev/project");
+  const options = parseNewTaskOptions("/newgroup", args, "项目目录", "~/dev/project", true);
+  if (options.agentName && !options.sessionId) {
+    throw new Error("/newgroup 的 --agent 只能和 --session 一起使用。");
+  }
+  if (options.sessionId && (options.cwd !== undefined || options.projectless)) {
+    throw new Error("/newgroup 的 --session 不能和 --dir 或 --nodir 一起使用。");
+  }
   return {
     type: "newgroup",
     title: options.title,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.projectless ? { projectless: true } : {}),
+    ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+    ...(options.agentName ? { agentName: options.agentName } : {}),
   };
 }
 
@@ -203,12 +211,35 @@ function parseNewTaskOptions(
   args: string[],
   directoryLabel: string,
   exampleDirectory: string,
-): { title?: string; cwd?: string; projectless: boolean } {
+  allowSession = false,
+): { title?: string; cwd?: string; projectless: boolean; sessionId?: string; agentName?: string } {
   const titleParts: string[] = [];
   let cwd: string | undefined;
   let projectless = false;
+  let sessionId: string | undefined;
+  let agentName: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]!;
+    if (allowSession && argument === "--session") {
+      if (sessionId !== undefined) throw new Error(`${commandName} 只能指定一次 --session。`);
+      const reference = args[index + 1];
+      if (!reference || reference.startsWith("--")) {
+        throw new Error("请在 --session 后指定 App Server Session ID。");
+      }
+      sessionId = reference;
+      index += 1;
+      continue;
+    }
+    if (allowSession && argument === "--agent") {
+      if (agentName !== undefined) throw new Error(`${commandName} 只能指定一次 --agent。`);
+      const name = args[index + 1];
+      if (!name?.trim() || name.startsWith("--")) {
+        throw new Error(`请在 --agent 后指定 Agent 标准名。`);
+      }
+      agentName = name.trim();
+      index += 1;
+      continue;
+    }
     if (argument === "--nodir") {
       if (projectless) throw new Error(`${commandName} 只能指定一次 --nodir。`);
       if (cwd !== undefined) throw new Error(`${commandName} 的 --dir 和 --nodir 不能同时使用。`);
@@ -216,13 +247,16 @@ function parseNewTaskOptions(
       continue;
     }
     if (argument !== "--dir") {
+      if (allowSession && argument.startsWith("--")) {
+        throw new Error(`${commandName} 不支持参数：${argument}。`);
+      }
       titleParts.push(argument);
       continue;
     }
     if (projectless) throw new Error(`${commandName} 的 --dir 和 --nodir 不能同时使用。`);
     if (cwd !== undefined) throw new Error(`${commandName} 只能指定一次 --dir。`);
     const directory = args[index + 1];
-    if (!directory || directory === "--dir" || directory === "--nodir") {
+    if (!directory || directory.startsWith("--")) {
       throw new Error(
         `请在 --dir 后指定${directoryLabel}，例如：${commandName} 修复会话列表 --dir ${exampleDirectory}。`,
       );
@@ -234,6 +268,8 @@ function parseNewTaskOptions(
     title: titleParts.join(" ").trim() || undefined,
     cwd,
     projectless,
+    ...(sessionId ? { sessionId } : {}),
+    ...(agentName ? { agentName } : {}),
   };
 }
 
