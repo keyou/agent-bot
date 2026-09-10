@@ -230,6 +230,33 @@ describe("CommandRouter", () => {
     expect(() => router.parse("/forkgroup --unknown")).toThrow("不支持参数");
   });
 
+  test("parses newgroup session mode with an optional title", () => {
+    expect(router.parse("/newgroup --session 019f-thread")).toEqual({
+      type: "newgroup",
+      sessionId: "019f-thread",
+      title: undefined,
+    });
+    expect(router.parse('/newgroup "Existing task" --session codex://threads/019f-thread')).toEqual({
+      type: "newgroup",
+      sessionId: "codex://threads/019f-thread",
+      title: "Existing task",
+    });
+    expect(router.parse("/newgroup --session 019f-thread --agent traex")).toEqual({
+      type: "newgroup",
+      sessionId: "019f-thread",
+      agentName: "traex",
+      title: undefined,
+    });
+    expect(() => router.parse("/newgroup --session")).toThrow("--session 后指定 App Server Session ID");
+    expect(() => router.parse("/newgroup --session 019f-thread --session other")).toThrow("只能指定一次 --session");
+    expect(() => router.parse("/newgroup --session 019f-thread --move")).toThrow("不支持参数：--move");
+    expect(() => router.parse("/newgroup --session 019f-thread --dir ~/project")).toThrow("不能和 --dir 或 --nodir");
+    expect(() => router.parse("/newgroup --session 019f-thread --nodir")).toThrow("不能和 --dir 或 --nodir");
+    expect(() => router.parse("/newgroup --agent traex")).toThrow("只能和 --session 一起使用");
+    expect(() => router.parse("/newgroup --session 019f-thread --agent")).toThrow("--agent 后指定 Agent 标准名");
+    expect(() => router.parse("/attachgroup 019f-thread")).toThrow("未知命令：/attachgroup");
+  });
+
   test("parses a title containing spaces", () => {
     expect(router.parse("/title 修复会话列表时间")).toEqual({ type: "title", title: "修复会话列表时间" });
     expect(router.parse('/title "Fix session title"')).toEqual({ type: "title", title: "Fix session title" });
@@ -315,6 +342,7 @@ describe("CommandRouter", () => {
     expect(() => router.parse("/f")).toThrow(
       "命令前缀 /f 不唯一，可匹配：/file、/fork、/forkgroup",
     );
+    expect(() => router.parse("/a")).toThrow("命令前缀 /a 不唯一，可匹配：/agent、/archive");
     expect(() => router.parse("/re")).toThrow(
       "命令前缀 /re 不唯一，可匹配：/release、/restart",
     );

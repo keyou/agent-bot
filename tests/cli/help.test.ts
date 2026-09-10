@@ -27,6 +27,8 @@ describe("CLI help", () => {
     expect(help).toContain("task current [--json]");
     expect(help).toContain("Show details for the task invoking the CLI");
     expect(help).toContain("task newgroup [task] [title]");
+    expect(help).toContain("--session <ID>");
+    expect(help).not.toContain("--move");
     expect(help).toContain("supports --agent, --dir, --nodir");
     expect(help).toContain("task forkgroup [task] [title]");
     expect(help).toContain("Task commands:");
@@ -69,6 +71,8 @@ describe("CLI help", () => {
     expect(help).toContain("task current [--json]");
     expect(help).toContain("显示当前调用任务的详情");
     expect(help).toContain("task newgroup [任务] [标题]");
+    expect(help).toContain("--session <ID>");
+    expect(help).not.toContain("--move");
     expect(help).toContain("支持 --agent、--dir、--nodir");
     expect(help).toContain("task forkgroup [任务] [标题]");
     expect(help).toContain("任务命令：");

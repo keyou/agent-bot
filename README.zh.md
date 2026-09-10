@@ -200,6 +200,7 @@ agentbot task status [任务]
 agentbot task prompt [任务] "<prompt>"
 agentbot task new [任务] [标题] [--agent <标准名>] [--dir <路径> | --nodir]
 agentbot task newgroup [任务] [标题] [--agent <标准名>] [--dir <路径> | --nodir]
+agentbot task newgroup [任务] [标题] --session <Session ID> [--agent <标准名>]
 agentbot task fork [任务]
 agentbot task forkgroup [任务] [标题]
 agentbot task queue [任务] "<prompt>"
@@ -217,7 +218,7 @@ agentbot task dismiss [任务] --yes
 
 在 Agent Bot 启动的 Agent 中，省略 `[任务]` 会自动使用当前任务；需要操作其他任务时可传入 `--task <任务>`。普通终端仍必须指定任务。`task current` 用于查看自动识别出的任务详情。任务引用可以是 `task list` 中的序号、任务 ID 或唯一的任务 ID 前缀。飞书中的任务、分支、排队、Agent、Provider、模型、思考强度、权限、Goal、历史 Turn、Reset、群静音、解散群、目录、文件、Shell 和重启能力都有对应的 CLI 命令；运行 `agentbot --help` 查看完整列表和参数。
 
-`task newgroup` 会创建飞书群和新任务。默认继承源任务的 Agent 和运行设置；`--agent <标准名>` 可选择另一个已配置的 Agent，此时仍继承源任务的项目形态，但 Provider、模型、思考强度和权限模式使用目标 Agent 已保存的默认值。`--dir` 可覆盖项目目录并支持 `~`，`--nodir` 会强制创建 Projectless App Server 任务。Project 与 Projectless 群名可在 `feishu.groupNameFormat` 中分别自定义。`task forkgroup` 从源任务最新可用的已完成 turn 创建分支，不会中断正在执行的 turn。两个命令都要求 Server 正在运行，邀请 Profile 中保存的授权用户，不会切换源会话的当前任务，并支持 `--json`。
+`task newgroup` 默认会创建飞书群和新任务，并继承源任务的 Agent 和运行设置；`--agent <标准名>` 可选择另一个已配置的 Agent，`--dir` 可覆盖项目目录并支持 `~`，`--nodir` 会强制创建 Projectless App Server 任务。指定 `--session <Session ID>` 时，它会改为给已有 App Server Session 创建新群，既支持原始 Session ID，也支持 `codex://threads/<id>`，并且不会创建或 Fork Session。如果多个 App Server Agent 中存在相同的 Session ID，可附加 `--agent <标准名>` 指定归属。Session 模式不能与 `--dir` 或 `--nodir` 混用；执行中的 Session 和已经绑定飞书会话的 Session 都会在建群前被拒绝。Project 与 Projectless 群名可在 `feishu.groupNameFormat` 中分别自定义。`task forkgroup` 从源任务最新可用的已完成 turn 创建分支，不会中断正在执行的 turn。这些建群命令都要求 Server 正在运行，会邀请 Profile 中保存的授权用户，并支持 `--json`。
 
 ## 飞书命令
 
@@ -246,6 +247,7 @@ agentbot task dismiss [任务] --yes
 | `/permissions`                                | 设置执行权限                 |
 | `/agent [名称]`                               | 选择新任务使用的 Agent       |
 | `/newgroup [标题] [--dir <路径> \| --nodir]`  | 在新私有群中开始任务         |
+| `/newgroup [标题] --session <Session ID> [--agent <标准名>]` | 在新私有群中复用尚未绑定的已有 Session |
 | `/forkgroup [标题]`                           | 将任务分支到新私有群         |
 | `/restart [--force]`                          | 安全重启；`--force` 会中断任务 |
 | `/release`                                    | 释放 Agent Bot 占用的 App Server 任务 |
@@ -266,7 +268,7 @@ Fork 只记录来源任务和分支轮次，不同步完整历史。普通任务
 
 `/file` 支持相对路径、绝对路径和以 `~` 开头的用户目录路径；相对路径以当前任务目录为基准。
 
-`/fork` 和 `/forkgroup` 会从已完成的工作创建分支，不会中断正在执行的轮次。`/sessions` 用于跨项目管理任务，每页最多显示 10 个任务；项目菜单提供 `New` 和 `NewGroup`。展开任务后会直接显示最后一个用户 Prompt 的前 50 个字符、更新时间以及任务级操作。`/turns` 用于恢复对话上下文，不会回退本地文件。
+`/fork` 和 `/forkgroup` 会从已完成的工作创建分支，不会中断正在执行的轮次。`/newgroup --session` 会直接复用空闲且尚未绑定飞书会话的已有 App Server Session；已绑定的 Session 会被拒绝。`/sessions` 用于跨项目管理任务，每页最多显示 10 个任务；项目菜单提供 `New` 和 `NewGroup`。展开任务后会直接显示最后一个用户 Prompt 的前 50 个字符、更新时间以及任务级操作。`/turns` 用于恢复对话上下文，不会回退本地文件。
 
 ## 本地命令
 

@@ -77,12 +77,31 @@ export type ControlRequest =
       agentName?: string;
       projectless?: boolean;
     }
+  | {
+      action: "task_new_group_session";
+      localSessionId: string;
+      sessionId: string;
+      title?: string;
+      agentName?: string;
+    }
   | { action: "task_fork_group"; localSessionId: string; title?: string };
 
 export interface ControlResponse {
   ok: boolean;
   message?: string;
   data?: unknown;
+}
+
+export function assertCompatibleTaskNewGroupRequest(request: {
+  action: "task_new_group";
+  [key: string]: unknown;
+}): void {
+  if (request.sessionId !== undefined) {
+    throw new Error(
+      "This Agent Bot Worker no longer accepts --session through the legacy newgroup protocol. "
+      + "Restart the Agent Bot CLI and try again.",
+    );
+  }
 }
 
 export interface TaskStatusControlData {

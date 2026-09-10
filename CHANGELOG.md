@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Extend Feishu `/newgroup` and CLI `agentbot task newgroup` with `--session <session-id>` to create a group for an unbound existing App Server Session without creating or forking a task; `--agent <name>` disambiguates identical Session IDs across App Server Agents.
+
 ## [0.1.20] - 2026-09-07
 
 - Load only necessary Turn history on demand, keep Fork creation lightweight, and require Codex 0.153.4 or later during initialization and runtime startup.

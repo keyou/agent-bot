@@ -1597,30 +1597,44 @@ async function taskCommand(input: string[]): Promise<void> {
       const target = resolveTaskCommandTarget(allSessions, rest, action);
       const options = parseTaskNewGroupOptions([target.session.localSessionId, ...target.args]);
       const session = target.session;
-      const targetAgentName = options.agentName ?? session.agentName;
-      const targetAgent = config.agents[targetAgentName];
-      if (!targetAgent) {
-        throw new Error(cliText(
-          `Unknown Agent standard name: ${targetAgentName}.`,
-          `未知的 Agent 标准名：${targetAgentName}。`,
-        ));
-      }
-      if (options.projectless && targetAgent.kind !== "app-server") {
-        throw new Error(cliText(
-          "task newgroup --nodir is only available for App Server agents.",
-          "task newgroup --nodir 仅适用于 App Server Agent。",
-        ));
+      if (!options.sessionId) {
+        const targetAgentName = options.agentName ?? session.agentName;
+        const targetAgent = config.agents[targetAgentName];
+        if (!targetAgent) {
+          throw new Error(cliText(
+            `Unknown Agent standard name: ${targetAgentName}.`,
+            `未知的 Agent 标准名：${targetAgentName}。`,
+          ));
+        }
+        if (options.projectless && targetAgent.kind !== "app-server") {
+          throw new Error(cliText(
+            "task newgroup --nodir is only available for App Server agents.",
+            "task newgroup --nodir 仅适用于 App Server Agent。",
+          ));
+        }
       }
       requireCliGroupUser(config.feishu.userOpenId);
-      const response = await sendControlRequest(controlEndpoint(config.storage.sqlitePath), {
-        action: "task_new_group",
-        localSessionId: session.localSessionId,
-        ...(options.title ? { title: options.title } : {}),
-        ...(options.cwd ? { cwd: options.cwd } : {}),
-        ...(options.agentName ? { agentName: options.agentName } : {}),
-        ...(options.projectless ? { projectless: true } : {}),
-      }, 120_000);
-      const result = taskGroupControlData(response);
+      const response = await sendControlRequest(
+        controlEndpoint(config.storage.sqlitePath),
+        options.sessionId
+          ? {
+              action: "task_new_group_session",
+              localSessionId: session.localSessionId,
+              sessionId: options.sessionId,
+              ...(options.title ? { title: options.title } : {}),
+              ...(options.agentName ? { agentName: options.agentName } : {}),
+            }
+          : {
+              action: "task_new_group",
+              localSessionId: session.localSessionId,
+              ...(options.title ? { title: options.title } : {}),
+              ...(options.cwd ? { cwd: options.cwd } : {}),
+              ...(options.agentName ? { agentName: options.agentName } : {}),
+              ...(options.projectless ? { projectless: true } : {}),
+            },
+        120_000,
+      );
+      const result = taskGroupControlData(response, Boolean(options.sessionId));
       if (options.json) printJson(result);
       else printTaskGroupResult(result, "newgroup");
       return;
@@ -2330,7 +2344,13 @@ function requireCliGroupUser(userOpenId: string | undefined): asserts userOpenId
   ));
 }
 
-function taskGroupControlData(response: ControlResponse): TaskGroupControlData {
+function taskGroupControlData(
+  response: ControlResponse,
+  preserveServerError = false,
+): TaskGroupControlData {
+  if (!response.ok && preserveServerError && response.message?.trim()) {
+    throw new Error(response.message.trim());
+  }
   ensureOk(response);
   const data = response.data as Partial<TaskGroupControlData> | undefined;
   if (

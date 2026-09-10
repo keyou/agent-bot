@@ -200,6 +200,7 @@ agentbot task status [task]
 agentbot task prompt [task] "<prompt>"
 agentbot task new [task] [title] [--agent <standard-name>] [--dir <path> | --nodir]
 agentbot task newgroup [task] [title] [--agent <standard-name>] [--dir <path> | --nodir]
+agentbot task newgroup [task] [title] --session <Session ID> [--agent <standard-name>]
 agentbot task fork [task]
 agentbot task forkgroup [task] [title]
 agentbot task queue [task] "<prompt>"
@@ -217,7 +218,7 @@ agentbot task dismiss [task] --yes
 
 Inside an Agent started by Agent Bot, `[task]` defaults to the current task; use `--task <task>` to target another task explicitly. A regular terminal must supply a task. `task current` shows the automatically detected task details. A task reference can be a number from `task list`, a task ID, or an unambiguous task-ID prefix. Every Feishu task, fork, queue, Agent, Provider, model, thinking, permission, Goal, historical Turn, Reset, group mute, group dismissal, directory, file, shell, and restart operation has a CLI counterpart. Run `agentbot --help` for the complete list and options.
 
-`task newgroup` creates a Feishu group and a new task. By default, it inherits the source task's Agent and execution settings. `--agent <standard-name>` selects another configured Agent; the source project shape is still inherited, while Provider, model, reasoning effort, and permission mode use the target Agent's saved defaults. `--dir` overrides the project directory and supports `~`; `--nodir` forces a Projectless App Server task. Project and Projectless group names can be customized separately through `feishu.groupNameFormat`. `task forkgroup` forks from the source task's latest available completed turn without interrupting an active turn. Both commands require the Server to be running, invite the authorizing user saved in the Profile, leave the source conversation on its current task, and support `--json`.
+`task newgroup` creates a Feishu group and a new task by default. It inherits the source task's Agent and execution settings; `--agent <standard-name>` selects another configured Agent, `--dir` overrides the project directory and supports `~`, and `--nodir` forces a Projectless App Server task. With `--session <Session ID>`, it instead creates a group for the exact existing App Server Session and accepts either a raw Session ID or `codex://threads/<id>`. If multiple App Server Agents contain the same Session ID, add `--agent <standard-name>` to select its owner. Session mode cannot be combined with `--dir` or `--nodir`; active Sessions and Sessions already bound to a Feishu conversation are rejected before group creation. Project and Projectless group names can be customized separately through `feishu.groupNameFormat`. `task forkgroup` forks from the source task's latest available completed turn without interrupting an active turn. These group commands require the Server to be running, invite the authorizing user saved in the Profile, and support `--json`.
 
 ## Feishu Commands
 
@@ -246,6 +247,7 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 | `/permissions`                                | Set execution permissions            |
 | `/agent [name]`                               | Choose the Agent for new tasks       |
 | `/newgroup [title] [--dir <path> \| --nodir]` | Start a task in a new private group  |
+| `/newgroup [title] --session <Session ID> [--agent <standard-name>]` | Reuse an unbound existing Session in a new private group |
 | `/forkgroup [title]`                          | Branch a task into a new private group |
 | `/restart [--force]`                          | Restart safely, or interrupt with `--force` |
 | `/release`                                    | Release Agent Bot's App Server tasks for Desktop |
@@ -264,7 +266,7 @@ In a group, `/mute` and `/mute on` make the bot process only messages that menti
 
 `/file` accepts relative paths, absolute paths, and paths beginning with `~`; relative paths resolve from the current task directory.
 
-`/fork` and `/forkgroup` branch from completed work without interrupting a running turn. `/sessions` manages tasks across projects in pages of up to 10 tasks; use each project menu for `New` and `NewGroup`. Expanding a task directly shows the first 50 characters of its latest user Prompt, its update time, and task-specific actions. `/turns` restores conversation context without reverting local files.
+`/fork` and `/forkgroup` branch from completed work without interrupting a running turn. `/newgroup --session` reuses an idle, unbound existing App Server Session; already-bound Sessions are rejected. `/sessions` manages tasks across projects in pages of up to 10 tasks; use each project menu for `New` and `NewGroup`. Expanding a task directly shows the first 50 characters of its latest user Prompt, its update time, and task-specific actions. `/turns` restores conversation context without reverting local files.
 
 Fork creation records the source task and branch Turn without synchronizing the local history list. Agent-side conversation inheritance is unchanged. Opening `/turns` reuses local history first and requests only the Turn-summary pages needed for the selected card page, bounded by the branch Turn. Older history is loaded only when needed for later pages; `agentbot task turns` loads the first page if necessary and returns the available local records. Failed history reads remain retryable, and Agents without summary pagination do not trigger a full-history fallback.
 

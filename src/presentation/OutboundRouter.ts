@@ -92,10 +92,13 @@ export class OutboundRouter {
 
   unregisterSession(sessionId: string): void {
     const route = this.sessionRoutes.get(sessionId);
-    route?.presenter.unregisterSession(sessionId);
-    this.sessionRoutes.delete(sessionId);
-    this.sessionContextKeys.delete(sessionId);
-    this.sessionReplyTargets.delete(sessionId);
+    try {
+      route?.presenter.unregisterSession(sessionId);
+    } finally {
+      this.sessionRoutes.delete(sessionId);
+      this.sessionContextKeys.delete(sessionId);
+      this.sessionReplyTargets.delete(sessionId);
+    }
   }
 
   async startPendingTurn(

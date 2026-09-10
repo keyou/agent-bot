@@ -76,6 +76,24 @@ describe("StateStore runtime metadata", () => {
     });
   });
 
+  test("indexes audit lookups by context and event type", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const dbPath = path.join(directory, "state.sqlite");
+    const store = new StateStore(dbPath);
+    stores.push(store);
+    store.audit("chat_id:failed_group", "group_attachment_rollback_failed", {});
+    expect(store.hasAuditEvent("chat_id:failed_group", "group_attachment_rollback_failed")).toBe(true);
+
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const indexes = db.prepare("PRAGMA index_list('audit_events')").all() as Array<{ name: string }>;
+      expect(indexes.map((index) => index.name)).toContain("idx_audit_events_context_type");
+    } finally {
+      db.close();
+    }
+  });
+
   test("persists Goal card deliveries across store restarts", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);
@@ -284,6 +302,52 @@ describe("StateStore runtime metadata", () => {
     });
   });
 
+  test.each(["setCurrentSession", "audit"] as const)(
+    "rolls back an attached task when %s fails",
+    (failurePoint) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+      tempDirectories.push(directory);
+      const store = new StateStore(path.join(directory, "state.sqlite"));
+      stores.push(store);
+      const contextKey = "chat_id:attachment";
+      store.getOrCreateUserContext(contextKey, "codex");
+      vi.spyOn(store, failurePoint).mockImplementationOnce(() => {
+        throw new Error(`${failurePoint} failed`);
+      });
+
+      expect(() => store.createSessionAsCurrent({
+        localSessionId: "attachment_failed",
+        contextKey,
+        agentName: "codex",
+        cwd: directory,
+        status: "ready",
+        runtimeKind: "codex",
+        remoteSessionId: "remote_attachment",
+      }, {
+        eventType: "session_attached_to_group",
+        payload: { remoteSessionId: "remote_attachment" },
+      })).toThrow(`${failurePoint} failed`);
+
+      expect(store.getSession("attachment_failed")).toBeUndefined();
+      expect(store.listSessions(contextKey)).toEqual([]);
+      expect(store.getUserContext(contextKey)?.currentSessionId).toBeUndefined();
+
+      expect(() => store.createSessionAsCurrent({
+        localSessionId: "attachment_retry",
+        contextKey,
+        agentName: "codex",
+        cwd: directory,
+        status: "ready",
+        runtimeKind: "codex",
+        remoteSessionId: "remote_attachment",
+      }, {
+        eventType: "session_attached_to_group",
+        payload: { remoteSessionId: "remote_attachment" },
+      })).not.toThrow();
+      expect(store.getUserContext(contextKey)?.currentSessionId).toBe("attachment_retry");
+    },
+  );
+
   test("archives a task and clears every current or previous context reference", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);
@@ -431,6 +495,29 @@ describe("StateStore runtime metadata", () => {
     expect(store.findSessionByRemoteSessionId("thr_1", "chat_id:other")).toBeUndefined();
   });
 
+  test("finds an archived Session by its Agent and remote identity when explicitly requested", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    store.createSession({
+      localSessionId: "archived_task",
+      contextKey: "chat_id:archived",
+      agentName: "codex",
+      cwd: process.cwd(),
+      status: "ready",
+      runtimeKind: "codex",
+      remoteSessionId: "archived_remote",
+    });
+    store.archiveSession("archived_task");
+
+    expect(store.findSessionByRemoteSessionId("archived_remote")).toBeUndefined();
+    expect(store.findSessionByRemoteSessionIdIncludingClosed("archived_remote", "codex"))
+      .toMatchObject({ localSessionId: "archived_task", status: "closed" });
+    expect(store.findSessionByRemoteSessionIdIncludingClosed("archived_remote", "traex"))
+      .toBeUndefined();
+  });
+
   test("allows different Agents to persist the same remote task id without merging", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);
@@ -456,6 +543,36 @@ describe("StateStore runtime metadata", () => {
       .toBe("traex_task");
     expect(store.listAllSessions().filter((session) => session.remoteSessionId === "shared_remote"))
       .toHaveLength(2);
+  });
+
+  test("atomically creates a task with its remote Session identity", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+
+    store.createSession({
+      localSessionId: "attached",
+      contextKey: "chat_id:first",
+      agentName: "codex",
+      cwd: process.cwd(),
+      status: "ready",
+      runtimeKind: "codex",
+      remoteSessionId: "shared_remote",
+      title: "Attached task",
+    });
+
+    expect(() => store.createSession({
+      localSessionId: "duplicate",
+      contextKey: "chat_id:second",
+      agentName: "codex",
+      cwd: process.cwd(),
+      status: "ready",
+      runtimeKind: "codex",
+      remoteSessionId: "shared_remote",
+    })).toThrow();
+    expect(store.getSession("duplicate")).toBeUndefined();
+    expect(store.getSessionForContext("duplicate", "chat_id:second")).toBeUndefined();
   });
 
   test("migrates duplicate remote tasks into one canonical task with multiple context links", () => {

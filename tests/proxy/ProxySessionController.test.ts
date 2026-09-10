@@ -5271,6 +5271,151 @@ describe("ProxySessionController", () => {
     );
   });
 
+  test("creates a group attached to an existing external Session without creating or forking a task", async () => {
+    const { controller, runtime, remoteSessions, outbound, presenter, store } = fixture();
+    remoteSessions.push({
+      id: "019f-existing",
+      title: "Existing Codex work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+      lastTurnId: "turn_existing",
+      lastTurnStatus: "completed",
+    });
+
+    await controller.onMessage({
+      messageId: "attach-existing-group",
+      contextKey: "chat_id:c1",
+      chatId: "c1",
+      chatType: "p2p",
+      userId: "ou_current_user",
+      text: "/newgroup Review room --session codex://threads/019f-existing",
+    });
+
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    expect(outbound.createGroup).toHaveBeenCalledWith({
+      name: expect.stringContaining("Review room"),
+      userOpenId: "ou_current_user",
+      avatarPng: expect.any(Uint8Array),
+    });
+    const taskId = store.getUserContext("chat_id:oc_new_group")?.currentSessionId;
+    expect(taskId).toBeDefined();
+    expect(store.getSession(taskId!)).toMatchObject({
+      contextKey: "chat_id:oc_new_group",
+      remoteSessionId: "019f-existing",
+      title: "Existing Codex work",
+      lastTurnId: "turn_existing",
+      lastTurnStatus: "completed",
+    });
+    expect(presenter.registerSession).toHaveBeenCalledWith(
+      taskId,
+      "chat_id:oc_new_group",
+      "Existing Codex work",
+      process.cwd(),
+      "Codex",
+    );
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group",
+      expect.stringContaining("不会创建或 Fork 新任务"),
+    );
+  });
+
+  test("rejects newgroup session mode before creating a group when the external Session is active", async () => {
+    const { controller, runtime, remoteSessions, outbound } = fixture();
+    remoteSessions.push({
+      id: "019f-active",
+      title: "Active Codex work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "active",
+      lastTurnId: "turn_active",
+      lastTurnStatus: "inProgress",
+    });
+
+    await controller.onMessage({
+      messageId: "attach-active-group",
+      contextKey: "chat_id:c1",
+      chatId: "c1",
+      chatType: "p2p",
+      userId: "ou_current_user",
+      text: "/newgroup --session 019f-active",
+    });
+
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:c1",
+      expect.stringContaining("正在外部 Agent 中执行"),
+    );
+  });
+
+  test("rejects an already-bound Session without creating another group", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("/new Existing local task"));
+    const taskId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+
+    await controller.onMessage({
+      messageId: "attach-bound-group",
+      contextKey: "chat_id:c1",
+      chatId: "c1",
+      chatType: "p2p",
+      userId: "ou_current_user",
+      text: "/newgroup --session thr_1",
+    });
+
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:c1",
+      expect.stringContaining("不能重复创建群"),
+    );
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe(taskId);
+    expect(store.getSession(taskId)?.contextKey).toBe("chat_id:c1");
+  });
+
+  test("rejects a previously archived Session before creating another group", async () => {
+    const { controller, remoteSessions, outbound, store } = fixture();
+    const remoteSessionId = "019f-archived-existing";
+    remoteSessions.push({
+      id: remoteSessionId,
+      title: "Archived Codex work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+      lastTurnStatus: "completed",
+    });
+    store.createSession({
+      localSessionId: "archived_existing",
+      contextKey: "chat_id:old_group",
+      agentName: "codex",
+      cwd: process.cwd(),
+      status: "ready",
+      runtimeKind: "codex",
+      remoteSessionId,
+    });
+    store.archiveSession("archived_existing");
+
+    await controller.onMessage({
+      messageId: "attach-archived-group",
+      contextKey: "chat_id:c1",
+      chatId: "c1",
+      chatType: "p2p",
+      userId: "ou_current_user",
+      text: `/newgroup --session ${remoteSessionId}`,
+    });
+
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:c1",
+      expect.stringContaining("已在 Agent Bot 中归档"),
+    );
+    expect(store.listAllSessions().filter((task) => task.remoteSessionId === remoteSessionId))
+      .toEqual([expect.objectContaining({ localSessionId: "archived_existing", status: "closed" })]);
+  });
+
   test("opens the unified Agent tab without a current task and switches the default in place", async () => {
     const { controller, outbound, store } = fixture();
 
@@ -8511,6 +8656,1029 @@ describe("ProxySessionController", () => {
     expect(runtime.createSession).toHaveBeenCalledTimes(2);
   });
 
+  test("creates a CLI newgroup for an existing Session without creating or forking one", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-cli-existing",
+      title: "Existing CLI work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+      lastTurnId: "turn_cli_existing",
+      lastTurnStatus: "completed",
+    });
+
+    const created = await controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "CLI existing room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "codex://threads/019f-cli-existing" },
+    );
+
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    expect(created).toMatchObject({
+      sourceLocalSessionId: sourceSessionId,
+      group: { contextKey: "chat_id:oc_new_group" },
+      task: {
+        contextKey: "chat_id:oc_new_group",
+        remoteSessionId: "019f-cli-existing",
+        title: "Existing CLI work",
+      },
+    });
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group",
+      expect.stringContaining("不会创建或 Fork 新任务"),
+    );
+  });
+
+  test("uses --agent to disambiguate identical existing Session IDs", async () => {
+    const traexRemote: RemoteSessionSummary = {
+      id: "019f-shared-existing",
+      title: "TraeX existing work",
+      cwd: "D:\\work\\traex",
+      source: "traex",
+      status: "idle",
+    };
+    const traexRead = vi.fn(async (_sessionId: string) => traexRemote);
+    const traexRuntime = {
+      kind: "codex",
+      readRemoteSession: traexRead,
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, runtime, remoteSessions, store } = fixture({ traex: traexRuntime });
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-shared-existing",
+      title: "Codex existing work",
+      cwd: "D:\\work\\codex",
+      source: "codex",
+      status: "idle",
+    });
+
+    const created = await controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "TraeX room",
+      "ou_cli_user",
+      undefined,
+      false,
+      "traex",
+      { sessionId: "019f-shared-existing" },
+    );
+
+    expect(created.task).toMatchObject({
+      agentName: "traex",
+      remoteSessionId: "019f-shared-existing",
+      title: "TraeX existing work",
+    });
+    expect(traexRead).toHaveBeenCalled();
+    expect(traexRead.mock.calls.every(([id]) => id === "019f-shared-existing")).toBe(true);
+    expect(vi.mocked(runtime.readRemoteSession!).mock.calls.some(([id]) => id === "019f-shared-existing"))
+      .toBe(false);
+  });
+
+  test("explains how to disambiguate identical existing Session IDs", async () => {
+    const sharedRemote: RemoteSessionSummary = {
+      id: "019f-ambiguous-existing",
+      title: "Ambiguous existing work",
+      cwd: process.cwd(),
+      source: "appServer",
+      status: "idle",
+    };
+    const secondRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => sharedRemote),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, remoteSessions, outbound } = fixture({ traex: secondRuntime });
+    remoteSessions.push(sharedRemote);
+
+    await controller.onMessage({
+      ...message("/newgroup --session 019f-ambiguous-existing"),
+      userId: "ou_current_user",
+    });
+
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:c1",
+      expect.stringContaining("--agent <标准名>"),
+    );
+  });
+
+  test("rechecks bare Session ID uniqueness before creating the group", async () => {
+    const sharedRemote: RemoteSessionSummary = {
+      id: "019f-late-ambiguous-existing",
+      title: "Late ambiguous existing work",
+      cwd: process.cwd(),
+      source: "appServer",
+      status: "idle",
+    };
+    let secondAgentLookupCount = 0;
+    const secondRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => {
+        secondAgentLookupCount += 1;
+        if (secondAgentLookupCount === 1) throw new Error(`Unknown remote session: ${sharedRemote.id}`);
+        return sharedRemote;
+      }),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, remoteSessions, outbound, store } = fixture({ traex: secondRuntime });
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push(sharedRemote);
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      undefined,
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: sharedRemote.id },
+    )).rejects.toThrow("多个 Agent 中存在相同任务 ID");
+    expect(secondRuntime.readRemoteSession).toHaveBeenCalledTimes(2);
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+  });
+
+  test("fails closed when a bare Session ID cannot be checked against every Agent", async () => {
+    const secondRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => {
+        throw new Error("App Server request timed out: thread/read");
+      }),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, remoteSessions, outbound, store } = fixture({ traex: secondRuntime });
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-partially-resolved",
+      title: "Only confirmed on Codex",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      undefined,
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "019f-partially-resolved" },
+    )).rejects.toThrow("无法确认任务 ID 019f-partially-resolved 在所有 Agent 中是否唯一");
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+
+    const created = await controller.controlCreateTaskGroup(
+      sourceSessionId,
+      undefined,
+      "ou_cli_user",
+      undefined,
+      false,
+      "codex",
+      { sessionId: "019f-partially-resolved" },
+    );
+    expect(created.task).toMatchObject({
+      agentName: "codex",
+      remoteSessionId: "019f-partially-resolved",
+    });
+  });
+
+  test.each([
+    "thread/read failed: Method not found",
+    "thread/read failed: thread/read endpoint not found",
+    "thread/read failed: project not found",
+    "thread/read failed: thread storage not found",
+  ])("does not mistake an unavailable thread/read API for a missing Session: %s", async (lookupError) => {
+    const secondRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => {
+        throw new Error(lookupError);
+      }),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, remoteSessions, outbound, store } = fixture({ traex: secondRuntime });
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-method-unavailable",
+      title: "Only confirmed on Codex",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      undefined,
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "019f-method-unavailable" },
+    )).rejects.toThrow("无法确认任务 ID 019f-method-unavailable 在所有 Agent 中是否唯一");
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+  });
+
+  test("still requires Agent disambiguation when one matching Session ID is already bound", async () => {
+    const sharedRemote: RemoteSessionSummary = {
+      id: "019f-partly-bound-existing",
+      title: "Shared existing work",
+      cwd: process.cwd(),
+      source: "appServer",
+      status: "idle",
+    };
+    const secondRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => sharedRemote),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, remoteSessions, outbound, store } = fixture({ traex: secondRuntime });
+    remoteSessions.push(sharedRemote);
+    store.createSession({
+      localSessionId: "bound_codex_copy",
+      contextKey: "chat_id:bound",
+      agentName: "codex",
+      cwd: process.cwd(),
+      status: "ready",
+      runtimeKind: "codex",
+      remoteSessionId: sharedRemote.id,
+    });
+
+    await controller.onMessage({
+      ...message(`/newgroup --session ${sharedRemote.id}`),
+      userId: "ou_current_user",
+    });
+
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:c1",
+      expect.stringContaining("--agent <标准名>"),
+    );
+  });
+
+  test("rejects --agent when it conflicts with a scoped Session reference", async () => {
+    const { controller, store, outbound } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      undefined,
+      "ou_cli_user",
+      undefined,
+      false,
+      "codex",
+      { sessionId: "agent-runtime:traex:019f-conflict" },
+    )).rejects.toThrow("与 --session 中的 Agent traex 不一致");
+
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+  });
+
+  test("keeps a committed existing-Session group when acknowledgement delivery fails", async () => {
+    const { controller, runtime, remoteSessions, outbound, store, logger } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-cli-existing-notification-failure",
+      title: "Existing CLI work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+    (outbound.sendText as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("Feishu unavailable"));
+
+    const created = await controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "CLI existing room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "019f-cli-existing-notification-failure" },
+    );
+
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(created.task.remoteSessionId).toBe("019f-cli-existing-notification-failure");
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId)
+      .toBe(created.task.localSessionId);
+    expect(outbound.deleteGroup).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledTimes(2);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({ message: "Feishu unavailable" }),
+        localSessionId: created.task.localSessionId,
+        remoteSessionId: "019f-cli-existing-notification-failure",
+      }),
+      "Failed to send a group attachment notification after the task was committed.",
+    );
+  });
+
+  test("rolls back a group attachment when presenter registration fails so it can be retried", async () => {
+    const { controller, remoteSessions, outbound, outboundRouter, presenter, store, logger } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    const remoteSessionId = "019f-register-failure";
+    remoteSessions.push({
+      id: remoteSessionId,
+      title: "Retry presenter registration",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+    vi.mocked(presenter.registerSession).mockImplementationOnce(() => {
+      throw new Error("presenter unavailable");
+    });
+    vi.mocked(presenter.unregisterSession).mockImplementationOnce(() => {
+      throw new Error("presenter cleanup unavailable");
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Failed room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    )).rejects.toThrow("presenter unavailable");
+
+    expect(store.listAllSessions().some((task) => task.remoteSessionId === remoteSessionId)).toBe(false);
+    expect(store.getChatContext("chat_id:oc_new_group")).toBeUndefined();
+    expect(outbound.deleteGroup).toHaveBeenCalledWith("oc_new_group");
+    expect(presenter.unregisterSession).toHaveBeenCalledOnce();
+    const failedLocalSessionId = vi.mocked(presenter.registerSession).mock.calls.at(-1)?.[0];
+    expect(failedLocalSessionId).toBeDefined();
+    expect(outboundRouter.getSessionContextKey(failedLocalSessionId!)).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({ message: "presenter cleanup unavailable" }),
+        localSessionId: failedLocalSessionId,
+      }),
+      "Failed to unregister a rolled-back group attachment.",
+    );
+
+    const retried = await controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Retry room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    );
+    expect(retried.task.remoteSessionId).toBe(remoteSessionId);
+  });
+
+  test.each(["setCurrentSession", "audit"] as const)(
+    "rolls back a group attachment when %s fails so it can be retried",
+    async (failurePoint) => {
+      const { controller, remoteSessions, outbound, outboundRouter, presenter, store } = fixture();
+      await controller.onMessage(groupMessage("origin", "start CLI source task"));
+      const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+      const remoteSessionId = `019f-${failurePoint}-failure`;
+      remoteSessions.push({
+        id: remoteSessionId,
+        title: `Retry ${failurePoint}`,
+        cwd: process.cwd(),
+        source: "codex",
+        status: "idle",
+      });
+      vi.spyOn(store, failurePoint).mockImplementationOnce(() => {
+        throw new Error(`${failurePoint} failed`);
+      });
+
+      await expect(controller.controlCreateTaskGroup(
+        sourceSessionId,
+        "Failed room",
+        "ou_cli_user",
+        undefined,
+        false,
+        undefined,
+        { sessionId: remoteSessionId },
+      )).rejects.toThrow(`${failurePoint} failed`);
+
+      expect(store.listAllSessions().some((task) => task.remoteSessionId === remoteSessionId)).toBe(false);
+      expect(store.getChatContext("chat_id:oc_new_group")).toBeUndefined();
+      expect(outbound.deleteGroup).toHaveBeenCalledWith("oc_new_group");
+      const failedLocalSessionId = vi.mocked(presenter.registerSession).mock.calls.at(-1)?.[0];
+      expect(failedLocalSessionId).toBeDefined();
+      expect(presenter.unregisterSession).toHaveBeenCalledWith(failedLocalSessionId);
+      expect(outboundRouter.getSessionContextKey(failedLocalSessionId!)).toBeUndefined();
+
+      const retried = await controller.controlCreateTaskGroup(
+        sourceSessionId,
+        "Retry room",
+        "ou_cli_user",
+        undefined,
+        false,
+        undefined,
+        { sessionId: remoteSessionId },
+      );
+      expect(retried.task.remoteSessionId).toBe(remoteSessionId);
+      expect(outboundRouter.getSessionContextKey(retried.task.localSessionId))
+        .toBe("chat_id:oc_new_group");
+    },
+  );
+
+  test("serializes concurrent group attachments for the same existing Session", async () => {
+    const { controller, remoteSessions, outbound, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-concurrent-attach",
+      title: "Concurrent existing work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+
+    const results = await Promise.allSettled([
+      controller.controlCreateTaskGroup(
+        sourceSessionId,
+        "First room",
+        "ou_cli_user",
+        undefined,
+        false,
+        undefined,
+        { sessionId: "019f-concurrent-attach" },
+      ),
+      controller.controlCreateTaskGroup(
+        sourceSessionId,
+        "Second room",
+        "ou_cli_user",
+        undefined,
+        false,
+        undefined,
+        { sessionId: "019f-concurrent-attach" },
+      ),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejection = results.find((result) => result.status === "rejected") as PromiseRejectedResult;
+    expect(String(rejection.reason)).toContain("不能重复创建群");
+    expect(outbound.createGroup).toHaveBeenCalledTimes(1);
+    expect(store.listAllSessions().filter((task) => task.remoteSessionId === "019f-concurrent-attach"))
+      .toHaveLength(1);
+  });
+
+  test("lets the database select a winner when another process commits the same Session", async () => {
+    const { controller, remoteSessions, outbound, presenter, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    const remoteSessionId = "019f-cross-process-attach";
+    remoteSessions.push({
+      id: remoteSessionId,
+      title: "Cross-process existing work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+    vi.mocked(presenter.registerSession).mockImplementationOnce(() => {
+      store.getOrCreateUserContext("chat_id:competing_group", "codex");
+      store.createSessionAsCurrent({
+        localSessionId: "competing_session",
+        contextKey: "chat_id:competing_group",
+        agentName: "codex",
+        cwd: process.cwd(),
+        status: "ready",
+        runtimeKind: "codex",
+        remoteSessionId,
+      }, {
+        eventType: "session_attached_to_group",
+        payload: { remoteSessionId },
+      });
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Winning room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    )).rejects.toThrow();
+
+    expect(store.getSession("competing_session")?.remoteSessionId).toBe(remoteSessionId);
+    expect(store.getUserContext("chat_id:competing_group")?.currentSessionId)
+      .toBe("competing_session");
+    expect(store.getChatContext("chat_id:oc_new_group")).toBeUndefined();
+    expect(outbound.deleteGroup).toHaveBeenCalledWith("oc_new_group");
+  });
+
+  test("rolls back the new group when the external Session becomes active before persistence", async () => {
+    const { controller, remoteSessions, outbound, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    const remote: RemoteSessionSummary = {
+      id: "019f-active-during-group-create",
+      title: "External work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    };
+    remoteSessions.push(remote);
+    (outbound.createGroup as ReturnType<typeof vi.fn>).mockImplementationOnce(async (input) => {
+      remote.status = "active";
+      remote.lastTurnStatus = "inProgress";
+      return { chatId: "oc_active_race", name: input.name };
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Race room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remote.id },
+    )).rejects.toThrow("正在外部 Agent 中执行");
+
+    expect(outbound.deleteGroup).toHaveBeenCalledWith("oc_active_race");
+    expect(store.listAllSessions().some((task) => task.remoteSessionId === remote.id)).toBe(false);
+    expect(store.getChatContext("chat_id:oc_active_race")).toBeUndefined();
+  });
+
+  test("does not switch Agents if a bare Session ID moves during final verification", async () => {
+    const remoteSessionId = "019f-agent-drift-during-attachment";
+    const codexRemote: RemoteSessionSummary = {
+      id: remoteSessionId,
+      title: "Codex work",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    };
+    const traexRemote: RemoteSessionSummary = {
+      ...codexRemote,
+      title: "TraeX work",
+      source: "appServer",
+    };
+    let traexReads = 0;
+    const secondRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => {
+        traexReads += 1;
+        if (traexReads <= 2) throw new Error(`Unknown remote session: ${remoteSessionId}`);
+        return traexRemote;
+      }),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, runtime, outbound, store } = fixture({ traex: secondRuntime });
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    let codexReads = 0;
+    vi.mocked(runtime.readRemoteSession!).mockImplementation(async (id: string) => {
+      if (id !== remoteSessionId) throw new Error(`Unknown remote session: ${id}`);
+      codexReads += 1;
+      if (codexReads <= 2) return codexRemote;
+      throw new Error(`Unknown remote session: ${id}`);
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Stable Agent room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    )).rejects.toThrow("远端 Session 身份在建群期间发生变化");
+
+    expect(secondRuntime.readRemoteSession).toHaveBeenCalledTimes(3);
+    expect(outbound.deleteGroup).toHaveBeenCalledWith("oc_new_group");
+    expect(store.listAllSessions().some((task) => task.remoteSessionId === remoteSessionId)).toBe(false);
+  });
+
+  test("rolls back if another Agent gains the same bare Session ID after group creation", async () => {
+    const remoteSessionId = "019f-late-agent-conflict";
+    const remote: RemoteSessionSummary = {
+      id: remoteSessionId,
+      title: "Late conflict",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    };
+    let secondAgentReads = 0;
+    const secondRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => {
+        secondAgentReads += 1;
+        if (secondAgentReads <= 2) throw new Error(`Unknown remote session: ${remoteSessionId}`);
+        return { ...remote, source: "appServer" };
+      }),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, remoteSessions, outbound, store } = fixture({ traex: secondRuntime });
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push(remote);
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Late conflict room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    )).rejects.toThrow("多个 Agent 中存在相同任务 ID");
+
+    expect(secondRuntime.readRemoteSession).toHaveBeenCalledTimes(3);
+    expect(outbound.deleteGroup).toHaveBeenCalledWith("oc_new_group");
+    expect(store.listAllSessions().some((task) => task.remoteSessionId === remoteSessionId)).toBe(false);
+  });
+
+  test("uses refreshed Session metadata when committing an existing-Session group", async () => {
+    const { controller, runtime, remoteSessions, outbound, presenter, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    const remoteSessionId = "019f-refreshed-attachment-metadata";
+    const initialCwd = path.join(process.cwd(), "initial-project");
+    const refreshedCwd = path.join(process.cwd(), "refreshed-project");
+    const initial: RemoteSessionSummary = {
+      id: remoteSessionId,
+      title: "Initial metadata",
+      cwd: initialCwd,
+      source: "codex",
+      status: "idle",
+    };
+    const refreshed: RemoteSessionSummary = {
+      ...initial,
+      title: "Refreshed metadata",
+      cwd: refreshedCwd,
+    };
+    remoteSessions.push(initial);
+    let reads = 0;
+    vi.mocked(runtime.readRemoteSession!).mockImplementation(async (id: string) => {
+      if (id !== remoteSessionId) throw new Error(`Unknown remote session: ${id}`);
+      reads += 1;
+      return reads < 3 ? initial : refreshed;
+    });
+
+    const created = await controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Metadata room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    );
+
+    expect(created.task).toMatchObject({
+      remoteSessionId,
+      title: "Refreshed metadata",
+      cwd: refreshedCwd,
+    });
+    expect(store.getUserContext("chat_id:oc_new_group")?.boundProjectCwd).toBe(refreshedCwd);
+    expect(presenter.registerSession).toHaveBeenCalledWith(
+      created.task.localSessionId,
+      "chat_id:oc_new_group",
+      "Refreshed metadata",
+      refreshedCwd,
+      "Codex",
+    );
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group",
+      expect.stringContaining(`当前 Project 目录：${refreshedCwd}`),
+    );
+  });
+
+  test("blocks messages that arrive while an existing Session group is still being attached", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    const remoteSessionId = "019f-pending-group-attachment";
+    const remote: RemoteSessionSummary = {
+      id: remoteSessionId,
+      title: "Pending group attachment",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    };
+    remoteSessions.push(remote);
+    let releaseFinalVerification!: () => void;
+    let markFinalVerificationStarted!: () => void;
+    const finalVerificationStarted = new Promise<void>((resolve) => { markFinalVerificationStarted = resolve; });
+    let readCount = 0;
+    vi.mocked(runtime.readRemoteSession!).mockImplementation(async (id: string) => {
+      readCount += 1;
+      if (readCount === 3) {
+        markFinalVerificationStarted();
+        await new Promise<void>((resolve) => { releaseFinalVerification = resolve; });
+      }
+      if (id !== remoteSessionId) throw new Error(`Unknown remote session: ${id}`);
+      return remote;
+    });
+
+    const attachment = controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Pending room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    );
+    await finalVerificationStarted;
+
+    vi.mocked(outbound.sendText).mockClear();
+    await controller.onMessage(groupMessage("oc_new_group", "do not create a task while attaching"));
+
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBeUndefined();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group",
+      expect.stringContaining("正在关联已有 Session"),
+    );
+
+    vi.mocked(outbound.sendText).mockClear();
+    await Promise.all([
+      controller.onMessage({
+        ...groupMessage("oc_new_group", ""),
+        messageId: "om_pending_image",
+        images: [{ imageKey: "img_pending" }],
+      }),
+      controller.onMessage({
+        ...groupMessage("oc_new_group", "analyze the image while attaching"),
+        messageId: "om_pending_instruction",
+        parentMessageId: "om_pending_image",
+      }),
+    ]);
+
+    expect(outbound.downloadImage).not.toHaveBeenCalledWith("om_pending_image", "img_pending");
+    expect(outbound.sendText).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(outbound.sendText).mock.calls.every(([, text]) =>
+      String(text).includes("正在关联已有 Session"))).toBe(true);
+
+    releaseFinalVerification();
+    const created = await attachment;
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId)
+      .toBe(created.task.localSessionId);
+  });
+
+  test("blocks a new group message that arrives before createGroup returns its chat ID", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    const remoteSessionId = "019f-message-before-group-response";
+    const remote: RemoteSessionSummary = {
+      id: remoteSessionId,
+      title: "Message before group response",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    };
+    remoteSessions.push(remote);
+    let releaseGroupCreation!: () => void;
+    const groupCreationBlocked = new Promise<void>((resolve) => { releaseGroupCreation = resolve; });
+    vi.mocked(outbound.createGroup!).mockImplementationOnce(async (input) => {
+      await groupCreationBlocked;
+      return { chatId: "oc_new_group", name: input.name };
+    });
+    let releaseFinalVerification!: () => void;
+    let markFinalVerificationStarted!: () => void;
+    const finalVerificationStarted = new Promise<void>((resolve) => { markFinalVerificationStarted = resolve; });
+    let reads = 0;
+    vi.mocked(runtime.readRemoteSession!).mockImplementation(async (id: string) => {
+      if (id !== remoteSessionId) throw new Error(`Unknown remote session: ${id}`);
+      reads += 1;
+      if (reads === 3) {
+        markFinalVerificationStarted();
+        await new Promise<void>((resolve) => { releaseFinalVerification = resolve; });
+      }
+      return remote;
+    });
+
+    const attachment = controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Early message room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: remoteSessionId },
+    );
+    await vi.waitFor(() => expect(outbound.createGroup).toHaveBeenCalledOnce());
+
+    let messageSettled = false;
+    const incoming = controller.onMessage(groupMessage("oc_new_group", "do not create an early task"))
+      .then(() => { messageSettled = true; });
+    await Promise.resolve();
+    expect(messageSettled).toBe(false);
+
+    releaseGroupCreation();
+    await finalVerificationStarted;
+    await incoming;
+
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBeUndefined();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group",
+      expect.stringContaining("正在关联已有 Session"),
+    );
+
+    releaseFinalVerification();
+    await attachment;
+  });
+
+  test("attempts a failed rollback deletion only once and blocks the retained group", async () => {
+    const { controller, runtime, remoteSessions, outbound, presenter, store, logger } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-pending-group-delete",
+      title: "Pending group cleanup",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+    vi.mocked(presenter.registerSession).mockImplementationOnce(() => {
+      throw new Error("presenter unavailable");
+    });
+    vi.mocked(outbound.deleteGroup!).mockRejectedValueOnce(new Error("Feishu unavailable"));
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Cleanup room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "019f-pending-group-delete" },
+    )).rejects.toThrow("presenter unavailable");
+
+    expect(store.getUserContext("chat_id:oc_new_group")).toBeDefined();
+    expect(store.hasAuditEvent("chat_id:oc_new_group", "group_attachment_rollback_failed")).toBe(true);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({ message: "Feishu unavailable" }),
+        chatId: "oc_new_group",
+        contextKey: "chat_id:oc_new_group",
+      }),
+      "Failed to remove a rolled-back Lark group.",
+    );
+
+    await controller.recoverInterruptedTasks();
+
+    expect(outbound.deleteGroup).toHaveBeenCalledTimes(1);
+
+    vi.mocked(outbound.sendText).mockClear();
+    await controller.onMessage(groupMessage("oc_new_group", "do not create a replacement task"));
+
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBeUndefined();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group",
+      expect.stringContaining("为避免误建新任务，本群已停止处理消息"),
+    );
+  });
+
+  test("blocks delayed messages after a failed attachment group was dissolved", async () => {
+    const { controller, runtime, remoteSessions, outbound, presenter, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-dissolved-group-message",
+      title: "Dissolved group message",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+    vi.mocked(presenter.registerSession).mockImplementationOnce(() => {
+      throw new Error("presenter unavailable");
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Dissolved room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "019f-dissolved-group-message" },
+    )).rejects.toThrow("presenter unavailable");
+
+    expect(outbound.deleteGroup).toHaveBeenCalledTimes(1);
+    expect(store.getChatContext("chat_id:oc_new_group")).toBeUndefined();
+
+    vi.mocked(outbound.sendText).mockClear();
+    await controller.onMessage(groupMessage("oc_new_group", "delayed message from dissolved group"));
+
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(store.getChatContext("chat_id:oc_new_group")).toBeUndefined();
+    expect(store.getUserContext("chat_id:oc_new_group")).toBeUndefined();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group",
+      expect.stringContaining("失败并已自动解散"),
+    );
+  });
+
+  test("blocks a retained group when local initialization and rollback deletion both fail", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-initialization-rollback-failure",
+      title: "Initialization rollback failure",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+    vi.spyOn(store, "recordChatContext").mockImplementationOnce(() => {
+      throw new Error("SQLite unavailable");
+    });
+    vi.mocked(outbound.deleteGroup!).mockRejectedValueOnce(new Error("Feishu unavailable"));
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Initialization failure room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "019f-initialization-rollback-failure" },
+    )).rejects.toThrow("SQLite unavailable");
+
+    expect(outbound.deleteGroup).toHaveBeenCalledTimes(1);
+    expect(store.hasAuditEvent("chat_id:oc_new_group", "group_attachment_rollback_failed")).toBe(true);
+
+    vi.mocked(outbound.sendText).mockClear();
+    await controller.onMessage(threadMessage(
+      "oc_new_group",
+      "group",
+      "omt_failed_attachment",
+      "om_failed_attachment_root",
+      "do not create a replacement task in a topic",
+    ));
+
+    expect(runtime.createSession).toHaveBeenCalledTimes(1);
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBeUndefined();
+    expect(store.getUserContext("chat_id:oc_new_group:thread_id:omt_failed_attachment")).toBeUndefined();
+    expect(outbound.sendText).toHaveBeenCalledWith(
+      "chat_id:oc_new_group:thread_id:omt_failed_attachment",
+      expect.stringContaining("为避免误建新任务，本群已停止处理消息"),
+    );
+  });
+
+  test("logs a local cleanup failure after the rolled-back group is dissolved", async () => {
+    const { controller, remoteSessions, outbound, presenter, store, logger } = fixture();
+    await controller.onMessage(groupMessage("origin", "start CLI source task"));
+    const sourceSessionId = store.getUserContext("chat_id:origin")!.currentSessionId!;
+    remoteSessions.push({
+      id: "019f-local-cleanup-failure",
+      title: "Local cleanup failure",
+      cwd: process.cwd(),
+      source: "codex",
+      status: "idle",
+    });
+    vi.mocked(presenter.registerSession).mockImplementationOnce(() => {
+      throw new Error("presenter unavailable");
+    });
+    vi.spyOn(store, "removeChatContext").mockImplementationOnce(() => {
+      throw new Error("SQLite unavailable");
+    });
+
+    await expect(controller.controlCreateTaskGroup(
+      sourceSessionId,
+      "Cleanup room",
+      "ou_cli_user",
+      undefined,
+      false,
+      undefined,
+      { sessionId: "019f-local-cleanup-failure" },
+    )).rejects.toThrow("presenter unavailable");
+
+    expect(outbound.deleteGroup).toHaveBeenCalledTimes(1);
+    expect(store.getChatContext("chat_id:oc_new_group")).toBeDefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({ message: "SQLite unavailable" }),
+        chatId: "oc_new_group",
+        contextKey: "chat_id:oc_new_group",
+      }),
+      "Failed to remove local state for a rolled-back Lark group.",
+    );
+  });
+
   test("lets CLI newgroup override the project directory and expand home shorthand", async () => {
     const { controller, runtime, outbound, store } = fixture();
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-cli-newgroup-home-"));
@@ -9715,6 +10883,7 @@ describe("ProxySessionController", () => {
     expect(serialized).not.toContain("/reset");
     expect(serialized).toContain("Reset 对话上下文");
     expect(serialized).not.toContain("/attach");
+    expect(serialized).not.toContain("/attachgroup");
     expect(serialized).not.toContain("/detach");
     expect(serialized).not.toContain("/cancel");
     expect(serialized).not.toContain("/close");

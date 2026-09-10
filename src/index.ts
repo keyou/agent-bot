@@ -2,7 +2,12 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { LocalControlServer } from "./cli/LocalControlServer.js";
-import { controlEndpoint, type ControlRequest, type ControlResponse } from "./cli/controlProtocol.js";
+import {
+  assertCompatibleTaskNewGroupRequest,
+  controlEndpoint,
+  type ControlRequest,
+  type ControlResponse,
+} from "./cli/controlProtocol.js";
 import { readPackageVersion } from "./cli/packageVersion.js";
 import { loadConfig } from "./config/loadConfig.js";
 import { persistFeishuUserOpenIdIfMissing } from "./config/FeishuUserOpenIdStore.js";
@@ -497,7 +502,8 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
       };
     case "task_send_file":
       return { ok: true, data: { messageId: await controller.controlSendTaskFile(request.localSessionId, request.filePath) } };
-    case "task_new_group":
+    case "task_new_group": {
+      assertCompatibleTaskNewGroupRequest(request);
       return {
         ok: true,
         data: await controller.controlCreateTaskGroup(
@@ -509,6 +515,21 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
           request.agentName,
         ),
       };
+    }
+    case "task_new_group_session": {
+      return {
+        ok: true,
+        data: await controller.controlCreateTaskGroup(
+          request.localSessionId,
+          request.title,
+          config.feishu.userOpenId,
+          undefined,
+          false,
+          request.agentName,
+          { sessionId: request.sessionId },
+        ),
+      };
+    }
     case "task_fork_group":
       return {
         ok: true,

@@ -91,10 +91,11 @@ Create a separate Feishu group:
 
 ```powershell
 agentbot task newgroup [title] [--agent <name>] [--dir <cwd> | --nodir]
+agentbot task newgroup [title] --session <session-id> [--agent <name>]
 agentbot task forkgroup [title]
 ```
 
-Choose `new` or `newgroup` for fresh context. Choose `fork` or `forkgroup` when the new task must retain conversation history through the latest completed Turn. Forking must not interrupt an active source turn.
+Choose `new` or `newgroup` for fresh context. Use `newgroup --session` to create a group for an unbound existing App Server Session without creating or forking a task; add `--agent <name>` when the same Session ID exists in more than one App Server Agent. Active Sessions and Sessions already bound to a Feishu conversation cannot be attached. Choose `fork` or `forkgroup` when the new task must retain conversation history through the latest completed Turn; forking must not interrupt an active source turn.
 
 Fork creation stores source-task and branch-Turn references without synchronizing the full local Turn list. The Feishu Turn card reuses local records and loads only the summary pages needed for the requested page, not the entire history. `task turns` loads the first page if necessary and returns available local records. This does not change the Agent's inherited context. Retry listing Turns after a temporary history-read failure; unsupported summary pagination never falls back to downloading full history.
 
