@@ -572,11 +572,14 @@ describe("LocalFileViewerServer", () => {
     const directory = createTemporaryDirectory();
     const changedFile = "changed & reviewed.ts";
     fs.writeFileSync(path.join(directory, changedFile), "export const previewChange = 1;\n");
+    const imagePath = path.join(directory, "auth image.png");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+    fs.writeFileSync(imagePath, png);
     let snapshot: TurnViewState = {
       sessionId: "session_1",
       turnId: "turn_1",
       projectCwd: directory,
-      prompt: "检查 <preview> & SSE",
+      prompt: "检查 <preview> & SSE\n![Prompt](auth%20image.png)",
       status: "running",
       startedAt: Date.now() - 2_000,
       assistantText: "",
@@ -611,6 +614,12 @@ describe("LocalFileViewerServer", () => {
     const fileResponse = await fetch(fileUrl!);
     expect(fileResponse.status).toBe(200);
     expect(await fileResponse.text()).toContain("previewChange");
+    const imageUrl = /<img src="([^"]+)" alt="Prompt"/u.exec(page)?.[1]?.replaceAll("&amp;", "&");
+    expect(imageUrl).toBeDefined();
+    const imageResponse = await fetch(imageUrl!);
+    expect(imageResponse.status).toBe(200);
+    expect(imageResponse.headers.get("content-type")).toBe("image/png");
+    expect(Buffer.from(await imageResponse.arrayBuffer())).toEqual(png);
 
     const eventsUrl = /data-events-url="([^"]+)"/u.exec(page)?.[1]?.replaceAll("&amp;", "&");
     expect(eventsUrl).toBeDefined();
@@ -623,13 +632,14 @@ describe("LocalFileViewerServer", () => {
       const initial = JSON.parse(await events.next("update")) as { content: string; terminal: boolean };
       expect(initial.content).toContain("正在检查入口。");
       expect(initial.terminal).toBe(false);
+      expect(initial.content).toContain(`src="${imageUrl!.replaceAll("&", "&amp;")}"`);
 
       snapshot = {
         ...snapshot,
         status: "completed",
         completedAt: Date.now(),
         durationMs: 2_500,
-        finalResponse: "完成 **Preview**。",
+        finalResponse: `完成 **Preview**。\n![QR](<${imagePath.replaceAll("\\", "/")}>)`,
         activities: [
           ...snapshot.activities,
           {
@@ -657,6 +667,9 @@ describe("LocalFileViewerServer", () => {
       expect(update.content).not.toContain("/bin/zsh -lc");
       expect(update.content).toContain("耗时 00:01");
       expect(update.content).toContain("完成 <strong>Preview</strong>。");
+      const updatedImageUrl = /<img src="([^"]+)" alt="QR"/u.exec(update.content)?.[1]?.replaceAll("&amp;", "&");
+      expect(updatedImageUrl).toBe(imageUrl);
+      expect(Buffer.from(await (await fetch(updatedImageUrl!)).arrayBuffer())).toEqual(png);
       expect(update.terminal).toBe(true);
       expect(update.content.match(/class="file-link"/gu)).toHaveLength(2);
       expect(update.content).toContain(`href="${fileUrl!.replaceAll("&", "&amp;")}"`);

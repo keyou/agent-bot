@@ -8,8 +8,8 @@ export function isFileUrl(value: string): boolean {
 
 export function rewriteMarkdownFileLinks(
   tokens: Token[],
-  markdownPath: string,
-  createPreviewUrl: (filePath: string) => URL,
+  markdownPath: string | undefined,
+  createPreviewUrl: (filePath: string) => URL | undefined,
 ): void {
   for (const token of tokens) {
     const attribute = token.type === "link_open" ? "href" : token.type === "image" ? "src" : undefined;
@@ -18,9 +18,13 @@ export function rewriteMarkdownFileLinks(
       const local = resolveLocalTarget(target, markdownPath);
       if (local) {
         const url = createPreviewUrl(local.filePath);
-        url.hash = local.hash;
-        if (token.type === "image") url.searchParams.set("raw", "1");
-        token.attrSet(attribute, url.toString());
+        if (url) {
+          url.hash = local.hash;
+          if (token.type === "image") url.searchParams.set("raw", "1");
+          token.attrSet(attribute, url.toString());
+        } else {
+          token.attrs = token.attrs?.filter(([name]) => name !== attribute) ?? null;
+        }
       } else if (isFileUrl(target)) {
         // File URLs are accepted by the parser only to convert them to signed HTTP URLs.
         token.attrs = token.attrs?.filter(([name]) => name !== attribute) ?? null;
@@ -30,7 +34,7 @@ export function rewriteMarkdownFileLinks(
   }
 }
 
-function resolveLocalTarget(target: string, markdownPath: string): { filePath: string; hash: string } | undefined {
+function resolveLocalTarget(target: string, markdownPath: string | undefined): { filePath: string; hash: string } | undefined {
   if (/^(?:#|\?|\/\/)/u.test(target)) return undefined;
   const windows = process.platform === "win32";
   const normalized = windows ? target.replace(/%5c/giu, "/").replaceAll("\\", "/") : target;
@@ -44,11 +48,12 @@ function resolveLocalTarget(target: string, markdownPath: string): { filePath: s
     ? normalized.slice(0, reference.index) + normalized.slice(reference.index + reference[0].length)
     : normalized;
   if (drivePath && !windows) return undefined;
+  if (!markdownPath && !drivePath && !isFileUrl(normalized) && !path.isAbsolute(normalized)) return undefined;
 
   try {
     const url = drivePath
       ? new URL(`file:///${withoutReference.replace(/^\//u, "")}`)
-      : new URL(withoutReference, pathToFileURL(markdownPath));
+      : new URL(withoutReference, markdownPath ? pathToFileURL(markdownPath) : "file:///");
     if (url.protocol !== "file:") return undefined;
     const filePath = fileURLToPath(url);
     if (!path.isAbsolute(filePath) || /[\x00-\x1f\x7f]/u.test(filePath)) return undefined;

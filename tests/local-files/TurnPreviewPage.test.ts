@@ -1,4 +1,5 @@
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import type { ToolState } from "../../src/runtime/types.js";
@@ -18,6 +19,46 @@ function state(tool?: Partial<ToolState>): TurnViewState {
 }
 
 describe("Turn Preview", () => {
+  test.each(["prompt", "commentary", "user", "assistantText", "finalResponse"] as const)("serves local Markdown images in %s through signed raw URLs", (area) => {
+    const input = state();
+    input.projectCwd = path.resolve("preview project");
+    const imagePath = path.join(input.projectCwd, "auth #1.png");
+    const markdown = [
+      `![Absolute](<${imagePath.replaceAll("\\", "/").replaceAll("#", "%23")}>)`,
+      `![File URL](${pathToFileURL(imagePath).href})`,
+      "![Relative][qr]", "", "[qr]: auth%20%231.png", "",
+      "`![Literal](auth%20%231.png)`",
+    ].join("\n");
+    if (area === "commentary" || area === "user") {
+      input.activities = [{ kind: area === "commentary" ? "assistant" : "user", id: area, text: markdown }];
+    } else {
+      input[area] = markdown;
+    }
+    const resolveUrl = vi.fn(() => "https://viewer.example/preview/signed?path=auth.png");
+    const { content } = renderTurnPreviewSnapshot(input, resolveUrl);
+    expect(resolveUrl.mock.calls).toEqual([[imagePath], [imagePath], [imagePath]]);
+    expect(content.match(/src="https:\/\/viewer.example\/preview\/signed\?path=auth.png&amp;raw=1"/gu)).toHaveLength(3);
+    expect(content).toContain("<code>![Literal](auth%20%231.png)</code>");
+    expect(content).not.toContain('src="file:');
+  });
+
+  test("resolves absolute images without a project and does not guess a relative image's directory", () => {
+    const input = state();
+    const imagePath = path.resolve("auth.png");
+    input.finalResponse = `![Absolute](<${imagePath.replaceAll("\\", "/")}>)\n![Relative](auth.png)`;
+    const resolveUrl = vi.fn(() => "https://viewer.example/preview/signed");
+    const { content } = renderTurnPreviewSnapshot(input, resolveUrl);
+    expect(resolveUrl.mock.calls).toEqual([[imagePath]]);
+    expect(content).toContain('src="https://viewer.example/preview/signed?raw=1" alt="Absolute"');
+  });
+
+  test("never emits file URLs when a local image cannot be resolved", () => {
+    const input = state();
+    input.finalResponse = `![Missing](${pathToFileURL(path.resolve("missing.png")).href})`;
+    expect(renderTurnPreviewSnapshot(input).content).not.toContain('src="file:');
+    expect(renderTurnPreviewSnapshot(input, () => undefined).content).not.toContain('src="file:');
+  });
+
   test("links changed files from the project directory in both file lists", () => {
     const file = { path: "src/changed & reviewed.ts", additions: 3, deletions: 1 };
     const input = state({ files: [file] });

@@ -3,6 +3,7 @@ import MarkdownIt from "markdown-it";
 import type { ToolState } from "../runtime/types.js";
 import type { FileSummary, TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
 import { displayToolCommand, formatShellCommandForDisplay } from "../feishu/CardRenderer.js";
+import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 
 const MARKDOWN = new MarkdownIt({
   breaks: true,
@@ -10,6 +11,8 @@ const MARKDOWN = new MarkdownIt({
   linkify: true,
   typographer: false,
 });
+const validateLink = MARKDOWN.validateLink.bind(MARKDOWN);
+MARKDOWN.validateLink = (url) => isFileUrl(url) || validateLink(url);
 const defaultLinkOpen = MARKDOWN.renderer.rules.link_open
   ?? ((tokens, index, options, _environment, renderer) => renderer.renderToken(tokens, index, options));
 MARKDOWN.renderer.rules.link_open = (tokens, index, options, environment, renderer) => {
@@ -284,9 +287,10 @@ export function renderTurnPreviewSnapshot(
     if (!state.projectCwd || !path.isAbsolute(state.projectCwd)) return undefined;
     return localFileUrl(path.resolve(state.projectCwd, filePath));
   } : undefined;
-  const timeline = renderTimeline(state.activities ?? [], resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language);
+  const renderText = (value: string): string => renderMarkdown(value, state.projectCwd, localFileUrl);
+  const timeline = renderTimeline(state.activities ?? [], renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language);
   const sections = [
-    state.prompt ? renderMessageActivity("prompt", state.prompt, "user prompt") : "",
+    state.prompt ? renderMessageActivity("prompt", state.prompt, "user prompt", renderText) : "",
     state.plan.length > 0 ? renderPlan(state, language) : "",
     state.activitiesTruncated
       ? `<div class="notice">${escapeHtml(labels.truncated)}</div>`
@@ -295,9 +299,9 @@ export function renderTurnPreviewSnapshot(
     state.fileSummary.length > 0 ? renderFileSummary(state, language, resolveFileUrl) : "",
     state.error ? `<section class="result error-result"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(state.error)}</pre></section>` : "",
     state.finalResponse
-      ? `<section class="result final-result"><h2>${escapeHtml(labels.finalAnswer)}</h2><div class="markdown">${renderMarkdown(state.finalResponse)}</div></section>`
+      ? `<section class="result final-result"><h2>${escapeHtml(labels.finalAnswer)}</h2><div class="markdown">${renderText(state.finalResponse)}</div></section>`
       : state.assistantText
-        ? `<section class="result"><h2>${escapeHtml(labels.generating)}</h2><div class="markdown">${renderMarkdown(state.assistantText)}</div></section>`
+        ? `<section class="result"><h2>${escapeHtml(labels.generating)}</h2><div class="markdown">${renderText(state.assistantText)}</div></section>`
         : "",
   ].filter(Boolean).join("");
   const terminal = isTerminal(state.status);
@@ -322,6 +326,7 @@ function renderPlan(state: TurnViewState, language: TurnPreviewLanguage): string
 
 function renderTimeline(
   activities: TurnActivity[],
+  renderText: (value: string) => string,
   localFileUrl?: (filePath: string) => string | undefined,
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
@@ -329,12 +334,13 @@ function renderTimeline(
 ): string {
   return activities
     .filter((activity): activity is Exclude<TurnActivity, { kind: "reasoning" }> => activity.kind !== "reasoning")
-    .map((activity) => renderActivity(activity, localFileUrl, fullToolOutputs, fullToolErrors, language))
+    .map((activity) => renderActivity(activity, renderText, localFileUrl, fullToolOutputs, fullToolErrors, language))
     .join("");
 }
 
 function renderActivity(
   activity: Exclude<TurnActivity, { kind: "reasoning" }>,
+  renderText: (value: string) => string,
   localFileUrl?: (filePath: string) => string | undefined,
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
@@ -342,16 +348,16 @@ function renderActivity(
 ): string {
   switch (activity.kind) {
     case "assistant":
-      return renderMessageActivity(activity.id, activity.text, "commentary");
+      return renderMessageActivity(activity.id, activity.text, "commentary", renderText);
     case "user":
-      return renderMessageActivity(activity.id, activity.text, "user");
+      return renderMessageActivity(activity.id, activity.text, "user", renderText);
     case "tool":
       return renderToolActivity(activity.id, activity.tool, localFileUrl, fullToolOutputs, fullToolErrors, language);
   }
 }
 
-function renderMessageActivity(id: string, text: string, kind: string): string {
-  return `<article class="activity message ${kind}" data-activity="${escapeAttribute(id)}"><div class="markdown">${renderMarkdown(text)}</div></article>`;
+function renderMessageActivity(id: string, text: string, kind: string, renderText: (value: string) => string): string {
+  return `<article class="activity message ${kind}" data-activity="${escapeAttribute(id)}"><div class="markdown">${renderText(text)}</div></article>`;
 }
 
 function renderToolActivity(
@@ -608,8 +614,16 @@ function previewTitle(state: TurnViewState): string {
   return value.length > 80 ? `${value.slice(0, 79)}…` : value;
 }
 
-function renderMarkdown(value: string): string {
-  return MARKDOWN.render(value);
+function renderMarkdown(value: string, projectCwd?: string, localFileUrl?: (filePath: string) => string | undefined): string {
+  const environment = {};
+  const tokens = MARKDOWN.parse(value, environment);
+  // Only the directory is used to resolve relative links; no Markdown file is created.
+  const markdownPath = projectCwd && path.isAbsolute(projectCwd) ? path.join(projectCwd, "turn.md") : undefined;
+  rewriteMarkdownFileLinks(tokens, markdownPath, (filePath) => {
+    const url = localFileUrl?.(filePath);
+    return url ? new URL(url) : undefined;
+  });
+  return MARKDOWN.renderer.render(tokens, MARKDOWN.options, environment);
 }
 
 function statusLabel(status: TurnViewStatus, language: TurnPreviewLanguage): string {
@@ -673,7 +687,7 @@ function escapeAttribute(value: string): string {
 }
 
 const TURN_PREVIEW_CSS = `
-:root { color-scheme: light dark; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; --page: #fff; --surface: #f5f6f7; --code: #fafafa; --text: #25272b; --muted: #62666d; --line: #e0e2e5; --accent: #245bc0; --success: #257449; --danger: #b52c34; }
+:root { color-scheme: light dark; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; --page: #fff; --surface: #f5f6f7; --code: #fafafa; --text: #25272b; --muted: #62666d; --line: #e0e2e5; --accent: #245bc0; --success: #257449; --danger: #b52c34; --scrollbar-thumb: #d4d7dc; --scrollbar-thumb-hover: #afb4bc; }
 * { box-sizing: border-box; letter-spacing: 0; }
 body { margin: 0; background: var(--page); color: var(--text); font-size: 13px; line-height: 1.55; }
 .page-header { position: sticky; top: 0; z-index: 3; background: var(--page); border-bottom: 1px solid var(--line); }
@@ -711,7 +725,7 @@ main { max-width: 1320px; margin: 0 auto; padding: 0 20px 40px; }
 .activity { min-width: 0; }
 .message { padding: 12px 0; border-bottom: 1px solid var(--line); }
 .markdown { min-width: 0; overflow-wrap: anywhere; }
-.commentary > .markdown { font-weight: 700; }
+.message > .markdown, .result > .markdown { font-size: 14px; font-weight: 400; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
 .markdown p, .markdown ul, .markdown ol, .markdown pre, .markdown blockquote { margin: 0 0 6px; }
@@ -734,7 +748,22 @@ summary:hover { background: transparent; }
 summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .tool { margin: 8px 0; }
 .tool-step { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: transparent; }
-.tool-header { display: flex; align-items: flex-start; gap: 8px; min-height: 32px; padding: 7px 10px; overflow-x: auto; background: transparent; font-weight: 400; }
+.tool-header { display: flex; align-items: flex-start; gap: 8px; min-height: 32px; max-height: calc(15 * 12px * 1.55 + 14px); padding: 7px 10px; overflow: auto; background: transparent; font-weight: 400; }
+.tool-header, .tool-body pre { --tool-scrollbar-thumb: var(--scrollbar-thumb); scrollbar-width: thin; scrollbar-color: var(--tool-scrollbar-thumb) transparent; }
+@media (hover: hover) and (pointer: fine) {
+  .tool-header, .tool-body pre { --tool-scrollbar-thumb: transparent; }
+  .tool-header:is(:hover, :focus-visible, :focus-within),
+  .tool-body pre:is(:hover, :focus-visible, :focus-within) { --tool-scrollbar-thumb: var(--scrollbar-thumb); }
+}
+@supports selector(::-webkit-scrollbar) {
+  .tool-header, .tool-body pre { scrollbar-width: auto; scrollbar-color: auto; }
+  :is(.tool-header, .tool-body pre)::-webkit-scrollbar { width: 6px; height: 6px; }
+  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-track,
+  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-corner { background: transparent; }
+  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-thumb { background: var(--tool-scrollbar-thumb); border-radius: 3px; }
+  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+}
 .tool-state { display: inline-flex; flex: none; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; font-weight: 650; white-space: nowrap; }
 .tool-state.completed { color: var(--success); }
 .tool-state.running { color: var(--accent); }
@@ -786,7 +815,7 @@ summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; 
   pre { padding: 8px 10px; }
 }
 @media (prefers-color-scheme: dark) {
-  :root { --page: #18191b; --surface: #232427; --code: #1d1e20; --text: #e0e1e4; --muted: #a0a3ab; --line: #35373c; --accent: #8aaff7; --success: #83c69c; --danger: #f58c94; }
+  :root { --page: #18191b; --surface: #232427; --code: #1d1e20; --text: #e0e1e4; --muted: #a0a3ab; --line: #35373c; --accent: #8aaff7; --success: #83c69c; --danger: #f58c94; --scrollbar-thumb: #45494f; --scrollbar-thumb-hover: #60666e; }
   .notice, .status.waiting_for_approval { color: #e1bc6f; }
 }
 `;
