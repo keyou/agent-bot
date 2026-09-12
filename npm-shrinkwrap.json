@@ -1,12 +1,12 @@
 {
   "name": "@keyou007/agent-bot",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "@keyou007/agent-bot",
-      "version": "0.1.21",
+      "version": "0.1.22",
       "license": "GPL-3.0-only",
       "dependencies": {
         "@agentclientprotocol/sdk": "1.2.1",
