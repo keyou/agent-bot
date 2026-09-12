@@ -6,6 +6,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Track Turn models, complete tool logs, and live context-compaction progress with timing and token changes; show task Turn counts and rollout disk usage through summary-only history and file metadata reads.
+- Accept a Turn ID or one-based history index after `/turn` or `/turns` to show saved runtime details without changing task execution, using only necessary summary pages for missing records and respecting Fork ancestry.
+- Include all Providers when listing and searching App Server tasks, fixing missing tasks after switching to a non-default Provider while preserving pagination and summary-only reads.
+- Add a signed `Preview` page to progress cards with a compact persisted Turn timeline, commands expanded by default, collapsed and deduplicated output/error logs, tool timing, responsive desktop/mobile rendering, and live SSE updates that preserve disclosure and code-scroll state.
+- Preview self-contained HTML files in an isolated frame with inline interactions, a source-code toggle, line anchors, and live updates, without enabling external resources or network access.
+- Summarize each execution setting's scope and effective timing in a one-sentence blockquote at the end of the settings card, and remove redundant Agent and Provider display names while keeping their identifiers and state indicators.
+- Discover models from the selected custom Provider's OpenAI-compatible `/models` endpoint, keep the previous model when supported, otherwise choose the Provider default or its first model, and keep Providers without a model-list endpoint usable through a current/configured model fallback.
+
 ## [0.1.20] - 2026-09-07
 
 - Load only necessary Turn history on demand, keep Fork creation lightweight, and require Codex 0.153.4 or later during initialization and runtime startup.

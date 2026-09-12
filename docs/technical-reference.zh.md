@@ -197,6 +197,10 @@ logging:
 
 `fileViewer` 为最终回答中的本地非图片文件和目录生成带签名的只读 HTTP 链接。默认 `host: "127.0.0.1"`，只能从运行 Agent Bot 的机器访问。设为 `0.0.0.0` 或 `::` 时，服务会监听所有网卡，并从非内部 IPv4 地址中按有线、Wi-Fi、其他物理网卡、VPN 的顺序自动选择链接地址；Docker、Hyper-V、VMware、VirtualBox、WSL、回环和链路本地地址会被排除，没有候选地址时回退到本机环回地址。`publicBaseUrl` 的优先级最高，用于域名、HTTPS 反向代理、NAT 或端口映射。`port: 0` 会在第一次启动时选择空闲端口，并保存到 `<data>/file-viewer/port`，以后重启继续使用，同一机器上的多个 Profile 不会争用固定端口。签名密钥保存在同目录的 `secret` 文件中。文件 URL 只能读取签发时对应的绝对路径；目录 URL 会列出其直接子项并允许继续向下浏览，但不提供向父目录跳转。文本身份由内容采样识别，页面显示带行号的开头 2 MiB；图片、PDF、音视频使用浏览器原生预览，其他二进制文件提供原始打开和下载入口。签名 URL 是持有者凭证，不应公开分享。
 
+同一服务也会为思考卡片生成带签名的 Turn Preview URL。预览直接渲染 SQLite 中持久化的 `TurnViewState` 时间线，不会重新扫描 Codex rollout 文件，也不会恢复或占用 App Server thread 的 writer。页面只展示 Agent Bot 已经可见的 Prompt、计划、Commentary/思考摘要、工具命令和完整保留的结果、文件摘要、错误与最终回答。命令默认展开，输出默认折叠；输出和错误在统一换行、去掉首尾空白后相同则合并展示。Shell 包装器复用思考卡片的清理逻辑。Provider 提供 `input` 或代码字段时，REPL 参数会格式化为可读代码。工具有已记录的时间时展示开始时间与耗时，仅执行中的工具实时计时。仅当页面保持 SSE 连接时，服务才轮询对应快照；状态变化时发送完整且可重复应用的快照，保留用户展开及折叠的状态和工具代码的滚动位置，并由 `EventSource` 在网络中断或 Worker 重启后自动重连。Turn 进入终态后，页面收到最后一份快照并关闭客户端流。该 URL 是当前 Profile 独立的持有者凭证，网络可达范围与 `fileViewer.host`、`publicBaseUrl` 配置完全相同。
+
+HTML 文本文件（`.html`、`.htm`，不区分大小写）支持预览与代码模式。预览 iframe 使用带 `render=html` 的签名文件 URL，按检测到的编码流式加载完整原文，并携带文件版本参数用于实时刷新。iframe 与响应 CSP 都使用 `sandbox allow-scripts`，不授予 `allow-same-origin`；直接打开渲染 URL 时，响应级沙箱仍生效。允许内联脚本、样式及 data/blob 嵌入媒体，不开放外部或本地资源加载、网络请求、表单、弹窗和顶层跳转。外层页面保持原有脚本限制，原始文件与下载响应不变。源码仍经过转义、按需高亮，限制为开头 2 MiB，并支持 `#L<n>` 行号定位。
+
 `feishu.respondToOwnerOnly` 默认为 `true`。每条消息的发送者及卡片操作人的 Open ID 都会与 `feishu.userOpenId` 比较；非拥有者输入会在持久化事件、添加 reaction、下载图片、执行命令或启动 Agent 前被忽略。设为 `false` 可允许其他用户。开启后若未配置拥有者 Open ID，所有飞书消息和卡片操作都会被忽略；需先配置 `FEISHU_USER_OPEN_ID`，或临时关闭限制后通过私聊完成补全。
 
 `feishu.respondToAllGroupMessages` 在模板中默认为 `true`，第一次初始化和 `init --reset` 会按用户选择写入实际值。设为 `false` 后，拥有者未 @ 当前机器人的群消息也会被忽略；Worker 启动时会解析机器人的 Open ID，因此 @ 其他成员不会误触发。拥有者私聊不受影响。初始化只在该值为 `true` 时申请接收全部群消息的权限；仅 @ 响应的 Profile 后续改为 `true` 时，需要重新运行 `agentbot init` 补充权限。
@@ -277,6 +281,8 @@ Fork 从未绑定过 Agent Bot 的任务前，Agent Bot 会先读取不含 Turns
 
 每个 turn 只有一张进度卡。普通更新最多每两秒一次，关键更新最短间隔 500 毫秒。完成时先把进度卡更新为终态，再单独发送 Markdown 最终回答。分组思考卡片只在渲染时派生执行组，持久化的时间线活动不依赖布局，因此切换布局或 Worker 重启都不会丢失思考和工具历史。
 
+`/status` 使用 `itemsView: "summary"` 分页调用 `thread/turns/list`，得到准确的 App Server Turn 总数；该指标不会加载历史工具输出。Codex rollout 的磁盘占用通过 App Server 返回的非稳定字段 `Thread.path` 直接查询文件元数据。任一指标读取失败时，状态命令会退回 Agent Bot 本地已知轮次或显示未知磁盘大小，不会整体失败。已加载的 Codex 会话在状态读取后缓存准确轮次，并跟踪之后启动的新 Turn。上下文压缩活动复用该缓存，轮次缺失时使用 Agent Bot 本地任务图兜底，并直接查询 rollout 文件大小，因此压缩处理期间不会读取任务历史。
+
 成功完成的思考卡片包含 `Reset` 操作，其作用提示紧跟在按钮下方。`/turns` 卡片把相同的作用提示放在最上方，按需从 App Server 刷新当前任务的已完成 turn，并在不覆盖 Agent Bot 富内容快照的前提下补齐缺失的本地索引，随后按时间倒序展示，每页 10 条。远端刷新会短暂缓存，卡片翻页不会重复读取同一份完整历史；刷新失败时仍使用已有本地记录。每次 `turn_started` 都会把前一个已完成 turn 保存为父节点；现有任务会结合快照时间和 `session_reset_to_turn` 审计记录回填，因此历史 Reset 后的第一轮会指向所选 turn，而不是时间上相邻的废弃路径。渲染器先基于完整历史计算 lane，再切分页面，从而跨分页正确显示延续和合并；内容缩进到第二列，状态或操作位于第三列。当前对话位置显示“当前”标记，其余 turn 提供 `Reset` 按钮。翻页和成功的 Reset 都会更新同一张卡片、保持与打开卡片时的任务绑定，并把“当前”标记移动到所选 turn；成功提示会用 Prompt 摘要、完成时间和 Turn ID 标明目标轮次。Agent Bot 会持久化每个 turn 原本所属的 App Server thread，从所选 turn fork，并替换当前任务的远端 thread 绑定；本地任务 ID、标题、Agent、项目目录、运行设置和聊天路由保持不变。所选 turn 之后已经完成的快照不会被删除，因此卡片会同时显示旧路径保留的轮次和 Reset 后新分支产生的轮次。当前任务仍在执行时会拒绝 Reset，本地文件修改也不会被回退。Reset 开始时 Agent Bot 会立即发送提示；在 Reset 完成前到达的每条消息都会先获得 Reaction，再等待新的 thread 绑定完成后继续处理。
 
 完成持久化消息去重占位后，Agent Bot 会等待 `OnIt` 表情添加成功，再进行聊天信息持久化、图片下载、队列等待、命令执行或 Runtime 调用。Turn 成功、失败或取消时分别替换为 `DONE`、`ERROR` 或 `CrossMark`。表情操作失败会记录日志，但不会阻塞任务。
@@ -297,7 +303,7 @@ Fork 从未绑定过 Agent Bot 的任务前，Agent Bot 会先读取不含 Turns
 
 Provider 会与模型、思考强度和权限模式一起保存在任务中；每个 Agent 还可以在 `agents.<name>.defaults` 下分别保存这些默认值。新任务先读取所选 Agent 的默认值，再由显式设置或同 Agent 任务继承值覆盖。Agent Bot 会通过 `thread/start`、`thread/resume` 和 `thread/fork` 传递最终设置，并把运行时返回的实际值保存到任务。
 
-`/provider`、`/model`、`/thinking` 和 `/permissions` 打开同一张 Card 2.0 运行设置卡片，并激活对应的 tab。四个命令都拒绝参数，tab 切换和设置修改只通过卡片回调完成。Provider 选项来自 App Server 的 `config/read`；对于 Codex，即使隐式内置的 `openai` 没有出现在显式 `model_providers` 配置中，Agent Bot 也会保留该选项。切换 Provider 时使用当前兼容的模型、思考强度和权限模式恢复 thread。每次成功修改 Provider、模型、思考强度或权限后，Agent Bot 都会更新当前任务，把完整生效设置原子写入该 Agent 在 `config.yaml` 中的默认值，就地刷新卡片，并从下一次请求生效；对应 CLI 任务设置命令使用相同的持久化路径。
+`/provider`、`/model`、`/thinking` 和 `/permissions` 打开同一张 Card 2.0 运行设置卡片，并激活对应的 tab。四个命令都拒绝参数，tab 切换和设置修改只通过卡片回调完成。Provider 选项来自 App Server 的 `config/read`；对于 Codex，即使隐式内置的 `openai` 没有出现在显式 `model_providers` 配置中，Agent Bot 也会保留该选项。内置 OpenAI Provider 使用 App Server 的 `model/list`；显式配置的自定义 Provider 会在接口可用时使用 `GET <base_url>/models`，并携带其 `query_params`、`http_headers`、`env_http_headers` 和已配置的 Bearer 凭据，凭据只在 Agent Bot 内部使用，不会进入卡片或模型记录。切换 Provider 时，如果目标模型目录包含原模型则继续使用；否则依次选择标记的默认模型和返回列表中的第一个模型。自定义接口只返回模型 ID 时，会按同名模型合并 App Server 目录中的思考强度元数据。模型发现不可用时，Agent Bot 会把当前或已配置模型作为唯一候选，因此不会因缺少 `/models` 而阻止切换；保存前仍由 Codex 返回的实际 Provider 和模型完成校验。每次成功修改 Provider、模型、思考强度或权限后，Agent Bot 都会更新当前任务，把完整生效设置原子写入该 Agent 在 `config.yaml` 中的默认值，就地刷新卡片，并从下一次请求生效；对应 CLI 任务设置命令使用相同的持久化路径。
 
 Agent Bot 内部保留本地路由键以关联飞书卡片和投递状态，但对用户展示所属 App Server 的任务 ID。没有明确用户操作时，不会续写、steer、停止或分支其他客户端正在运行的 Agent 工作。
 

@@ -96,6 +96,8 @@ agentbot task forkgroup [title]
 
 Choose `new` or `newgroup` for fresh context. Choose `fork` or `forkgroup` when the new task must retain conversation history through the latest completed Turn. Forking must not interrupt an active source turn.
 
+Feishu `/sessions [keyword]` lists and searches tasks across projects and all Providers, not just the App Server's current Provider. Switching Provider does not hide existing tasks; listing still uses paged metadata and the latest Turn summary only.
+
 Fork creation stores source-task and branch-Turn references without synchronizing the full local Turn list. The Feishu Turn card reuses local records and loads only the summary pages needed for the requested page, not the entire history. `task turns` loads the first page if necessary and returns available local records. This does not change the Agent's inherited context. Retry listing Turns after a temporary history-read failure; unsupported summary pagination never falls back to downloading full history.
 
 ## Change Settings
@@ -110,7 +112,7 @@ agentbot task permissions [auto|confirm]
 
 Omit the value to inspect the current setting and available choices. `agent` changes the default Agent for future tasks in that conversation. The other settings affect the specified task from its next request and become the saved defaults for that Agent.
 
-Provider changes require an idle task and verify the actual Provider and model before saving. Wait for active work to finish; do not stop it without the user's request. Switching unloads only the selected thread, not the shared App Server. On failure, previous settings are retained and recovery is attempted. If recovery fails, resolve the reported configuration or ownership issue and retry the Provider switch before sending another prompt. Never replace a forked task with an empty task to work around a switch failure.
+Provider changes require an idle task and verify the actual Provider and model before saving. Custom Providers discover models through their OpenAI-compatible `/models` endpoint when available. Switching keeps the previous model when supported, otherwise uses the Provider default or its first model. A missing model-list endpoint falls back to the current or configured model and does not by itself block switching. Wait for active work to finish; do not stop it without the user's request. Switching unloads only the selected thread, not the shared App Server. On failure, previous settings are retained and recovery is attempted. If recovery fails, resolve the reported configuration or ownership issue and retry the Provider switch before sending another prompt. Never replace a forked task with an empty task to work around a switch failure.
 
 ## Goals And Turns
 
@@ -122,6 +124,8 @@ agentbot task goal edit "<objective>"
 agentbot task turns
 agentbot task reset <turn-id>
 ```
+
+In Feishu, `/turn` (also `/turns`) opens history. `/turn <Turn ID>` or `/turn <index>` shows saved runtime details for the current task without resetting, resuming, or interrupting it. Indices match the history card: one-based, newest first, including a running Turn at the top. Missing records use only necessary summary pages; Fork queries stay within the branch anchor. Summary-only external Turns do not contain unrecorded tool output. This does not change the CLI's `task turns [task]` task-reference argument.
 
 Use `turns` to obtain a real Turn ID before `reset`. Reset changes conversation context only; it does not revert local files. Agent Bot announces an interactive Reset when it starts and queues every new message after its Reaction until the replacement thread is ready.
 
