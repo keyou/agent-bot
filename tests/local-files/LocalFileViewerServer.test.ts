@@ -363,10 +363,30 @@ describe("LocalFileViewerServer", () => {
     const controller = new AbortController();
     try {
       const events = createServerSentEventReader(await fetch(eventsUrl, { signal: controller.signal }));
-      await events.next("update");
+      expect(JSON.parse(await events.next("update")).content).toContain("Live");
       fs.appendFileSync(filePath, "\n[Child](child.txt#L1)\n", "utf8");
       const update = JSON.parse(await events.next("update"));
       expect(update.content).toContain(`<a href="${server.createFileUrl(child, ":1")!.replaceAll("&", "&amp;")}">Child</a>`);
+    } finally {
+      controller.abort();
+    }
+  }, 10_000);
+
+  test("resumes live file updates after deletion and recreation", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "live.md");
+    fs.writeFileSync(filePath, "# Original\n", "utf8");
+    const server = await startServer(path.join(directory, "state"));
+    const page = await (await fetch(server.createFileUrl(filePath)!)).text();
+    const eventsUrl = /data-events-url="([^"]+)"/u.exec(page)![1]!.replaceAll("&amp;", "&");
+    const controller = new AbortController();
+    try {
+      const events = createServerSentEventReader(await fetch(eventsUrl, { signal: controller.signal }));
+      expect(JSON.parse(await events.next("update")).content).toContain("Original");
+      fs.unlinkSync(filePath);
+      expect(JSON.parse(await events.next("unavailable")).message).toBeTypeOf("string");
+      fs.writeFileSync(filePath, "# Restored\n", "utf8");
+      expect(JSON.parse(await events.next("update")).content).toContain("Restored");
     } finally {
       controller.abort();
     }

@@ -622,10 +622,12 @@ export class LocalFileViewerServer {
 
     let closed = false;
     let pendingUpdate: NodeJS.Timeout | undefined;
+    let previousStat: fs.Stats | undefined;
     const sendSnapshot = () => {
       if (closed || response.destroyed) return;
       try {
         const stat = fs.statSync(filePath);
+        previousStat = stat;
         if (!stat.isFile()) throw new Error("Path is no longer a file");
         const snapshot = this.renderFileSnapshot(filePath, stat);
         writeServerSentEvent(response, "update", JSON.stringify({
@@ -644,17 +646,27 @@ export class LocalFileViewerServer {
       pendingUpdate = setTimeout(sendSnapshot, 100);
       pendingUpdate.unref();
     };
-    const watcher = (current: fs.Stats, previous: fs.Stats) => {
-      if (
-        current.mtimeMs === previous.mtimeMs
-        && current.ctimeMs === previous.ctimeMs
-        && current.size === previous.size
-        && current.nlink === previous.nlink
-      ) return;
-      scheduleSnapshot();
-    };
-    fs.watchFile(filePath, { interval: 1_000, persistent: false }, watcher);
     sendSnapshot();
+    // Compare against the sent snapshot so edits during watcher startup cannot be missed.
+    let checking = false;
+    const poller = setInterval(() => {
+      if (closed || checking) return;
+      checking = true;
+      fs.stat(filePath, (error, stat) => {
+        checking = false;
+        if (closed) return;
+        const current = error ? undefined : stat;
+        if (
+          current?.mtimeMs === previousStat?.mtimeMs
+          && current?.ctimeMs === previousStat?.ctimeMs
+          && current?.size === previousStat?.size
+          && current?.nlink === previousStat?.nlink
+        ) return;
+        previousStat = current;
+        scheduleSnapshot();
+      });
+    }, 1_000);
+    poller.unref();
     const keepAlive = setInterval(() => {
       if (!closed && !response.destroyed) response.write(": keep-alive\n\n");
     }, 15_000);
@@ -665,7 +677,7 @@ export class LocalFileViewerServer {
       closed = true;
       if (pendingUpdate) clearTimeout(pendingUpdate);
       clearInterval(keepAlive);
-      fs.unwatchFile(filePath, watcher);
+      clearInterval(poller);
     };
     request.once("aborted", cleanup);
     response.once("close", cleanup);
