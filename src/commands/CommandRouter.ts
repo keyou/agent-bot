@@ -128,8 +128,13 @@ export class CommandRouter {
         throw new Error("/mute 只接受 on 或 off；不传参数等同于 /mute on。");
       }
       case "turns":
-        if (args.length > 0) throw new Error("/turns 不接受参数，请在历史轮次卡片中选择 turn。");
-        return { type: "turns" };
+        rejectOptions("/turn", args);
+        if (args.length > 1) throw new Error("/turn 只接受一个可选的 Turn ID 或序号。");
+        if (args[0] && /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(args[0])
+          && (!/^\d+$/.test(args[0]) || !Number.isSafeInteger(Number(args[0])) || Number(args[0]) < 1)) {
+          throw new Error("Turn 序号必须是从 1 开始的正整数。");
+        }
+        return args[0] ? { type: "turns", turnReference: args[0] } : { type: "turns" };
       case "model":
         return settingsCommand("/model", args, { type: "model" });
       case "provider":

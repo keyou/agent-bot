@@ -260,7 +260,7 @@ const HELP_COMMAND_SECTIONS: Array<{
         usage: "[序号或任务 ID]",
         description: "从当前或指定任务最近完成轮次创建分支",
       },
-      { command: "/turns", description: "浏览历史轮次，并可 Reset 对话上下文" },
+      { command: "/turns", usage: "[Turn ID 或序号]", description: "浏览历史轮次，并可 Reset 对话上下文；带参数查看运行详情" },
       {
         command: "/title",
         usage: "&#60;新标题&#62;",
@@ -2074,8 +2074,13 @@ export class ProxySessionController {
         await this.setGroupMute(contextKey, command.enabled);
         return;
       case "turns":
-        await this.outbound.sendText(contextKey, LIST_TURNS_STARTED_MESSAGE);
-        await this.openResetHistory(contextKey);
+        if (command.turnReference) {
+          await this.outbound.sendText(contextKey, "正在读取轮次运行信息，请稍后。");
+          await this.openTurnDetails(contextKey, command.turnReference);
+        } else {
+          await this.outbound.sendText(contextKey, LIST_TURNS_STARTED_MESSAGE);
+          await this.openResetHistory(contextKey);
+        }
         return;
       case "model":
         await this.openExecutionSettings(contextKey, "model");
@@ -3407,14 +3412,15 @@ export class ProxySessionController {
   private async hydrateTaskTurnHistory(
     current: SessionRecord,
     requiredCount = RESET_HISTORY_PAGE_SIZE,
+    targetTurnId?: string,
   ): Promise<boolean> {
     const existing = this.turnHistoryHydrations.get(current.localSessionId);
     if (existing) await existing;
     const hydration = (async () => {
       if (this.store.getForkHistorySource(current.localSessionId)) {
-        return this.hydrateForkTurnHistory(current.contextKey, current, requiredCount);
+        return this.hydrateForkTurnHistory(current.contextKey, current, requiredCount, new Set(), targetTurnId);
       }
-      return this.hydrateRemoteTurnHistory(current.contextKey, current, requiredCount);
+      return this.hydrateRemoteTurnHistory(current.contextKey, current, requiredCount, targetTurnId);
     })();
     this.turnHistoryHydrations.set(current.localSessionId, hydration);
     try {
@@ -3431,6 +3437,7 @@ export class ProxySessionController {
     current: SessionRecord,
     requiredCount: number,
     visited = new Set<string>(),
+    targetTurnId?: string,
   ): Promise<boolean> {
     if (visited.has(current.localSessionId)) return false;
     visited.add(current.localSessionId);
@@ -3459,7 +3466,7 @@ export class ProxySessionController {
       ? Math.max(0, localAnchorIndex)
       : localAnchorIndex >= 0 ? localAnchorIndex : availableCount;
     const neededInheritedCount = Math.max(0, requiredCount - ownTurnCount);
-    if (localAnchorIndex >= 0 && availableCount >= requiredCount
+    if (!targetTurnId && localAnchorIndex >= 0 && availableCount >= requiredCount
       && (!state.anchorFound || (state.loadedCount ?? 0) >= neededInheritedCount)) return !state.complete;
     const sourceSession = source.sourceLocalSessionId
       ? this.store.getSession(source.sourceLocalSessionId)
@@ -3472,6 +3479,7 @@ export class ProxySessionController {
         sourceSession.contextKey, sourceSession,
         this.store.listTaskTurnGraphIndex(sourceSession.localSessionId).length + requiredCount - availableCount,
         visited,
+        targetTurnId,
       );
       if (!hasMore && this.store.hasImportedForkTurnHistory(sourceSession.localSessionId)) {
         this.store.audit(contextKey, "fork_turn_history_imported", {
@@ -3488,8 +3496,10 @@ export class ProxySessionController {
     if (runtime.kind !== "codex" || !runtime.listRemoteTurnSummaries) return false;
     const seenCursors = new Set<string>();
     try {
-      while (!state.complete && (state.loadedCount ?? 0) < neededInheritedCount) {
-        const remaining = neededInheritedCount - (state.loadedCount ?? 0);
+      while (!state.complete && (targetTurnId
+        ? !this.store.hasTaskHistoryTurn(current.localSessionId, targetTurnId)
+        : (state.loadedCount ?? 0) < neededInheritedCount)) {
+        const remaining = targetTurnId ? RESET_HISTORY_PAGE_SIZE : neededInheritedCount - (state.loadedCount ?? 0);
         const page = await runtime.listRemoteTurnSummaries(source.sourceRemoteSessionId, {
           cursor: state.cursor, limit: Math.min(RESET_HISTORY_PAGE_SIZE, remaining),
         });
@@ -3553,6 +3563,7 @@ export class ProxySessionController {
     contextKey: string,
     current: SessionRecord,
     requiredCount: number,
+    targetTurnId?: string,
   ): Promise<boolean> {
     if (!current.remoteSessionId) return false;
     const key = JSON.stringify([current.agentName, current.remoteSessionId, "turn-card"]);
@@ -3564,10 +3575,12 @@ export class ProxySessionController {
     if (runtime.kind !== "codex" || !runtime.listRemoteTurnSummaries) return false;
     const seen = new Set<string>();
     try {
-      while (!state.complete && (state.loadedCount ?? 0) < requiredCount) {
+      while (!state.complete && (targetTurnId
+        ? !this.store.hasTaskHistoryTurn(current.localSessionId, targetTurnId)
+        : (state.loadedCount ?? 0) < requiredCount)) {
         const page = await runtime.listRemoteTurnSummaries(current.remoteSessionId, {
           cursor: state.cursor,
-          limit: Math.min(RESET_HISTORY_PAGE_SIZE, requiredCount - (state.loadedCount ?? 0)),
+          limit: targetTurnId ? RESET_HISTORY_PAGE_SIZE : Math.min(RESET_HISTORY_PAGE_SIZE, requiredCount - (state.loadedCount ?? 0)),
         });
         if (page.nextCursor && (page.nextCursor === state.cursor || seen.has(page.nextCursor))) {
           throw new Error("App Server repeated a Turn history cursor.");
@@ -5723,6 +5736,71 @@ export class ProxySessionController {
     );
   }
 
+  private taskTurnIds(current: SessionRecord): string[] {
+    const ids = this.store.listTaskTurnGraphIndex(current.localSessionId).map((turn) => turn.turnId);
+    if (current.lastTurnStatus === "running" && current.lastTurnId && !ids.includes(current.lastTurnId)) {
+      ids.unshift(current.lastTurnId);
+    }
+    return ids;
+  }
+
+  private runningTurnSnapshot(current: SessionRecord, turnId: string): TurnViewState {
+    const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(turnId));
+    if (snapshot) return snapshot;
+    const attempt = this.store.findIncompleteTurnAttemptByTurnId(turnId);
+    const startedAt = Date.parse(attempt?.createdAt ?? "");
+    return {
+      sessionId: current.localSessionId,
+      turnId,
+      taskTitle: current.title,
+      prompt: attempt?.promptText ?? current.title,
+      status: "running",
+      startedAt: Number.isFinite(startedAt) ? startedAt : Date.now(),
+      assistantText: "", plan: [], activities: [], completedTools: [], failedTools: [], fileSummary: [],
+    };
+  }
+
+  private async openTurnDetails(contextKey: string, reference: string): Promise<void> {
+    const current = this.requireCurrentSession(contextKey);
+    let turnId: string | undefined;
+    if (/^\d+$/.test(reference)) {
+      const index = Number(reference);
+      const runningCount = current.lastTurnStatus === "running" && current.lastTurnId ? 1 : 0;
+      const hasMore = index > runningCount && this.isCodexSession(current)
+        ? await this.hydrateTaskTurnHistory(current, index - runningCount)
+        : false;
+      turnId = this.taskTurnIds(current)[index - 1];
+      if (!turnId) {
+        throw new Error(hasMore
+          ? "轮次历史暂未加载完成，请稍后重试。"
+          : `未找到序号为 ${reference} 的轮次。请发送 /turn 查看当前轮次序号。`);
+      }
+    } else {
+      const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(reference));
+      if (snapshot && (snapshot.sessionId === current.localSessionId
+        || this.store.hasTaskHistoryTurn(current.localSessionId, reference))) {
+        turnId = reference;
+      } else if (current.lastTurnStatus === "running" && current.lastTurnId === reference) {
+        turnId = reference;
+      } else if (this.isCodexSession(current) && (!snapshot || this.store.getForkHistorySource(current.localSessionId))) {
+        const hasMore = await this.hydrateTaskTurnHistory(current, 0, reference);
+        if (this.store.hasTaskHistoryTurn(current.localSessionId, reference)) turnId = reference;
+        else if (hasMore) throw new Error("轮次历史暂未加载完成，请稍后重试。");
+      }
+      if (!turnId && snapshot) throw new Error("这个 Turn 不属于当前任务的历史。请先切换到对应任务。");
+      if (!turnId) throw new Error(`未找到当前任务的 Turn：${reference}`);
+    }
+
+    if (current.lastTurnStatus === "running" && current.lastTurnId === turnId
+      && !this.store.getTurnPromptSummary(turnId)) {
+      await this.outbound.sendInteractiveCard(contextKey, this.cardRenderer.renderTurnDetails(
+        this.runningTurnSnapshot(current, turnId),
+      ));
+      return;
+    }
+    await this.outbound.showDetails(contextKey, turnId);
+  }
+
   private async openResetHistory(
     contextKey: string,
     options: ResetHistoryCardOptions = {},
@@ -5742,27 +5820,11 @@ export class ProxySessionController {
       && !completedTurnIds.has(current.lastTurnId)
       ? current.lastTurnId
       : undefined;
-    const persistedRunningSnapshot = runningTurnId
-      ? turnViewSnapshot(this.store.getTurnSnapshot(runningTurnId))
-      : undefined;
     const runningAttempt = runningTurnId
       ? this.store.findIncompleteTurnAttemptByTurnId(runningTurnId)
       : undefined;
-    const attemptStartedAt = Date.parse(runningAttempt?.createdAt ?? "");
     const runningSnapshot: TurnViewState | undefined = runningTurnId
-      ? persistedRunningSnapshot ?? {
-          sessionId: current.localSessionId,
-          turnId: runningTurnId,
-          prompt: runningAttempt?.promptText ?? current.title,
-          status: "running",
-          startedAt: Number.isFinite(attemptStartedAt) ? attemptStartedAt : Date.now(),
-          assistantText: "",
-          plan: [],
-          activities: [],
-          completedTools: [],
-          failedTools: [],
-          fileSummary: [],
-        }
+      ? this.runningTurnSnapshot(current, runningTurnId)
       : undefined;
     const runningTurn = runningTurnId && runningSnapshot
       ? {

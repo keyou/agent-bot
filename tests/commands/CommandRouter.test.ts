@@ -48,9 +48,18 @@ describe("CommandRouter", () => {
     expect(() => router.parse("/mute on extra")).toThrow("只接受 on 或 off");
   });
 
-  test("opens the turn history card without accepting arguments", () => {
+  test("opens turn history or selects a Turn ID or one-based index", () => {
     expect(router.parse("/turns")).toEqual({ type: "turns" });
-    expect(() => router.parse("/turns turn_1")).toThrow("不接受参数");
+    expect(router.parse("/turn")).toEqual({ type: "turns" });
+    expect(router.parse("/turn turn_1")).toEqual({ type: "turns", turnReference: "turn_1" });
+    expect(router.parse("/turns 12")).toEqual({ type: "turns", turnReference: "12" });
+    expect(router.parse("/turn 019fbc76-5c41-7e53-93b8-1f9fb2e3de1c"))
+      .toEqual({ type: "turns", turnReference: "019fbc76-5c41-7e53-93b8-1f9fb2e3de1c" });
+    expect(() => router.parse("/turn 1 extra")).toThrow("只接受一个");
+    expect(() => router.parse("/turn --all")).toThrow("不支持参数");
+    for (const index of ["0", "-1", "1.5", "9007199254740992"]) {
+      expect(() => router.parse(`/turn ${index}`)).toThrow("从 1 开始的正整数");
+    }
   });
 
   test("opens the directory browser at the current or specified directory", () => {

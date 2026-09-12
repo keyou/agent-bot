@@ -21,7 +21,7 @@ export type Command =
   | { type: "restart"; force?: boolean }
   | { type: "release" }
   | { type: "mute"; enabled: boolean }
-  | { type: "turns" }
+  | { type: "turns"; turnReference?: string }
   | { type: "model" }
   | { type: "provider" }
   | { type: "thinking" }

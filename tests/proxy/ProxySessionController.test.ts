@@ -12,6 +12,7 @@ import type { AppConfig } from "../../src/config/schema.js";
 import { generateGroupAvatarPng, resolveGroupAvatarProjectName } from "../../src/feishu/GroupAvatarGenerator.js";
 import type { FeishuOutbound, IncomingMessage } from "../../src/feishu/types.js";
 import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
+import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import { OutboundRouter } from "../../src/presentation/OutboundRouter.js";
 import { ProxySessionController } from "../../src/proxy/ProxySessionController.js";
 import { AgentRuntimeRegistry } from "../../src/runtime/AgentRuntimeRegistry.js";
@@ -1485,6 +1486,146 @@ describe("ProxySessionController", () => {
     expect(startedRemoteSessionId).toBe(`${sourceRemoteSessionId}_fork`);
     expect(store.getTurnRuntimeOrigin("turn_after_reset")?.remoteSessionId)
       .toBe(`${sourceRemoteSessionId}_fork`);
+  });
+
+  describe("Turn detail commands", () => {
+    function historyFixture() {
+      const result = fixture();
+      const { store, remoteSessions } = result;
+      store.getOrCreateUserContext("chat_id:c1", "codex");
+      store.createSession({ localSessionId: "details", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "ready" });
+      store.updateRuntimeSession("details", { runtimeKind: "codex", remoteSessionId: "remote_details", lastTurnId: "detail_40", lastTurnStatus: "completed" });
+      store.setCurrentSession("chat_id:c1", "details");
+      remoteSessions.push({
+        id: "remote_details", cwd: process.cwd(), source: "appServer", status: "idle",
+        completedTurns: Array.from({ length: 40 }, (_, index) => ({
+          id: `detail_${index + 1}`, prompt: `Prompt ${index + 1}`, startedAt: index * 10, completedAt: index * 10 + 1,
+        })),
+      });
+      const save = (turnId: string, status: TurnViewState["status"] = "completed", sessionId = "details") => {
+        const snapshot: TurnViewState = {
+          sessionId, turnId, status, prompt: `Saved ${turnId}`, startedAt: 1_000,
+          assistantText: "Saved answer", plan: [], activities: [], completedTools: [], failedTools: [], fileSummary: [],
+        };
+        store.saveTurnSnapshot(turnId, sessionId, snapshot, "chat_id:c1");
+      };
+      return { ...result, save };
+    }
+
+    test.each(["completed", "failed", "cancelled", "tool_running"] as const)(
+      "reads a saved %s Turn by ID without remote reads or task mutations", async (status) => {
+        const { controller, runtime, store, presenter, save } = historyFixture();
+        save("saved_turn", status);
+        const before = store.getSession("details");
+        await controller.onMessage(message("/turn saved_turn"));
+        expect(presenter.showDetails).toHaveBeenCalledExactlyOnceWith("chat_id:c1", "saved_turn");
+        expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+        expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+        expect(runtime.resumeSession).not.toHaveBeenCalled();
+        expect(runtime.startTurn).not.toHaveBeenCalled();
+        expect(runtime.cancelTurn).not.toHaveBeenCalled();
+        expect(runtime.forkSession).not.toHaveBeenCalled();
+        expect(store.getSession("details")).toEqual(before);
+        expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe("details");
+      },
+    );
+
+    test.each([true, false])("shows the running Turn first, with saved snapshot = %s", async (saved) => {
+      const { controller, runtime, store, presenter, outbound, save } = historyFixture();
+      store.updateRuntimeSession("details", { lastTurnId: "live_turn", lastTurnStatus: "running" });
+      if (saved) save("live_turn", "tool_running");
+      await controller.onMessage(message("/turn 1"));
+      expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+      if (saved) expect(presenter.showDetails).toHaveBeenCalledWith("chat_id:c1", "live_turn");
+      else {
+        const card = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1]);
+        expect(card).toContain("live_turn");
+        expect(card).toContain("任务执行详情");
+        expect(store.getTurnSnapshot("live_turn")).toBeUndefined();
+      }
+      await controller.onMessage(message("/turn 2"));
+      expect(presenter.showDetails).toHaveBeenLastCalledWith("chat_id:c1", "detail_40");
+      expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledExactlyOnceWith("remote_details", { cursor: undefined, limit: 1 });
+      expect(runtime.cancelTurn).not.toHaveBeenCalled();
+      expect(runtime.forkSession).not.toHaveBeenCalled();
+    });
+
+    test("matches list numbering across pages and loads only up to the requested index", async () => {
+      const { controller, runtime, presenter, store } = historyFixture();
+      await controller.onMessage(message("/turn"));
+      await controller.onMessage(message("/turn 12"));
+      expect(presenter.showDetails).toHaveBeenLastCalledWith("chat_id:c1", "detail_29");
+      expect(vi.mocked(runtime.listRemoteTurnSummaries!).mock.calls).toEqual([
+        ["remote_details", { cursor: undefined, limit: 10 }],
+        ["remote_details", { cursor: "10", limit: 2 }],
+      ]);
+      expect(store.getTurnSnapshot("detail_28")).toBeUndefined();
+      expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    });
+
+    test("stops summary pagination as soon as a previously uncached Turn ID is found", async () => {
+      const { controller, runtime, presenter, store } = historyFixture();
+      await controller.onMessage(message("/turn detail_29"));
+      expect(presenter.showDetails).toHaveBeenLastCalledWith("chat_id:c1", "detail_29");
+      expect(vi.mocked(runtime.listRemoteTurnSummaries!).mock.calls).toEqual([
+        ["remote_details", { cursor: undefined, limit: 10 }],
+        ["remote_details", { cursor: "10", limit: 10 }],
+      ]);
+      expect(store.getTurnSnapshot("detail_20")).toBeUndefined();
+      expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    });
+
+    test.each([false, true])("looks up inherited Turns within the Fork anchor, cached source snapshot = %s", async (cached) => {
+      const { controller, store, runtime, presenter, outbound, save } = historyFixture();
+      store.createSession({ localSessionId: "source", contextKey: "chat_id:source", agentName: "codex", cwd: process.cwd(), status: "ready" });
+      if (cached) save("detail_24", "completed", "source");
+      store.updateRuntimeSession("details", { remoteSessionId: "remote_branch", lastTurnId: "detail_35", lastTurnStatus: "completed" });
+      store.audit("chat_id:c1", "session_forked", {
+        forkedLocalSessionId: "details", sourceLocalSessionId: "source",
+        sourceRemoteSessionId: "remote_details", sourceTurnId: "detail_35",
+      });
+      await controller.onMessage(message("/turn detail_24"));
+      expect(presenter.showDetails).toHaveBeenCalledWith("chat_id:c1", "detail_24");
+      expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(2);
+      expect(store.getTurnSnapshot("detail_36")).toBeUndefined();
+      expect(store.getTurnSnapshot("detail_20")).toBeUndefined();
+      await controller.onMessage(message("/turn detail_40"));
+      expect(outbound.sendText).toHaveBeenLastCalledWith("chat_id:c1", expect.stringContaining("未找到当前任务"));
+      expect(presenter.showDetails).toHaveBeenCalledOnce();
+      expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+      expect(runtime.forkSession).not.toHaveBeenCalled();
+    });
+
+    test.each(["41", "missing_turn"])("reports a missing reference: %s", async (reference) => {
+      const { controller, presenter, outbound } = historyFixture();
+      await controller.onMessage(message(`/turn ${reference}`));
+      expect(presenter.showDetails).not.toHaveBeenCalled();
+      expect(outbound.sendText).toHaveBeenLastCalledWith("chat_id:c1", expect.stringContaining("未找到"));
+    });
+
+    test("keeps failed history reads retryable without a full-history fallback", async () => {
+      const { controller, runtime, presenter, outbound } = historyFixture();
+      vi.mocked(runtime.listRemoteTurnSummaries!).mockRejectedValueOnce(new Error("temporarily unavailable"));
+      await controller.onMessage(message("/turn detail_40"));
+      expect(presenter.showDetails).not.toHaveBeenCalled();
+      expect(outbound.sendText).toHaveBeenLastCalledWith("chat_id:c1", expect.stringContaining("请稍后重试"));
+      expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledOnce();
+      await controller.onMessage({ ...message("/turn detail_40"), messageId: "retry-detail" });
+      expect(presenter.showDetails).toHaveBeenCalledWith("chat_id:c1", "detail_40");
+      expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    });
+
+    test("rejects other tasks' Turns and an unbound topic instead of showing the parent task", async () => {
+      const { controller, store, presenter, outbound, runtime, save } = historyFixture();
+      store.createSession({ localSessionId: "other", contextKey: "chat_id:other", agentName: "codex", cwd: process.cwd(), status: "ready" });
+      save("other_turn", "completed", "other");
+      await controller.onMessage(message("/turn other_turn"));
+      expect(outbound.sendText).toHaveBeenLastCalledWith("chat_id:c1", expect.stringContaining("不属于当前任务"));
+      await controller.onMessage(threadMessage("c1", "group", "unbound", "root", "/turn 1"));
+      expect(presenter.showDetails).not.toHaveBeenCalled();
+      expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+    });
   });
 
   test("shows ten completed turns per Turns card page and keeps later turns after Reset", async () => {
