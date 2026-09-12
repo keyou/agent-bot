@@ -2386,7 +2386,7 @@ function displayFilePath(filePath: string, projectCwd?: string): string {
 }
 
 function escapeMarkdownFilePath(filePath: string): string {
-  return filePath.replaceAll("\\.", "\\\\.");
+  return filePath.replace(/[\\`*_[\]]/g, "\\$&");
 }
 
 function usesWindowsPaths(...values: string[]): boolean {

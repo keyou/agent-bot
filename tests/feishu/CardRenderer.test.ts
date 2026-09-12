@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import MarkdownIt from "markdown-it";
 import type { RuntimeSession } from "../../src/acp/AcpSessionManager.js";
 import { CardRenderer } from "../../src/feishu/CardRenderer.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
@@ -1855,8 +1856,31 @@ describe("CardRenderer", () => {
     const panel = collectObjects(card).find((item) => panelTitle(item).startsWith("文件变更"));
     const content = String((panel?.elements as Array<{ content?: string }> | undefined)?.[0]?.content ?? "");
 
-    expect(content).toContain("C:\\Users\\Admin\\\\.agent-bot\\config.yaml  +28 -4");
+    expect(new MarkdownIt().render(content)).toContain("C:\\Users\\Admin\\.agent-bot\\config.yaml  +28 -4");
     expect(content).not.toContain("`");
+  });
+
+  test.each(["grouped", "timeline"] as const)("preserves literal file paths in %s summaries and details", (thinkingCardLayout) => {
+    const running = state();
+    running.projectCwd = "D:\\dev\\agent-bot";
+    const paths = [
+      "aha\\components\\cua_sandbox\\task-mode-resource\\python-packages\\gac_runtime\\aha_browser_use_speedup\\__init__.py",
+      "src\\_private\\_helpers_.py",
+      "C:\\Users\\Admin\\.agent-bot\\_cache\\__init__.py",
+      "\\\\server\\shared_dir\\__init__.py",
+      "notes\\[draft]_notes.md",
+      "notes\\`sample`.md",
+    ];
+    running.fileSummary = paths.map((filePath) => ({ path: filePath, additions: 6, deletions: 2 }));
+    const renderer = new CardRenderer({ thinkingCardLayout });
+    for (const card of [renderer.renderTurn(running), renderer.renderTurnDetails(running)]) {
+      const panel = collectObjects(card).find((item) => panelTitle(item).startsWith("文件变更"));
+      const content = String((panel?.elements as Array<{ content?: string }> | undefined)?.[0]?.content ?? "");
+      const rendered = new MarkdownIt().render(content);
+      for (const filePath of paths) expect(rendered).toContain(`${filePath}  +6 -2`);
+      expect(rendered).not.toMatch(/<(?:em|strong|code|a)(?:\s|>)/u);
+      expect(panel).toMatchObject({ tag: "collapsible_panel", element_id: "turn_files", expanded: false });
+    }
   });
 
   test("keeps a stable identity for a tool panel while command output is updated", () => {
