@@ -123,6 +123,14 @@ export interface PermissionSelectorCardView {
 
 export type ExecutionSettingsTab = "agent" | "provider" | "model" | "thinking" | "permission";
 
+const EXECUTION_SETTING_EFFECTS: Record<ExecutionSettingsTab, string> = {
+  agent: "只影响新建任务，不切换当前任务。",
+  provider: "只影响当前任务，需空闲时切换。",
+  model: "只影响当前任务，下一轮生效。",
+  thinking: "只影响当前任务，下一轮生效。",
+  permission: "只影响当前任务，下一轮生效。",
+};
+
 export interface ExecutionSettingsAgentOption {
   name: string;
   title: string;
@@ -158,6 +166,7 @@ export interface TaskListCardAction {
   text: string;
   type?: "default" | "primary" | "danger";
   value: Record<string, string>;
+  url?: string;
 }
 
 export interface HelpCardCommand {
@@ -542,7 +551,7 @@ export class CardRenderer {
 
     if (view.activeTab === "agent") {
       elements.push(...view.agents.map((agent) => settingsOptionRow({
-        label: `${inlineCode(agent.name)} · ${escapeCardHtml(agent.title)}`,
+        label: inlineCode(agent.name),
         current: agent.name === view.currentAgent,
         action: {
           text: "Switch",
@@ -562,9 +571,6 @@ export class CardRenderer {
         elements.push(...view.providers.map((provider) => settingsOptionRow({
           label: [
             inlineCode(provider.id),
-            provider.displayName && provider.displayName !== provider.id
-              ? ` · ${escapeCardHtml(provider.displayName)}`
-              : "",
             provider.isDefault ? " · 默认" : "",
           ].join(""),
           current: provider.id === view.currentProvider,
@@ -631,6 +637,7 @@ export class CardRenderer {
       })));
     }
 
+    elements.push(markdown(`> ${EXECUTION_SETTING_EFFECTS[view.activeTab]}`));
     return sectionCard("运行设置", elements, view.notice ? "green" : "blue");
   }
 
@@ -1138,7 +1145,7 @@ export class CardRenderer {
     };
   }
 
-  renderTurn(state: TurnViewState): Record<string, unknown> {
+  renderTurn(state: TurnViewState, previewUrl?: string): Record<string, unknown> {
     const elements = this.thinkingCardLayout === "timeline"
       ? renderTurnElements(state, "hidden")
       : renderGroupedTurnElements(state, "hidden");
@@ -1149,23 +1156,31 @@ export class CardRenderer {
         type: "danger",
         value: { action: "turn_cancel", sessionId: state.sessionId, turnId: state.turnId },
       });
+      if (previewUrl) footerActions.push(turnPreviewAction(previewUrl));
       elements.push(
         { tag: "hr" },
-        taskActionRow(footerActions, renderTurnDuration(state)),
+        taskActionRow(footerActions, renderTurnDuration(state), true),
       );
     } else if (state.status === "completed") {
       footerActions.push({
         text: "Reset",
         value: { action: "turn_reset", sessionId: state.sessionId, turnId: state.turnId },
       });
+      if (previewUrl) footerActions.push(turnPreviewAction(previewUrl));
       elements.push(
         { tag: "hr" },
-        taskActionRow(footerActions),
+        taskActionRow(footerActions, undefined, true),
       );
     } else if (state.status === "starting") {
+      if (previewUrl) footerActions.push(turnPreviewAction(previewUrl));
       elements.push(
         { tag: "hr" },
-        taskActionRow([], renderTurnDuration(state)),
+        taskActionRow(footerActions, renderTurnDuration(state), true),
+      );
+    } else if (previewUrl) {
+      elements.push(
+        { tag: "hr" },
+        taskActionRow([turnPreviewAction(previewUrl)], renderTurnDuration(state)),
       );
     }
     if (state.status === "completed") {
@@ -1184,11 +1199,15 @@ export class CardRenderer {
     );
   }
 
-  renderTurnDetails(state: TurnViewState): Record<string, unknown> {
+  renderTurnDetails(state: TurnViewState, previewUrl?: string): Record<string, unknown> {
     const title = state.taskTitle
       ? `任务执行详情：${truncateText(state.taskTitle.replace(/\s+/g, " ").trim(), 60)}`
       : "任务执行详情";
-    return turnCard(title, "blue", renderTurnElements(state, "always"), renderTurnSubtitle(state));
+    const elements = [markdown(`Turn: \`${state.turnId}\``)];
+    if (state.prompt) elements.push(markdown(`**Prompt**\n${truncateText(state.prompt, 1_000)}`));
+    elements.push(...renderTurnElements(state, "always"));
+    if (previewUrl) elements.push(taskActionRow([turnPreviewAction(previewUrl)]));
+    return turnCard(title, "blue", elements, renderTurnSubtitle(state));
   }
 
   renderActivityHistory(state: TurnViewState, requestedPage: number): Record<string, unknown> {
@@ -2274,7 +2293,7 @@ function renderToolDetails(tool: ToolState, projectCwd?: string): string {
   return codeBlock([`$ ${commandText}`, resultText].filter((part): part is string => part !== undefined).join("\n"), 2_003);
 }
 
-function formatShellCommandForDisplay(command: string): string {
+export function formatShellCommandForDisplay(command: string): string {
   const normalized = command.replace(/\r\n/g, "\n");
   let result = "";
   let quote: "'" | "\"" | undefined;
@@ -2379,7 +2398,7 @@ function toolPanelTitle(tool: ToolState): string {
   const command = stripAnsi(tool.command ?? tool.title).trim();
   const meaningfulCommand = tool.kind === "web_search"
     ? tool.title
-    : unwrapShellCommand(command) ?? tool.title;
+    : displayToolCommand(command) ?? tool.title;
   const duration = toolDuration(tool);
   const prefix = `${icon} `;
   const suffix = duration ? ` · ${duration}` : "";
@@ -2449,6 +2468,11 @@ function shellCommandStatus(view: ShellCommandCardView): {
     return { title: "命令执行完成", label: `退出码 ${view.exitCode ?? 0}`, template: "green" };
   }
   return { title: "命令执行失败", label: `退出码 ${view.exitCode ?? "未知"}`, template: "red" };
+}
+
+export function displayToolCommand(command: string): string | undefined {
+  const clean = stripAnsi(command).trim();
+  return unwrapShellCommand(clean);
 }
 
 function unwrapShellCommand(command: string): string | undefined {
@@ -3007,10 +3031,17 @@ function taskActionElement(action: TaskListCardAction): Record<string, unknown> 
     elements: [markdown(
       `<font color='${action.type === "danger" ? "red" : "blue"}'>${escapeCardActionText(action.text)}</font>`,
     )],
-    behaviors: [{
-      type: "callback",
-      value: action.value,
-    }],
+    behaviors: action.url
+      ? [{ type: "open_url", default_url: action.url }]
+      : [{ type: "callback", value: action.value }],
+  };
+}
+
+function turnPreviewAction(previewUrl: string): TaskListCardAction {
+  return {
+    text: "Preview",
+    value: {},
+    url: previewUrl,
   };
 }
 

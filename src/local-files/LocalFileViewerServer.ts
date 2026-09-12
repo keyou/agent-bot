@@ -12,6 +12,13 @@ import {
   selectPreferredNetworkAddress,
   type NetworkConnectionKind,
 } from "./NetworkAddressSelector.js";
+import {
+  isTurnPreviewState,
+  detectTurnPreviewLanguage,
+  renderTurnPreviewPage,
+  renderTurnPreviewSnapshot,
+  TURN_PREVIEW_CLIENT_SCRIPT,
+} from "./TurnPreviewPage.js";
 
 const SECRET_FILE = "secret";
 const PORT_FILE = "port";
@@ -22,6 +29,7 @@ const MAX_CONTENT_SAMPLE_BYTES = 64 * 1024;
 const MAX_SYNTAX_HIGHLIGHT_BYTES = 512 * 1024;
 const DIRECTORY_PAGE_SIZE = 100;
 const MARKDOWN_EXTENSIONS = new Set([".markdown", ".md", ".mdown", ".mkd", ".mkdn"]);
+const HTML_EXTENSIONS = new Set([".html", ".htm"]);
 hljs.registerLanguage("dos", dos);
 hljs.registerLanguage("dockerfile", dockerfile);
 hljs.registerLanguage("powershell", powershell);
@@ -172,7 +180,7 @@ const VIEWER_CLIENT_SCRIPT = `(() => {
     try {
       const update = JSON.parse(event.data);
       if (typeof update.content === "string" && typeof update.metadata === "string") {
-        if (viewSwitch) viewSwitch.hidden = update.viewMode !== "markdown";
+        if (viewSwitch) viewSwitch.hidden = update.viewMode !== "markdown" && update.viewMode !== "html";
         replaceContent(update.content, update.metadata);
       }
     } catch {
@@ -214,7 +222,7 @@ interface DirectoryViewerEntry {
 interface RenderedFileSnapshot {
   content: string;
   metadata: string[];
-  viewMode?: "markdown";
+  viewMode?: "markdown" | "html";
 }
 
 export interface LocalFileViewerServerOptions {
@@ -222,6 +230,8 @@ export interface LocalFileViewerServerOptions {
   port: number;
   publicBaseUrl?: string;
   stateDirectory: string;
+  getTurnSnapshot?: (turnId: string) => unknown;
+  turnPreviewPollIntervalMs?: number;
 }
 
 export interface LocalFileViewerAddress {
@@ -333,6 +343,18 @@ export class LocalFileViewerServer {
     return url.toString();
   }
 
+  createTurnPreviewUrl(turnId: string): string | undefined {
+    const normalizedTurnId = normalizeTurnId(turnId);
+    if (!this.address || !this.secret || !this.options.getTurnSnapshot || !normalizedTurnId) return undefined;
+    const url = new URL(this.address.publicBaseUrl);
+    url.pathname = `${this.basePath}/turn-preview/${this.createShortToken(`turn:${normalizedTurnId}`)}`
+      .replace(/\/{2,}/gu, "/");
+    url.search = "";
+    url.hash = "";
+    url.searchParams.set("turn", normalizedTurnId);
+    return url.toString();
+  }
+
   private async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (request.method !== "GET" && request.method !== "HEAD") {
       response.setHeader("Allow", "GET, HEAD");
@@ -348,6 +370,42 @@ export class LocalFileViewerServer {
     }
     if (route === "/assets/viewer.js") {
       this.sendJavascript(response, request.method === "HEAD");
+      return;
+    }
+    if (route === "/assets/turn-preview.js") {
+      this.sendJavascript(response, request.method === "HEAD", TURN_PREVIEW_CLIENT_SCRIPT);
+      return;
+    }
+    const turnPreviewMatch = new RegExp(`^/turn-preview/([A-Za-z0-9_-]{${SHORT_TOKEN_LENGTH}})$`, "u").exec(route);
+    if (turnPreviewMatch) {
+      const turnId = this.verifyTurnPreviewToken(
+        turnPreviewMatch[1] ?? "",
+        requestUrl.searchParams.get("turn") ?? "",
+      );
+      if (!turnId) {
+        this.sendHtml(response, 403, errorPage("Turn 链接无效", "签名校验失败，Agent Bot 已拒绝该请求。"), request.method === "HEAD");
+        return;
+      }
+      const snapshot = this.options.getTurnSnapshot?.(turnId);
+      if (!isTurnPreviewState(snapshot)) {
+        this.sendHtml(response, 404, errorPage("Turn 不存在", "这次执行可能尚未保存或已被清理。"), request.method === "HEAD");
+        return;
+      }
+      if (requestUrl.searchParams.get("events") === "1") {
+        this.serveTurnEvents(request, response, turnId);
+        return;
+      }
+      const eventsUrl = new URL(this.createTurnPreviewUrl(turnId)!);
+      eventsUrl.searchParams.set("events", "1");
+      const language = detectTurnPreviewLanguage(request.headers["accept-language"]);
+      const html = renderTurnPreviewPage({
+        state: snapshot,
+        eventsUrl: eventsUrl.toString(),
+        scriptPath: `${this.basePath}/assets/turn-preview.js`.replace(/\/{2,}/gu, "/"),
+        localFileUrl: (filePath) => this.createFileUrl(filePath),
+        language,
+      });
+      this.sendHtml(response, 200, html, request.method === "HEAD");
       return;
     }
     const previewMatch = new RegExp(`^/preview/([A-Za-z0-9_-]{${SHORT_TOKEN_LENGTH}})$`, "u").exec(route);
@@ -387,12 +445,13 @@ export class LocalFileViewerServer {
     }
 
     const raw = legacyMatch?.[1] === "raw" || requestUrl.searchParams.get("raw") === "1";
-    if (raw) {
+    const renderHtml = !raw && requestUrl.searchParams.get("render") === "html";
+    if (raw || renderHtml) {
       if (stat.isDirectory()) {
         this.sendHtml(response, 400, errorPage("无法打开目录", "目录只能通过文件列表页面浏览。"), request.method === "HEAD");
         return;
       }
-      this.serveRawFile(request, response, filePath, stat, requestUrl.searchParams.get("download") === "1");
+      this.serveRawFile(request, response, filePath, stat, requestUrl.searchParams.get("download") === "1", renderHtml);
       return;
     }
 
@@ -427,6 +486,17 @@ export class LocalFileViewerServer {
     const expectedBuffer = Buffer.from(expected, "utf8");
     return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer)
       ? filePath
+      : undefined;
+  }
+
+  private verifyTurnPreviewToken(token: string, rawTurnId: string): string | undefined {
+    const turnId = normalizeTurnId(rawTurnId);
+    if (!turnId || !this.secret) return undefined;
+    const expected = this.createShortToken(`turn:${turnId}`);
+    const actualBuffer = Buffer.from(token, "utf8");
+    const expectedBuffer = Buffer.from(expected, "utf8");
+    return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer)
+      ? turnId
       : undefined;
   }
 
@@ -499,12 +569,25 @@ export class LocalFileViewerServer {
     appendUrlQueryParameter(rawUrl, "raw", "1");
 
     let content: string;
+    let viewMode: RenderedFileSnapshot["viewMode"];
     if (classification.kind === "text") {
       const preview = readTextPreview(filePath, stat.size, classification.encoding);
-      const previewContent = isMarkdownFile(filePath)
-        ? renderMarkdownDocument(preview.text, filePath, (target) => this.createPreviewUrl(target))
-        : renderText(preview.text, filePath);
-      content = `${preview.truncated ? '<div class="notice">文件较大，仅显示开头 2 MiB。可使用下方按钮查看或下载完整文件。</div>' : ""}${previewContent}`;
+      const notice = preview.truncated
+        ? '<div class="notice">文件较大，源码仅显示开头 2 MiB。可打开原始文件或下载完整文件。</div>'
+        : "";
+      if (HTML_EXTENSIONS.has(extension)) {
+        viewMode = "html";
+        const renderUrl = this.createPreviewUrl(filePath);
+        appendUrlQueryParameter(renderUrl, "render", "html");
+        appendUrlQueryParameter(renderUrl, "version", `${stat.mtimeMs}-${stat.ctimeMs}-${stat.size}`);
+        content = `<iframe class="html-preview" data-view-panel="rendered" title="HTML 预览" sandbox="allow-scripts" referrerpolicy="no-referrer" src="${escapeAttribute(renderUrl.toString())}"></iframe><section data-view-panel="code">${notice}${renderText(preview.text, filePath)}</section>`;
+      } else {
+        viewMode = isMarkdownFile(filePath) ? "markdown" : undefined;
+        const previewContent = viewMode === "markdown"
+          ? renderMarkdownDocument(preview.text, filePath, (target) => this.createPreviewUrl(target))
+          : renderText(preview.text, filePath);
+        content = `${notice}${previewContent}`;
+      }
     } else if (contentType.startsWith("image/")) {
       content = `<div class="media"><img src="${escapeAttribute(rawUrl.toString())}" alt="${escapeAttribute(fileName)}"></div>`;
     } else if (contentType === "application/pdf") {
@@ -519,9 +602,7 @@ export class LocalFileViewerServer {
     return {
       content,
       metadata: [formatFileSize(stat.size), stat.mtime.toLocaleString()],
-      ...(classification.kind === "text" && isMarkdownFile(filePath)
-        ? { viewMode: "markdown" as const }
-        : {}),
+      ...(viewMode ? { viewMode } : {}),
     };
   }
 
@@ -590,6 +671,57 @@ export class LocalFileViewerServer {
     response.once("close", cleanup);
   }
 
+  private serveTurnEvents(request: IncomingMessage, response: ServerResponse, turnId: string): void {
+    setSecurityHeaders(response);
+    response.statusCode = 200;
+    response.setHeader("Cache-Control", "no-cache, no-store");
+    response.setHeader("Connection", "keep-alive");
+    response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    response.setHeader("X-Accel-Buffering", "no");
+    if (request.method === "HEAD") {
+      response.end();
+      return;
+    }
+    response.flushHeaders();
+    response.write("retry: 2000\n\n");
+    const language = detectTurnPreviewLanguage(request.headers["accept-language"]);
+
+    let closed = false;
+    let previousSnapshot = "";
+    const sendSnapshot = () => {
+      if (closed || response.destroyed) return;
+      const state = this.options.getTurnSnapshot?.(turnId);
+      if (!isTurnPreviewState(state)) {
+        writeServerSentEvent(response, "unavailable", JSON.stringify({ message: "Turn 暂时无法读取。" }));
+        return;
+      }
+      const serialized = JSON.stringify(state);
+      if (serialized === previousSnapshot) return;
+      previousSnapshot = serialized;
+      const snapshot = renderTurnPreviewSnapshot(state, (filePath) => this.createFileUrl(filePath), language);
+      writeServerSentEvent(response, "update", JSON.stringify(snapshot));
+    };
+    sendSnapshot();
+    const poller = setInterval(
+      sendSnapshot,
+      Math.max(50, this.options.turnPreviewPollIntervalMs ?? 1_000),
+    );
+    poller.unref();
+    const keepAlive = setInterval(() => {
+      if (!closed && !response.destroyed) response.write(": keep-alive\n\n");
+    }, 15_000);
+    keepAlive.unref();
+
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(poller);
+      clearInterval(keepAlive);
+    };
+    request.once("aborted", cleanup);
+    response.once("close", cleanup);
+  }
+
   private renderDirectoryViewer(directory: string, stat: fs.Stats, requestedPage: number): string {
     const entries = fs.readdirSync(directory, { withFileTypes: true })
       .flatMap((entry): DirectoryViewerEntry[] => {
@@ -638,9 +770,14 @@ export class LocalFileViewerServer {
     filePath: string,
     stat: fs.Stats,
     download: boolean,
+    renderHtml = false,
   ): void {
     const extension = path.extname(filePath).toLowerCase();
     const classification = classifyFileContent(filePath, stat.size);
+    if (renderHtml && (!HTML_EXTENSIONS.has(extension) || classification.kind !== "text")) {
+      this.sendHtml(response, 400, errorPage("无法预览 HTML", "只有 HTML 文本文件支持此预览模式。"), request.method === "HEAD");
+      return;
+    }
     const contentType = classification.kind === "text"
       ? textContentTypeFor(extension, classification.encoding)
       : binaryContentTypeFor(extension);
@@ -648,6 +785,10 @@ export class LocalFileViewerServer {
     const fileName = path.basename(filePath);
     const disposition = download ? "attachment" : "inline";
     setSecurityHeaders(response);
+    if (renderHtml) {
+      // A response-level sandbox also isolates this document when opened outside the viewer iframe.
+      response.setHeader("Content-Security-Policy", "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'");
+    }
     response.setHeader("Accept-Ranges", "bytes");
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("Content-Type", contentType);
@@ -686,8 +827,8 @@ export class LocalFileViewerServer {
     response.end(headOnly ? undefined : body);
   }
 
-  private sendJavascript(response: ServerResponse, headOnly: boolean): void {
-    const body = Buffer.from(VIEWER_CLIENT_SCRIPT, "utf8");
+  private sendJavascript(response: ServerResponse, headOnly: boolean, source = VIEWER_CLIENT_SCRIPT): void {
+    const body = Buffer.from(source, "utf8");
     setSecurityHeaders(response);
     response.statusCode = 200;
     response.setHeader("Cache-Control", "no-store");
@@ -703,14 +844,14 @@ function renderViewerPage(input: {
   metadata: string[];
   actions: Array<{ href: string; label: string }>;
   content: string;
-  viewMode?: "markdown";
+  viewMode?: RenderedFileSnapshot["viewMode"];
   liveUpdates?: { eventsUrl: string; scriptPath: string };
 }): string {
   const metadata = renderMetadata(input.metadata);
   const actions = input.actions.length > 0
     ? `<nav class="actions">${input.actions.map((action) => `<a href="${escapeAttribute(action.href)}">${escapeHtml(action.label)}</a>`).join("")}</nav>`
     : "";
-  const viewSwitch = input.viewMode === "markdown"
+  const viewSwitch = input.viewMode
     ? '<div class="view-switch" id="viewer-view-switch" role="tablist" aria-label="预览模式"><button class="is-active" type="button" role="tab" aria-selected="true" data-view-mode-button="rendered">预览</button><button type="button" role="tab" aria-selected="false" data-view-mode-button="code">代码</button></div>'
     : "";
   const toolbar = viewSwitch || actions
@@ -787,6 +928,7 @@ function renderViewerPage(input: {
     .media img, .media video { max-width: 100%; max-height: calc(100vh - 70px); }
     .media audio { width: min(720px, 100%); }
     .document { width: 100%; height: calc(100vh - 70px); border: 0; border-radius: 0; background: #fff; }
+    .html-preview { display: block; width: 100%; height: calc(100dvh - var(--viewer-header-offset)); min-height: 240px; border: 0; background: #fff; color-scheme: normal; }
     .directory-list { overflow: hidden; border: 0; border-radius: 0; background: #fff; }
     .directory-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 18px; align-items: center; min-height: 44px; padding: 8px 14px; color: inherit; text-decoration: none; border-bottom: 1px solid #eceff3; }
     .directory-entry:last-child { border-bottom: 0; }
@@ -834,7 +976,7 @@ function renderViewerPage(input: {
     }
   </style>
 </head>
-<body${input.viewMode === "markdown" ? ' data-view-mode="rendered"' : ""}${liveAttributes}>
+<body${input.viewMode ? ' data-view-mode="rendered"' : ""}${liveAttributes}>
   <header id="viewer-header">
     <h1 id="viewer-title" data-file-path="${escapeAttribute(input.filePath)}">${escapeHtml(input.filePath)}</h1>
     <div class="meta"><span class="metadata-values" id="viewer-metadata">${metadata}</span>${toolbar}</div>
@@ -1221,7 +1363,7 @@ function writeServerSentEvent(response: ServerResponse, event: string, data: str
 }
 
 function setSecurityHeaders(response: ServerResponse): void {
-  response.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; media-src 'self'; object-src 'self'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'");
+  response.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; media-src 'self'; object-src 'self'; frame-src 'self'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'");
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("X-Content-Type-Options", "nosniff");
@@ -1234,6 +1376,13 @@ function escapeHtml(value: string): string {
 
 function escapeAttribute(value: string): string {
   return escapeHtml(value);
+}
+
+function normalizeTurnId(value: string): string | undefined {
+  const normalized = value.trim();
+  return normalized && normalized.length <= 256 && !normalized.includes("\0")
+    ? normalized
+    : undefined;
 }
 
 function errorPage(title: string, message: string): string {

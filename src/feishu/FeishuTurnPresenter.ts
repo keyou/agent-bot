@@ -51,6 +51,7 @@ export interface FeishuTurnPresenterOptions {
   onError?: (error: unknown) => void;
   finalRetryBackoffMs?: number[];
   localFileUrl?: LocalFileUrlResolver;
+  turnPreviewUrl?: (turnId: string) => string | undefined;
 }
 
 const MAX_FINAL_TABLES_PER_CARD = 5;
@@ -496,15 +497,30 @@ export class FeishuTurnPresenter {
   }
 
   private renderTurn(state: TurnViewState): Record<string, unknown> {
-    return this.renderer.renderTurn(normalizeTurnCardMarkdown(state, this.options.localFileUrl));
+    return this.renderer.renderTurn(
+      normalizeTurnCardMarkdown(state, this.options.localFileUrl),
+      this.turnPreviewUrl(state),
+    );
   }
 
   private renderTurnDetails(state: TurnViewState): Record<string, unknown> {
-    return this.renderer.renderTurnDetails(normalizeTurnCardMarkdown(state, this.options.localFileUrl));
+    return this.renderer.renderTurnDetails(
+      normalizeTurnCardMarkdown(state, this.options.localFileUrl),
+      this.turnPreviewUrl(state),
+    );
   }
 
   private renderActivityHistory(state: TurnViewState, page: number): Record<string, unknown> {
-    return this.renderer.renderActivityHistory(normalizeTurnCardMarkdown(state, this.options.localFileUrl), page);
+    return this.renderer.renderActivityHistory(
+      normalizeTurnCardMarkdown(state, this.options.localFileUrl),
+      page,
+    );
+  }
+
+  private turnPreviewUrl(state: TurnViewState): string | undefined {
+    return state.turnId.startsWith("pending_")
+      ? undefined
+      : this.options.turnPreviewUrl?.(state.turnId);
   }
 
   private startElapsedUpdates(entry: TurnEntry): void {

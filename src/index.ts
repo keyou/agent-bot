@@ -80,6 +80,7 @@ if (config.fileViewer.enabled) {
     port: config.fileViewer.port,
     publicBaseUrl: config.fileViewer.publicBaseUrl,
     stateDirectory: path.join(path.dirname(config.storage.sqlitePath), "file-viewer"),
+    getTurnSnapshot: (turnId) => store.getTurnSnapshot(turnId),
   });
   try {
     const address = await viewer.start();
@@ -116,6 +117,7 @@ if (feishuOutbound) {
     criticalGapMs: 500,
     onError: (error) => logger.warn({ error }, "Failed to update Agent progress card."),
     localFileUrl: (filePath, reference) => localFileViewer?.createFileUrl(filePath, reference),
+    turnPreviewUrl: (turnId) => localFileViewer?.createTurnPreviewUrl(turnId),
   });
   routes.push({ matches: (contextKey) => !contextKey.startsWith("console:"), outbound: feishuOutbound, presenter });
   const defaultAgentName = config.defaults.agent!;

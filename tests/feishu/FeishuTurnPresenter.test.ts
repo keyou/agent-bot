@@ -41,6 +41,59 @@ function createFixture(delivered = false, renderer?: CardRenderer) {
 }
 
 describe("FeishuTurnPresenter", () => {
+  test("shows requested details without claiming the live card or redelivering the answer", async () => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, {
+      criticalGapMs: 0,
+      turnPreviewUrl: (turnId) => `https://preview.example.test/${turnId}`,
+    });
+    presenter.registerSession("s1", "chat_id:c1");
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.flushAll();
+    const delivery = store.getTurnDelivery("turn_1");
+    const updates = vi.mocked(outbound.updateInteractiveCard).mock.calls.length;
+
+    await presenter.showDetails("chat_id:c1:thread_id:details", "turn_1");
+    expect(outbound.sendInteractiveCard).toHaveBeenLastCalledWith("chat_id:c1:thread_id:details", expect.any(Object));
+    const card = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("https://preview.example.test/turn_1");
+    expect(card).toContain("Turn: `turn_1`");
+    expect(store.getTurnDelivery("turn_1")).toEqual(delivery);
+    expect(outbound.updateInteractiveCard).toHaveBeenCalledTimes(updates);
+    expect(outbound.sendMarkdown).not.toHaveBeenCalled();
+
+    await presenter.onEvent(completed());
+    expect(outbound.sendMarkdown).toHaveBeenCalledExactlyOnceWith("chat_id:c1", "answer", expect.any(String));
+    await presenter.showDetails("chat_id:c1:thread_id:details", "turn_1");
+    expect(outbound.sendMarkdown).toHaveBeenCalledOnce();
+    await presenter.flushAll();
+  });
+
+  test("adds the stable Turn Preview URL after the pending Turn receives its App Server ID", async () => {
+    const outbound: FeishuOutbound = {
+      sendText: vi.fn(async () => "text_1"),
+      sendMarkdown: vi.fn(async () => "final_1"),
+      sendInteractiveCard: vi.fn(async () => "progress_1"),
+      updateInteractiveCard: vi.fn(async () => undefined),
+    };
+    const presenter = new FeishuTurnPresenter(outbound, new MemoryStore(), undefined, {
+      criticalGapMs: 0,
+      turnPreviewUrl: (turnId) => `https://preview.example.test/${turnId}`,
+    });
+    presenter.registerSession("s1", "chat_id:c1");
+
+    await presenter.startPendingTurn("s1", "chat_id:c1", undefined, undefined, "Preview this Turn");
+    expect(JSON.stringify((outbound.sendInteractiveCard as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]))
+      .not.toContain("preview.example.test");
+
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.flushAll();
+    const updated = JSON.stringify((outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]);
+    expect(updated).toContain("https://preview.example.test/turn_1");
+    expect(updated).toContain("Preview");
+  });
+
   test("creates one progress card and delivers a duplicated completion once", async () => {
     const { presenter, outbound, store } = createFixture();
     await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() - 1_000 });

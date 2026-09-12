@@ -5290,10 +5290,11 @@ describe("ProxySessionController", () => {
     let serialized = JSON.stringify(card);
     expect(serialized).toContain("运行设置");
     expect(serialized).toContain('"tag":"markdown","content":"Agent"');
-    expect(serialized).toContain('"tag":"markdown","content":"`codex` · Codex"');
-    expect(serialized).toContain('"tag":"markdown","content":"`acp` · ACP"');
-    expect(serialized).not.toContain("`codex` · Codex · Codex");
-    expect(serialized).not.toContain("`acp` · ACP · ACP");
+    expect(serialized).toContain('"tag":"markdown","content":"`codex`"');
+    expect(serialized).toContain('"tag":"markdown","content":"`acp`"');
+    expect(serialized).not.toContain("`codex` · Codex");
+    expect(serialized).not.toContain("`acp` · ACP");
+    expect(serialized).toContain("> 只影响新建任务，不切换当前任务。");
     expect(serialized).toContain('"action":"settings_agent_select"');
     expect(serialized).not.toContain('"tab":"model"');
     expect(serialized).not.toContain('"sessionId"');

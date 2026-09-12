@@ -5,6 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
+import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 
 const temporaryDirectories: string[] = [];
 const servers: LocalFileViewerServer[] = [];
@@ -106,8 +107,124 @@ describe("LocalFileViewerServer", () => {
     expect(script).toContain('button.addEventListener("click"');
     expect(script).toContain('document.body.dataset.viewMode = mode === "code" ? "code" : "rendered"');
     expect(script).toContain('if (/^#L\\d+$/u.test(window.location.hash)) document.body.dataset.viewMode = "code"');
-    expect(script).toContain('viewSwitch.hidden = update.viewMode !== "markdown"');
+    expect(script).toContain('viewSwitch.hidden = update.viewMode !== "markdown" && update.viewMode !== "html"');
   });
+
+  test.each([".html", ".htm", ".HTML"])("previews %s in a sandbox while retaining source and raw downloads", async (extension) => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, `report & notes${extension}`);
+    const source = '<!doctype html>\n<style>body { color: green; }</style>\n<h1>Report</h1>\n<script>document.body.dataset.ready = "yes";</script>';
+    fs.writeFileSync(filePath, source, "utf8");
+    const server = await startServer(directory);
+    const response = await fetch(server.createFileUrl(filePath, ":3")!);
+    const page = await response.text();
+    expect(page).toContain('<body data-view-mode="rendered"');
+    expect(page).toContain('id="viewer-view-switch"');
+    expect(page).toContain('data-view-mode-button="code">代码</button>');
+    expect(page).toContain('sandbox="allow-scripts" referrerpolicy="no-referrer"');
+    expect(page).not.toContain("allow-same-origin");
+    expect(page).not.toContain('<script>document.body.dataset.ready = "yes";</script>');
+    expect(page).toContain('<section data-view-panel="code"><pre class="code hljs">');
+    expect(page).toContain('id="L3"');
+    expect(response.headers.get("content-security-policy")).toContain("frame-src 'self'");
+    expect(response.headers.get("content-security-policy")).toContain("script-src 'self'");
+
+    const renderUrl = htmlFrameUrl(page);
+    expect(new URL(renderUrl).searchParams.get("render")).toBe("html");
+    const rendered = await fetch(renderUrl);
+    expect(rendered.status).toBe(200);
+    expect(await rendered.text()).toBe(source);
+    expect(rendered.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    const policy = rendered.headers.get("content-security-policy");
+    expect(policy).toContain("sandbox allow-scripts;");
+    expect(policy).toContain("default-src 'none'");
+    expect(policy).toContain("script-src 'unsafe-inline'");
+    expect(policy).toContain("form-action 'none'");
+    expect(policy).not.toContain("allow-same-origin");
+    const head = await fetch(renderUrl, { method: "HEAD" });
+    expect(head.headers.get("content-security-policy")).toBe(policy);
+    expect(head.headers.get("content-length")).toBe(String(Buffer.byteLength(source)));
+    expect(await head.text()).toBe("");
+
+    const rawUrl = new URL(renderUrl);
+    rawUrl.searchParams.delete("render");
+    rawUrl.searchParams.set("raw", "1");
+    rawUrl.searchParams.set("download", "1");
+    const raw = await fetch(rawUrl);
+    expect(await raw.text()).toBe(source);
+    expect(raw.headers.get("content-disposition")).toContain("attachment;");
+    expect(raw.headers.get("content-security-policy")).not.toContain("script-src 'unsafe-inline'");
+
+    const tampered = new URL(renderUrl);
+    tampered.searchParams.set("path", path.join(directory, "secret.html"));
+    expect((await fetch(tampered)).status).toBe(403);
+  });
+
+  test("keeps full HTML rendering separate from the truncated source preview", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "large.html");
+    const source = `<!doctype html><body>${" ".repeat(2 * 1024 * 1024)}<p>Full document tail</p></body>`;
+    fs.writeFileSync(filePath, source, "utf8");
+    const server = await startServer(directory);
+    const page = await (await fetch(server.createFileUrl(filePath)!)).text();
+    expect(page).toContain('<section data-view-panel="code"><div class="notice">');
+    expect(page).not.toContain("Full document tail");
+    expect(await (await fetch(htmlFrameUrl(page))).text()).toBe(source);
+  });
+
+  test("preserves the encoding of HTML documents", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "encoded.html");
+    const source = Buffer.from('\ufeff<!doctype html><h1>中文报告</h1>', "utf16le");
+    fs.writeFileSync(filePath, source);
+    const server = await startServer(directory);
+    const page = await (await fetch(server.createFileUrl(filePath)!)).text();
+    expect(page).toContain("中文报告");
+    const rendered = await fetch(htmlFrameUrl(page));
+    expect(rendered.headers.get("content-type")).toBe("text/html; charset=utf-16le");
+    expect(Buffer.from(await rendered.arrayBuffer())).toEqual(source);
+  });
+
+  test.each([
+    ["report.txt", Buffer.from("<h1>Not HTML</h1>")],
+    ["binary.html", Buffer.from([0, 1, 2, 3, 4, 5])],
+  ])("does not enable HTML rendering for %s", async (fileName, source) => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, fileName);
+    fs.writeFileSync(filePath, source);
+    const server = await startServer(directory);
+    const url = new URL(server.createFileUrl(filePath)!);
+    expect(await (await fetch(url)).text()).not.toContain('<iframe class="html-preview"');
+    url.searchParams.set("render", "html");
+    const response = await fetch(url);
+    expect(response.status).toBe(400);
+    expect(response.headers.get("content-security-policy")).not.toContain("script-src 'unsafe-inline'");
+  });
+
+  test("streams updated HTML frame URLs and source without leaving preview mode", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "live.html");
+    fs.writeFileSync(filePath, "<h1>First</h1>", "utf8");
+    const server = await startServer(directory);
+    const page = await (await fetch(server.createFileUrl(filePath)!)).text();
+    const eventsUrl = /data-events-url="([^"]+)"/u.exec(page)![1]!.replaceAll("&amp;", "&");
+    const controller = new AbortController();
+    try {
+      const events = createServerSentEventReader(await fetch(eventsUrl, { signal: controller.signal }));
+      const initial = JSON.parse(await events.next("update"));
+      expect(initial.viewMode).toBe("html");
+      expect(htmlFrameUrl(initial.content)).toBe(htmlFrameUrl(page));
+      fs.writeFileSync(filePath, "<h1>Updated report</h1>", "utf8");
+      const update = JSON.parse(await events.next("update"));
+      expect(update.viewMode).toBe("html");
+      expect(update.content).toContain('data-view-panel="code"');
+      expect(update.content).toContain("Updated report");
+      expect(htmlFrameUrl(update.content)).not.toBe(htmlFrameUrl(initial.content));
+      expect(await (await fetch(htmlFrameUrl(update.content))).text()).toBe("<h1>Updated report</h1>");
+    } finally {
+      controller.abort();
+    }
+  }, 10_000);
 
   test("wraps Markdown tables in scroll regions without squeezing cells or changing alignment", async () => {
     const directory = createTemporaryDirectory();
@@ -450,12 +567,120 @@ describe("LocalFileViewerServer", () => {
     expect((await fetch(persistentUrl)).status).toBe(200);
     expect(fs.readFileSync(path.join(directory, "port"), "utf8").trim()).toBe(String(firstAddress.port));
   });
+
+  test("serves signed live Turn previews from persisted presentation snapshots", async () => {
+    const directory = createTemporaryDirectory();
+    const changedFile = "changed & reviewed.ts";
+    fs.writeFileSync(path.join(directory, changedFile), "export const previewChange = 1;\n");
+    let snapshot: TurnViewState = {
+      sessionId: "session_1",
+      turnId: "turn_1",
+      projectCwd: directory,
+      prompt: "检查 <preview> & SSE",
+      status: "running",
+      startedAt: Date.now() - 2_000,
+      assistantText: "",
+      plan: [{ text: "读取代码", status: "in_progress" }],
+      activities: [{ kind: "assistant", id: "commentary:1", text: "正在检查入口。" }],
+      totalToolCount: 0,
+      completedTools: [],
+      failedTools: [],
+      fileSummary: [{ path: changedFile, additions: 1 }],
+    };
+    const server = new LocalFileViewerServer({
+      host: "127.0.0.1",
+      port: 0,
+      stateDirectory: directory,
+      getTurnSnapshot: (turnId) => turnId === snapshot.turnId ? snapshot : undefined,
+      turnPreviewPollIntervalMs: 20,
+    });
+    servers.push(server);
+    await server.start();
+
+    const previewUrl = server.createTurnPreviewUrl("turn_1");
+    expect(previewUrl).toBeDefined();
+    const pageResponse = await fetch(previewUrl!, { headers: { "Accept-Language": "zh-CN" } });
+    const page = await pageResponse.text();
+    expect(pageResponse.status).toBe(200);
+    expect(page).toContain("检查 &lt;preview&gt; &amp; SSE");
+    expect(page).toContain("正在检查入口。");
+    expect(page).toContain("实时更新");
+    expect(page).not.toContain("检查 <preview> & SSE");
+    const fileUrl = /class="file-link" href="([^"]+)"/u.exec(page)?.[1]?.replaceAll("&amp;", "&");
+    expect(fileUrl).toBe(server.createFileUrl(path.join(directory, changedFile)));
+    const fileResponse = await fetch(fileUrl!);
+    expect(fileResponse.status).toBe(200);
+    expect(await fileResponse.text()).toContain("previewChange");
+
+    const eventsUrl = /data-events-url="([^"]+)"/u.exec(page)?.[1]?.replaceAll("&amp;", "&");
+    expect(eventsUrl).toBeDefined();
+    const controller = new AbortController();
+    try {
+      const events = createServerSentEventReader(await fetch(eventsUrl!, {
+        signal: controller.signal,
+        headers: { "Accept-Language": "zh-CN" },
+      }));
+      const initial = JSON.parse(await events.next("update")) as { content: string; terminal: boolean };
+      expect(initial.content).toContain("正在检查入口。");
+      expect(initial.terminal).toBe(false);
+
+      snapshot = {
+        ...snapshot,
+        status: "completed",
+        completedAt: Date.now(),
+        durationMs: 2_500,
+        finalResponse: "完成 **Preview**。",
+        activities: [
+          ...snapshot.activities,
+          {
+            kind: "tool",
+            id: "tool_1",
+            tool: {
+              id: "tool_1",
+              title: "npm test",
+              kind: "command",
+              status: "completed",
+              command: "/bin/zsh -lc 'npm test'",
+              output: "all passed",
+              files: [{ path: changedFile, additions: 1 }],
+              startedAt: Date.now() - 1_500,
+              completedAt: Date.now(),
+            },
+          },
+        ],
+        totalToolCount: 1,
+        completedToolCount: 1,
+      };
+      const update = JSON.parse(await events.next("update")) as { content: string; terminal: boolean };
+      expect(update.content).toContain("npm test");
+      expect(update.content).toContain("all passed");
+      expect(update.content).not.toContain("/bin/zsh -lc");
+      expect(update.content).toContain("耗时 00:01");
+      expect(update.content).toContain("完成 <strong>Preview</strong>。");
+      expect(update.terminal).toBe(true);
+      expect(update.content.match(/class="file-link"/gu)).toHaveLength(2);
+      expect(update.content).toContain(`href="${fileUrl!.replaceAll("&", "&amp;")}"`);
+    } finally {
+      controller.abort();
+    }
+
+    const tampered = new URL(previewUrl!);
+    tampered.searchParams.set("turn", "turn_2");
+    expect((await fetch(tampered)).status).toBe(403);
+    expect(server.createTurnPreviewUrl("\0invalid")).toBeUndefined();
+  }, 10_000);
 });
 
 function createTemporaryDirectory(): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-file-viewer-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+function htmlFrameUrl(page: string): string {
+  const url = /<iframe class="html-preview"[^>]+src="([^"]+)"/u.exec(page)?.[1];
+  expect(url).toBeDefined();
+  return url!.replaceAll("&amp;", "&");
 }
 
 async function startServer(stateDirectory: string): Promise<LocalFileViewerServer> {

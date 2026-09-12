@@ -53,6 +53,39 @@ function state(): TurnViewState {
 }
 
 describe("CardRenderer", () => {
+  test("identifies a requested Turn and links its saved runtime details to Preview", () => {
+    const serialized = JSON.stringify(new CardRenderer().renderTurnDetails({
+      ...state(), status: "completed", assistantText: "Completed result",
+    }, "https://preview.example.test/turn_1"));
+    expect(serialized).toContain("Turn: `turn_1`");
+    expect(serialized).toContain("检查卡片渲染");
+    expect(serialized).toContain("npm test");
+    expect(serialized).toContain("Completed result");
+    expect(serialized).toContain("https://preview.example.test/turn_1");
+    expect(serialized).not.toContain('"action":"turn_reset"');
+    expect(serialized).not.toContain('"action":"stop"');
+  });
+
+  test("renders Preview to the right of Stop using the same text action style", () => {
+    const previewUrl = "https://preview.example.test/turn/turn_1";
+    const card = new CardRenderer().renderTurn(state(), previewUrl);
+    const actions = collectObjects(card).filter((item) => item.tag === "interactive_container");
+    const stopIndex = actions.findIndex((item) => JSON.stringify(item).includes("Stop"));
+    const previewIndex = actions.findIndex((item) => JSON.stringify(item).includes("Preview"));
+
+    expect(stopIndex).toBeGreaterThanOrEqual(0);
+    expect(previewIndex).toBe(stopIndex + 1);
+    expect(actions[previewIndex]).toMatchObject({
+      has_border: false,
+      behaviors: [{ type: "open_url", default_url: previewUrl }],
+    });
+    expect(JSON.stringify(actions[previewIndex])).toContain("color='blue'");
+    expect(collectObjects(card).some((item) => item.tag === "markdown"
+      && item.content === "<font color='grey'>·</font>")).toBe(true);
+    expect(collectObjects(card).some((item) => item.tag === "button"
+      && JSON.stringify(item).includes("Preview"))).toBe(false);
+  });
+
   test("renders waiting and completed App Server release cards", () => {
     const renderer = new CardRenderer();
     const waiting = renderer.renderAppServerRelease({
@@ -363,6 +396,91 @@ describe("CardRenderer", () => {
       .filter((item) => item.tag === "markdown")
       .every((label) => label.text_align === "center" && label.text_size === "notation")).toBe(true);
     expect(JSON.stringify(tabRow)).toContain("Permission");
+  });
+
+  test.each([
+    ["agent", "只影响新建任务，不切换当前任务。", { agent: "traex" }],
+    ["provider", "只影响当前任务，需空闲时切换。", { provider: "ai_coding" }],
+    ["model", "只影响当前任务，下一轮生效。", { model: "gpt-next" }],
+    ["thinking", "只影响当前任务，下一轮生效。", { model: "gpt-test", effort: "low" }],
+    ["permission", "只影响当前任务，下一轮生效。", { permissionMode: "confirm" }],
+  ] as const)("ends %s settings with one concise blockquote without changing callbacks", (activeTab, effect, selectedValue) => {
+    const card = new CardRenderer().renderExecutionSettings({
+      sessionId: "session_1",
+      contextKey: "chat_id:c1",
+      activeTab,
+      currentAgent: "codex",
+      taskAgent: "traex",
+      agents: [
+        { name: "codex", title: "Codex" },
+        { name: "traex", title: "TraeX" },
+      ],
+      runtimeSettingsAvailable: true,
+      currentProvider: "openai",
+      currentModel: "gpt-test",
+      currentEffort: "high",
+      currentPermissionMode: "auto",
+      providers: [
+        { id: "openai", displayName: "OpenAI", isDefault: true },
+        { id: "ai_coding", displayName: "AI Coding" },
+      ],
+      providerSupported: true,
+      models: [
+        { id: "gpt-test", supportedReasoningEfforts: [], isDefault: true },
+        { id: "gpt-next", supportedReasoningEfforts: [] },
+      ],
+      reasoningOptions: [{ value: "high" }, { value: "low" }],
+    });
+    const objects = collectObjects(card);
+    const notes = objects.filter((item) => item.tag === "markdown"
+      && String(item.content).startsWith("> "));
+    expect(notes).toEqual([{ tag: "markdown", content: `> ${effect}` }]);
+    const elements = (card.body as { elements: Array<Record<string, unknown>> }).elements;
+    expect(elements.at(-1)).toBe(notes[0]);
+    expect(JSON.stringify(card)).not.toContain("同时保存为该 Agent 的默认设置");
+    expect(objects).toContainEqual({
+      action: `settings_${activeTab}_select`,
+      sessionId: "session_1",
+      contextKey: "chat_id:c1",
+      ...selectedValue,
+    });
+    const content = objects.filter((item) => item.tag === "markdown")
+      .map((item) => String(item.content ?? "")).join("\n");
+    expect(content).toContain("**默认 Agent / 当前任务 Agent**：`codex` / `traex`");
+    expect(content).toContain("当前");
+    if (activeTab === "agent") {
+      expect(content).toContain("`traex`");
+      expect(content).not.toContain("Codex");
+      expect(content).not.toContain("TraeX");
+    }
+    if (activeTab === "provider") {
+      expect(content).toContain("`openai` · 默认");
+      expect(content).toContain("`ai_coding`");
+      expect(content).not.toContain("OpenAI");
+      expect(content).not.toContain("AI Coding");
+    }
+  });
+
+  test("explains the default Agent setting without an existing task", () => {
+    const card = new CardRenderer().renderExecutionSettings({
+      contextKey: "chat_id:c1",
+      activeTab: "agent",
+      currentAgent: "codex",
+      agents: [{ name: "codex", title: "Codex" }, { name: "traex", title: "TraeX" }],
+      runtimeSettingsAvailable: false,
+      currentPermissionMode: "auto",
+      providers: [],
+      providerSupported: false,
+      models: [],
+      reasoningOptions: [],
+    });
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain("> 只影响新建任务，不切换当前任务。");
+    expect(serialized).not.toContain("同时保存为该 Agent 的默认设置");
+    expect(serialized).not.toContain("当前任务 Agent");
+    expect(collectObjects(card)).toContainEqual({
+      action: "settings_agent_select", contextKey: "chat_id:c1", agent: "traex",
+    });
   });
 
   test("renders ACP permission buttons in English regardless of supplied names", () => {
@@ -1421,6 +1539,36 @@ describe("CardRenderer", () => {
     expect(card.header.subtitle.content).toContain("778 个工具");
   });
 
+  test("shows context compaction as an activity inside the thinking card", () => {
+    const renderer = new CardRenderer();
+    const running = renderer.renderTurn({
+      ...state(),
+      contextCompactionStatus: "running",
+      activities: [{
+        kind: "assistant",
+        id: "context-compaction:compact_1",
+        text: "Codex 正在压缩上下文（压缩前 228,188 tokens）…",
+      }],
+    }) as { header: { subtitle: { content: string } } };
+    const completed = renderer.renderTurn({
+      ...state(),
+      contextCompactionStatus: "completed",
+      contextCompactionCount: 2,
+      activities: [{
+        kind: "assistant",
+        id: "context-compaction:compact_2",
+        text: "Codex 已完成本轮第 2 次上下文压缩 · 耗时 02:43 · 上下文 228,188 → 72,373 tokens（减少 68%），继续处理。",
+      }],
+    }) as { header: { subtitle: { content: string } } };
+
+    expect(running.header.subtitle.content).not.toContain("压缩上下文");
+    expect(completed.header.subtitle.content).not.toContain("上下文压缩");
+    expect(JSON.stringify(running)).toContain("Codex 正在压缩上下文（压缩前 228,188 tokens）…");
+    expect(JSON.stringify(completed)).toContain(
+      "Codex 已完成本轮第 2 次上下文压缩 · 耗时 02:43 · 上下文 228,188 → 72,373 tokens（减少 68%），继续处理。",
+    );
+  });
+
   test.each([
     [12_400, "12.4s"],
     [72_400, "01:12.4s"],
@@ -1999,6 +2147,8 @@ describe("CardRenderer", () => {
       body: { elements: Array<Record<string, unknown>> };
     };
     expect(detailsCard.body.elements).toEqual([
+      { tag: "markdown", content: "Turn: `turn_1`" },
+      { tag: "markdown", content: "**Prompt**\n检查卡片渲染" },
       { tag: "markdown", content: "正在组织回答" },
       { tag: "hr" },
       { tag: "markdown", content: "**回答**\n正在组织回答正文" },
