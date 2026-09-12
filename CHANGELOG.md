@@ -6,6 +6,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Preserve Windows separators, underscores, and Markdown delimiters as literal text in file-change paths, including `\__init__.py`, without changing card layout.
+- Render local Markdown images and links in Turn previews through signed file URLs, including live updates and paths relative to the task project directory.
+- Improve Turn preview readability with regular-weight message text, scrollable tool commands capped at 15 visible lines, and subtle tool scrollbars.
+
 ## [0.1.21] - 2026-09-12
 
 - Track Turn models, complete tool logs, and live context-compaction progress with timing and token changes; show task Turn counts and rollout disk usage through summary-only history and file metadata reads.

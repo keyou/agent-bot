@@ -298,7 +298,9 @@ Local non-image files and directories referenced in Agent replies become signed,
 
 Progress cards include a `Preview` button that opens the saved Turn timeline in a compact, mobile-friendly browser view. Consecutive native reasoning entries share one collapsed section. Commands are shown in a code-style header, outputs are collapsed, and identical output/error logs appear once. Tool status, start time, and duration appear on the output row. Running Turns update live while preserving your expanded or collapsed steps. Click a file in the file changes or tool file list to preview its current contents in a new tab; deleted or unavailable files remain plain text. Turn previews use the same signed viewer address and access rules as local file links.
 
-The compact Turn Preview header uses dot-separated values, keeps the duration label, and abbreviates token counts with K, M, and B units. It wraps to fit narrow screens. Commentary text is bold. Tool commands and outputs preserve line breaks and indentation; long lines scroll horizontally within the tool block without wrapping.
+The compact Turn Preview header uses dot-separated values, keeps the duration label, and abbreviates token counts with K, M, and B units. It wraps to fit narrow screens. Prompt, Commentary, and result text use a regular weight and a slightly larger font than tool calls. Tool commands and outputs preserve line breaks and indentation; long lines scroll horizontally within the tool block without wrapping. Commands show up to 15 lines at a time; scroll vertically within the command area to see the rest. Thin, subtle scrollbars have no arrow buttons. On desktop they appear on hover or keyboard focus; on touch devices they remain available for scrolling.
+
+Local images in Turn Preview Prompts, Commentary, and results load through signed file URLs, including live updates. Relative image paths resolve from the task's project directory.
 
 Markdown previews keep table cells at their content width. Wide tables scroll horizontally within the preview instead of squeezing columns on narrow screens, and live updates preserve each table's horizontal scroll position.
 
@@ -321,6 +323,8 @@ By default, `feishu.respondToOwnerOnly: true` accepts only messages and card act
 Agent Bot responds to ordinary owner messages in groups containing the bot. Set `feishu.respondToAllGroupMessages` to `false` to additionally require the owner to @ the bot in groups; private chats are unchanged. Initialization requests the manually published all-group-message permission only when this option is enabled. After changing it from `false` to `true`, rerun `agentbot init` and complete the final permission step.
 
 Thinking cards use the grouped layout by default: auxiliary Commentary and user steering remain visible, while each execution group shows only its latest native reasoning and expands to reveal complete tool commands and results. Common PowerShell, zsh, bash, and sh launcher prefixes are omitted from the displayed commands. A failed tool remains marked inside its own tool panel but does not turn the complete execution group red or give the group a failure icon. Execution groups start collapsed and keep stable component identities so a group manually opened in Feishu stays open across card updates. When Codex compacts its context, the card shows the live compaction state as a progress activity, including elapsed time, before/after context token counts, executed Turn count, and rollout disk usage when available. On long turns, pagination measures the fully rendered card content instead of using fixed message or tool counts. Set `feishu.thinkingCardLayout` to `timeline` to temporarily restore the original layout.
+
+File-change summaries display paths as plain text, preserving Windows separators and literal underscores (including `\__init__.py`) instead of interpreting them as Markdown formatting.
 
 ## Troubleshooting
 
