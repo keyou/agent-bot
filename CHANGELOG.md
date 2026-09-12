@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-09-12
+
 - Track Turn models, complete tool logs, and live context-compaction progress with timing and token changes; show task Turn counts and rollout disk usage through summary-only history and file metadata reads.
 - Accept a Turn ID or one-based history index after `/turn` or `/turns` to show saved runtime details without changing task execution, using only necessary summary pages for missing records and respecting Fork ancestry.
 - Include all Providers when listing and searching App Server tasks, fixing missing tasks after switching to a non-default Provider while preserving pagination and summary-only reads.
