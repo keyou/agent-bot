@@ -73,6 +73,17 @@ export type AgentEvent =
       turnId: string;
       lastTokens: number;
       cumulativeTokens: number;
+      contextTokens?: number;
+    }
+  | {
+      type: "context_compaction";
+      sessionId: string;
+      turnId: string;
+      phase: "started" | "completed";
+      compactionId?: string;
+      timestampMs?: number;
+      turnCount?: number;
+      storageBytes?: number;
     }
   | {
       type: "progress";
@@ -156,6 +167,11 @@ export interface RemoteSessionActivity {
   activeTurnId?: string;
 }
 
+export interface RemoteSessionMetrics {
+  turnCount: number;
+  storageBytes?: number;
+}
+
 export interface RuntimeSession {
   localSessionId: string;
   remoteSessionId: string;
@@ -237,6 +253,7 @@ export interface AgentRuntime {
   readSessionMetadata(remoteSessionId: string): Promise<RuntimeSessionMetadata>;
   listRemoteSessions?(input?: { searchTerm?: string; cursor?: string; limit?: number }): Promise<RemoteSessionPage>;
   readRemoteSession?(remoteSessionId: string, view?: "metadata" | "latest" | "latest-full"): Promise<RemoteSessionSummary>;
+  readRemoteSessionMetrics?(remoteSessionId: string): Promise<RemoteSessionMetrics>;
   readRemoteForkSource?(remoteSessionId: string): Promise<RemoteSessionSummary>;
   listRemoteTurnSummaries?(remoteSessionId: string, input: { cursor?: string; limit: number }): Promise<RemoteTurnPage>;
   inspectRemoteSessionActivity?(remoteSessionId: string): Promise<RemoteSessionActivity>;
@@ -261,7 +278,7 @@ export interface AgentRuntime {
     persist?: (session: RuntimeSession) => Promise<void>,
   ): Promise<RuntimeSession>;
   respondToApproval(sessionId: string, requestId: string, decision: ApprovalDecision): Promise<void>;
-  listModels(): Promise<ModelOption[]>;
+  listModels(modelProvider?: string, fallbackModel?: string): Promise<ModelOption[]>;
   listModelProviders?(): Promise<ModelProviderOption[]>;
   release?(options?: { force?: boolean }): Promise<RuntimeReleaseResult>;
   onEvent(listener: (event: RuntimeEvent) => void): () => void;

@@ -15,10 +15,13 @@ export class ConsoleTurnPresenter implements TurnPresenter {
     _taskTitle?: string,
     _projectCwd?: string,
     agentLabel?: string,
+    _model?: string,
   ): void {
     this.contexts.set(sessionId, contextKey);
     if (agentLabel) this.agentLabels.set(sessionId, agentLabel);
   }
+
+  updateSessionModel(): void {}
 
   updateSessionTitle(): void {}
 

@@ -37,6 +37,7 @@ describe("StateStore runtime metadata", () => {
       expect(index).toHaveLength(20);
       expect(index[0]).toMatchObject({ turnId: "turn_20", parentTurnId: "turn_19" });
       expect(index[0]).not.toHaveProperty("snapshot");
+      expect(store.countTaskTurns("large")).toBe(20);
       expect(store.getTurnPromptSummary("turn_20")).toMatchObject({ prompt: "Prompt 20", completedAt: 21 });
       expect(parse.mock.calls.some(([value]) => value.includes("large-output"))).toBe(false);
     } finally {

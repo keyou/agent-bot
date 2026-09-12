@@ -20,6 +20,18 @@ afterEach(() => {
 });
 
 describe("CodexProcessManager", () => {
+  test("resolves Agent-specific environment values before inherited values", () => {
+    vi.stubEnv("INHERITED_PROVIDER_KEY", "parent-value");
+    vi.stubEnv("OVERRIDDEN_PROVIDER_KEY", "parent-value");
+    const manager = new CodexProcessManager("codex", ["app-server"], {
+      OVERRIDDEN_PROVIDER_KEY: "agent-value",
+    }, logger());
+
+    expect(manager.getEnvironmentVariable("INHERITED_PROVIDER_KEY")).toBe("parent-value");
+    expect(manager.getEnvironmentVariable("OVERRIDDEN_PROVIDER_KEY")).toBe("agent-value");
+    expect(manager.getEnvironmentVariable("MISSING_PROVIDER_KEY")).toBeUndefined();
+  });
+
   test.each(["0.153.3", "0.153.4-alpha.1", undefined])("rejects unsupported Codex %s before exposing a client", async (version) => {
     const process = fakeChildProcess();
     mocks.spawnStdioCommand.mockReturnValue(process.child);

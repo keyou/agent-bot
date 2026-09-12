@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import type { Logger } from "pino";
 import type {
   AgentRuntime,
@@ -9,6 +10,7 @@ import type {
   ModelProviderOption,
   PermissionMode,
   RemoteSessionActivity,
+  RemoteSessionMetrics,
   RemoteSessionPage,
   RemoteSessionSummary,
   RemoteTurnPage,
@@ -30,6 +32,7 @@ import { CodexLocalActivityDetector } from "./CodexLocalActivityDetector.js";
 import { detectProjectlessWorkspace } from "./ProjectlessWorkspace.js";
 import { threadWriterLockPath } from "./ThreadWriterProcess.js";
 import { assertProviderSettingsApplied, PROVIDER_SWITCH_BUSY, providerSwitchFailure } from "./ProviderSwitch.js";
+import { fetchProviderModels, type ProviderModelConfig } from "./ProviderModels.js";
 
 const WINDOWS_SCREENSHOT_DEVELOPER_INSTRUCTIONS = [
   "When capturing any screenshot on Windows, use one fresh process and make it Per-Monitor DPI Aware V2 before loading System.Windows.Forms, System.Drawing, or UI Automation, and before calling any screen, window, or bounds API.",
@@ -66,6 +69,7 @@ export interface AppServerClientProvider {
   getAgentFamily?(): "codex" | "traex" | undefined;
   getProcessInfo?(): AgentProcessInfo;
   getCodexHome?(): string;
+  getEnvironmentVariable?(name: string): string | undefined;
   onDisconnect?(listener: (error: Error) => void): () => void;
   release?(): Promise<void>;
   close(): void;
@@ -80,6 +84,9 @@ interface CodexSession extends RuntimeSession {
   needsResume: boolean;
   canReplaceEmptyThread: boolean;
   settingsRecoveryError?: string;
+  rolloutPath?: string;
+  turnCount?: number;
+  knownTurnIds: Set<string>;
 }
 
 interface PendingApproval {
@@ -291,6 +298,8 @@ export class CodexRuntime implements AgentRuntime {
         limit: input.limit ?? 20,
         sortKey: this.provider.getAgentFamily?.() === "traex" ? "updated_at" : "recency_at",
         sortDirection: "desc",
+        // Omitting this filter only lists the App Server's current Provider.
+        modelProviders: [],
         sourceKinds: USER_RESUMABLE_THREAD_SOURCE_KINDS,
         archived: false,
         searchTerm: input.searchTerm,
@@ -310,6 +319,53 @@ export class CodexRuntime implements AgentRuntime {
     const turns = view === "metadata" ? []
       : await this.readLatestThreadTurns(client, remoteSessionId, view === "latest-full" ? "full" : "summary");
     return this.decorateRemoteSession(remoteSessionId, remoteSessionSummary({ ...response.thread, turns }));
+  }
+
+  async readRemoteSessionMetrics(remoteSessionId: string): Promise<RemoteSessionMetrics> {
+    const client = await this.client();
+    const metadata = await client.request<ThreadReadResponse>(
+      "thread/read", { threadId: remoteSessionId, includeTurns: false }, SYNC_REQUEST_TIMEOUT_MS,
+    );
+    const { turnCount, turnIds } = await this.countRemoteTurns(client, remoteSessionId);
+    const rolloutPath = stringValue(metadata.thread.path)?.trim() || undefined;
+    const loaded = [...this.sessions.values()].filter((session) => session.remoteSessionId === remoteSessionId);
+    for (const session of loaded) {
+      session.rolloutPath = rolloutPath ?? session.rolloutPath;
+      const knownTurnIds = new Set(turnIds);
+      if (session.activeTurnId && !knownTurnIds.has(session.activeTurnId)) knownTurnIds.add(session.activeTurnId);
+      session.knownTurnIds = knownTurnIds;
+      session.turnCount = knownTurnIds.size;
+    }
+    const effectivePath = rolloutPath ?? loaded[0]?.rolloutPath;
+    return {
+      turnCount: loaded[0]?.turnCount ?? turnCount,
+      storageBytes: rolloutStorageBytes(effectivePath),
+    };
+  }
+
+  private async countRemoteTurns(
+    client: AppServerClient,
+    remoteSessionId: string,
+  ): Promise<{ turnCount: number; turnIds: Set<string> }> {
+    const turnIds = new Set<string>();
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.readTurnPage(client, remoteSessionId, {
+        cursor,
+        limit: 100,
+        itemsView: "summary",
+      }, CONTROL_REQUEST_TIMEOUT_MS);
+      for (const turn of page.data) turnIds.add(turn.id);
+      const nextCursor = page.nextCursor ?? undefined;
+      if (!nextCursor) break;
+      if (nextCursor === cursor || seenCursors.has(nextCursor)) {
+        throw new Error("App Server repeated a Turn history cursor while counting task Turns.");
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+    return { turnCount: turnIds.size, turnIds };
   }
 
   async listRemoteTurnSummaries(
@@ -698,7 +754,43 @@ export class CodexRuntime implements AgentRuntime {
     this.emit({ type: "approval_resolved", sessionId, turnId: pending.turnId, requestId, decision });
   }
 
-  async listModels(): Promise<ModelOption[]> {
+  async listModels(modelProvider?: string, fallbackModel?: string): Promise<ModelOption[]> {
+    const requestedProvider = modelProvider?.trim();
+    if (!requestedProvider
+      || (requestedProvider === BUILT_IN_CODEX_PROVIDER_ID && this.provider.getAgentFamily?.() !== "traex")) {
+      return this.listCatalogModels();
+    }
+    const config = await this.readConfig();
+    const configuredProviders = isRecord(config.model_providers) ? config.model_providers : {};
+    const providerConfig = configuredProviders[requestedProvider];
+    let catalog: ModelOption[] = [];
+    try {
+      catalog = await this.listCatalogModels();
+    } catch (error) {
+      this.logger.warn({ error, modelProvider: requestedProvider },
+        "Failed to read the App Server model catalog while discovering Provider models.");
+    }
+    const configuredDefaultModel = stringValue(config.model_provider)?.trim() === requestedProvider
+      ? stringValue(config.model)?.trim()
+      : undefined;
+    try {
+      return await fetchProviderModels({
+        providerId: requestedProvider,
+        config: (isRecord(providerConfig) ? providerConfig : {}) as ProviderModelConfig,
+        catalog,
+        configuredDefaultModel,
+        environmentValue: (name) => this.provider.getEnvironmentVariable?.(name) ?? process.env[name],
+      });
+    } catch (error) {
+      const fallback = fallbackProviderModel(catalog, fallbackModel, configuredDefaultModel);
+      if (!fallback) throw error;
+      this.logger.warn({ error, modelProvider: requestedProvider, fallbackModel: fallback.id },
+        "Provider model discovery failed; using the current or configured model as a fallback.");
+      return [fallback];
+    }
+  }
+
+  private async listCatalogModels(): Promise<ModelOption[]> {
     const response = await (await this.client()).request<{
       data: Array<{
         id: string;
@@ -724,12 +816,7 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async listModelProviders(): Promise<ModelProviderOption[]> {
-    const response = await (await this.client()).request<{ config?: Record<string, unknown> }>(
-      "config/read",
-      {},
-      CONTROL_REQUEST_TIMEOUT_MS,
-    );
-    const config = response.config ?? {};
+    const config = await this.readConfig();
     const defaultProvider = stringValue(config.model_provider)?.trim();
     const configuredProviders = isRecord(config.model_providers) ? config.model_providers : {};
     const providers = new Map<string, ModelProviderOption>();
@@ -755,6 +842,15 @@ export class CodexRuntime implements AgentRuntime {
     return [...providers.values()].sort((left, right) =>
       Number(Boolean(right.isDefault)) - Number(Boolean(left.isDefault)) || left.id.localeCompare(right.id),
     );
+  }
+
+  private async readConfig(): Promise<Record<string, unknown>> {
+    const response = await (await this.client()).request<{ config?: Record<string, unknown> }>(
+      "config/read",
+      {},
+      CONTROL_REQUEST_TIMEOUT_MS,
+    );
+    return response.config ?? {};
   }
 
   onEvent(listener: (event: RuntimeEvent) => void): () => void {
@@ -890,6 +986,18 @@ export class CodexRuntime implements AgentRuntime {
         turnId: mapped.turnId,
         lastTokens: mapped.lastTokens,
         cumulativeTokens: mapped.cumulativeTokens,
+        contextTokens: mapped.contextTokens,
+      });
+    } else if (mapped.kind === "context_compaction") {
+      this.emit({
+        type: "context_compaction",
+        sessionId,
+        turnId: mapped.turnId,
+        phase: mapped.phase,
+        compactionId: mapped.compactionId,
+        timestampMs: mapped.timestampMs,
+        turnCount: session.turnCount,
+        storageBytes: rolloutStorageBytes(session.rolloutPath),
       });
     } else if (mapped.kind === "agent_message_phase") {
       session.messagePhases.set(mapped.itemId, mapped.phase);
@@ -1005,7 +1113,7 @@ export class CodexRuntime implements AgentRuntime {
     if (input.reasoningEffort) return input.reasoningEffort;
     if (response.reasoningEffort) return response.reasoningEffort;
     const model = input.model ?? response.model;
-    const models = await this.listModels();
+    const models = await this.listModels(input.modelProvider ?? response.modelProvider, model);
     return models.find((item) => item.id === model)?.defaultReasoningEffort
       ?? models.find((item) => item.isDefault)?.defaultReasoningEffort;
   }
@@ -1091,6 +1199,10 @@ export class CodexRuntime implements AgentRuntime {
 
   private adoptTurn(session: CodexSession, turnId: string, startedAt: number): void {
     session.canReplaceEmptyThread = false;
+    if (!session.knownTurnIds.has(turnId)) {
+      session.knownTurnIds.add(turnId);
+      if (session.turnCount !== undefined) session.turnCount += 1;
+    }
     session.activeTurnId = turnId;
     session.activeTurnStartedAt = startedAt;
     session.finalText = "";
@@ -1183,6 +1295,9 @@ export class CodexRuntime implements AgentRuntime {
       messagePhases: new Map(),
       needsResume: false,
       canReplaceEmptyThread: !("remoteSessionId" in input),
+      rolloutPath: stringValue(response.thread.path)?.trim() || undefined,
+      turnCount: "remoteSessionId" in input ? undefined : 0,
+      knownTurnIds: new Set(),
     };
   }
 
@@ -1241,7 +1356,7 @@ export class CodexRuntime implements AgentRuntime {
 }
 
 interface ThreadResponse {
-  thread: { id: string; name?: string | null; preview?: string };
+  thread: { id: string; name?: string | null; preview?: string; path?: string | null };
   modelProvider?: string;
   model?: string;
   reasoningEffort?: string | null;
@@ -1273,6 +1388,7 @@ interface CodexThreadSnapshot {
   recencyAt?: number | null;
   status?: { type?: string };
   forkedFromId?: string | null;
+  path?: string | null;
   turns?: CodexTurnSnapshot[];
 }
 
@@ -1339,6 +1455,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function rolloutStorageBytes(filePath: string | undefined): number | undefined {
+  if (!filePath) return undefined;
+  try {
+    const stats = statSync(filePath);
+    return stats.isFile() ? stats.size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function fallbackProviderModel(
+  catalog: ModelOption[],
+  requestedModel?: string,
+  configuredDefaultModel?: string,
+): ModelOption | undefined {
+  const id = requestedModel?.trim()
+    || configuredDefaultModel?.trim()
+    || catalog.find((model) => model.isDefault)?.id
+    || catalog[0]?.id;
+  if (!id) return undefined;
+  const catalogModel = catalog.find((model) => model.id === id);
+  return {
+    ...(catalogModel ?? { id, supportedReasoningEfforts: [] }),
+    id,
+    isDefault: true,
+  };
 }
 
 function turnStartedAt(turn: CodexTurnSnapshot): number {

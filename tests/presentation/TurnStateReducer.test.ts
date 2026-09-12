@@ -74,6 +74,7 @@ describe("TurnStateReducer", () => {
     expect(boundedOutput).toHaveLength(6_000);
     expect(boundedOutput.startsWith("…")).toBe(true);
     expect(boundedOutput.endsWith("x".repeat(100))).toBe(true);
+    expect(state.fullToolOutputs?.t1).toBe(`starting\ntest 1 passed\n${"x".repeat(7_000)}`);
 
     state = reduceTurnEvent(
       state,
@@ -178,12 +179,112 @@ describe("TurnStateReducer", () => {
 
   test("accumulates current-turn token usage from cumulative notifications without double counting", () => {
     let state = createTurnViewState("s1", "turn_1", 1_000);
-    state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 123, cumulativeTokens: 1_000 }));
-    state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 123, cumulativeTokens: 1_000 }));
-    state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 456, cumulativeTokens: 1_456 }));
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 123, cumulativeTokens: 1_000, contextTokens: 120_000,
+    }));
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 123, cumulativeTokens: 1_000, contextTokens: 120_000,
+    }));
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 456, cumulativeTokens: 1_456, contextTokens: 121_000,
+    }));
 
     expect(state.totalTokens).toBe(579);
     expect(state.tokenUsageCumulative).toBe(1_456);
+    expect(state.latestContextTokens).toBe(121_000);
+  });
+
+  test("tracks context compaction lifecycle and ignores duplicate completion notifications", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 1_000, cumulativeTokens: 1_000, contextTokens: 120_000,
+    }));
+    state = reduceTurnEvent(state, event("context_compaction", {
+      phase: "started",
+      compactionId: "compact_1",
+      timestampMs: 1_000,
+      turnCount: 12,
+      storageBytes: 714 * 1_024 * 1_024,
+    }));
+    expect(state).toMatchObject({
+      contextCompactionStatus: "running",
+      contextCompactionId: "compact_1",
+      contextCompactionBeforeTokens: 120_000,
+      contextCompactionTurnCount: 12,
+      contextCompactionStorageBytes: 714 * 1_024 * 1_024,
+      progressText: "Codex 正在压缩上下文（压缩前 120,000 tokens）… · 已执行 12 轮 · 磁盘占用 714 MB",
+    });
+    expect(state.contextCompactionCount).toBeUndefined();
+    expect(state.activities).toContainEqual({
+      kind: "assistant",
+      id: "context-compaction:compact_1",
+      text: "Codex 正在压缩上下文（压缩前 120,000 tokens）… · 已执行 12 轮 · 磁盘占用 714 MB",
+    });
+
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 0, cumulativeTokens: 1_000, contextTokens: 40_000,
+    }));
+    state = reduceTurnEvent(state, event("context_compaction", {
+      phase: "completed",
+      compactionId: "compact_1",
+      timestampMs: 3_500,
+      turnCount: 12,
+      storageBytes: 715 * 1_024 * 1_024,
+    }));
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 100, cumulativeTokens: 1_100, contextTokens: 55_000,
+    }));
+    state = reduceTurnEvent(state, event("context_compaction", {
+      phase: "completed",
+      compactionId: "compact_1",
+      timestampMs: 4_000,
+    }));
+    state = reduceTurnEvent(state, event("context_compaction", { phase: "completed" }));
+    expect(state).toMatchObject({
+      contextCompactionStatus: "completed",
+      contextCompactionCount: 1,
+      contextCompactionId: "compact_1",
+      contextCompactionDurationMs: 2_500,
+      contextCompactionBeforeTokens: 120_000,
+      contextCompactionAfterTokens: 40_000,
+      contextCompactionTurnCount: 12,
+      contextCompactionStorageBytes: 715 * 1_024 * 1_024,
+      progressText: "Codex 已完成上下文压缩 · 耗时 2.5s · 上下文 120,000 → 40,000 tokens（减少 67%） · 已执行 12 轮 · 磁盘占用 715 MB，继续处理。",
+    });
+    expect(state.activities.filter((activity) => activity.id === "context-compaction:compact_1")).toEqual([{
+      kind: "assistant",
+      id: "context-compaction:compact_1",
+      text: "Codex 已完成上下文压缩 · 耗时 2.5s · 上下文 120,000 → 40,000 tokens（减少 67%） · 已执行 12 轮 · 磁盘占用 715 MB，继续处理。",
+    }]);
+
+    state = reduceTurnEvent(state, event("context_compaction", {
+      phase: "started",
+      compactionId: "compact_2",
+      timestampMs: 4_000,
+      turnCount: 13,
+      storageBytes: 716 * 1_024 * 1_024,
+    }));
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 0, cumulativeTokens: 1_100, contextTokens: 20_000,
+    }));
+    state = reduceTurnEvent(state, event("context_compaction", {
+      phase: "completed",
+      compactionId: "compact_2",
+      timestampMs: 7_000,
+      turnCount: 13,
+      storageBytes: 717 * 1_024 * 1_024,
+    }));
+    expect(state.contextCompactionCount).toBe(2);
+    expect(state.progressText).toBe(
+      "Codex 已完成本轮第 2 次上下文压缩 · 耗时 3s · 上下文 55,000 → 20,000 tokens（减少 64%） · 已执行 13 轮 · 磁盘占用 717 MB，继续处理。",
+    );
+  });
+
+  test("marks compaction task metrics unknown when runtime data is unavailable", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    state = reduceTurnEvent(state, event("context_compaction", { phase: "completed" }));
+
+    expect(state.progressText).toBe("Codex 已完成上下文压缩 · 已执行轮次未知 · 磁盘占用未知，继续处理。");
   });
 
   test("preserves reasoning and tool activity order while updating entries in place", () => {

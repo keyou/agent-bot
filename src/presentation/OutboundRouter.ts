@@ -16,7 +16,9 @@ export interface TurnPresenter {
     taskTitle?: string,
     projectCwd?: string,
     agentLabel?: string,
+    model?: string,
   ): void;
+  updateSessionModel(sessionId: string, model?: string): void;
   updateSessionTitle(sessionId: string, taskTitle: string): void;
   unregisterSession(sessionId: string): void;
   startPendingTurn(
@@ -67,11 +69,13 @@ export class OutboundRouter {
     taskTitle?: string,
     projectCwd?: string,
     agentLabel?: string,
+    model?: string,
   ): void {
     const route = this.route(contextKey);
     this.sessionRoutes.set(sessionId, route);
     this.sessionContextKeys.set(sessionId, contextKey);
     route.presenter.registerSession(sessionId, contextKey, taskTitle, projectCwd, agentLabel);
+    if (model) route.presenter.updateSessionModel(sessionId, model);
   }
 
   getSessionContextKey(sessionId: string): string | undefined {
@@ -88,6 +92,10 @@ export class OutboundRouter {
 
   updateSessionTitle(sessionId: string, taskTitle: string): void {
     this.sessionRoutes.get(sessionId)?.presenter.updateSessionTitle(sessionId, taskTitle);
+  }
+
+  updateSessionModel(sessionId: string, model?: string): void {
+    this.sessionRoutes.get(sessionId)?.presenter.updateSessionModel(sessionId, model);
   }
 
   unregisterSession(sessionId: string): void {

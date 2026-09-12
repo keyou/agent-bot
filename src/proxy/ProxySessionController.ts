@@ -59,9 +59,11 @@ import type { AgentRuntimeRegistry } from "../runtime/AgentRuntimeRegistry.js";
 import type {
   AgentRuntime,
   ApprovalDecision,
+  ModelOption,
   PermissionMode,
   RemoteCompletedTurnSummary,
   RemoteSessionActivity,
+  RemoteSessionMetrics,
   RemoteSessionPage,
   RemoteSessionSummary,
   RuntimeGoal,
@@ -87,6 +89,7 @@ import {
   type TurnAnchorRecord,
 } from "../state/StateStore.js";
 import { createId } from "../utils/id.js";
+import { formatStorageSize } from "../utils/formatStorageSize.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
 import { normalizeTaskTitle } from "../utils/taskTitle.js";
 import {
@@ -1433,6 +1436,7 @@ export class ProxySessionController {
         scopedRecord.title,
         scopedRecord.cwd,
         this.agentLabel(scopedRecord.agentName),
+        scopedRecord.model,
       );
       const promptMessageId = await this.outbound.withReplyTarget(
         responseContextKey,
@@ -1680,16 +1684,10 @@ export class ProxySessionController {
     const loaded = await this.loadSession(record);
     if (setting === "provider" && nextValue) {
       await this.assertModelProvider(loaded, nextValue);
-      const models = await loaded.runtime.listModels();
-      const model = models.find((candidate) => candidate.id === loaded.session.model)
-        ?? models.find((candidate) => candidate.isDefault);
+      const models = await loaded.runtime.listModels(nextValue, loaded.session.model);
+      const model = selectProviderModel(models, loaded.session.model);
       if (!model) throw new Error("The current runtime has no model available for a Provider change.");
-      const effort = model.supportedReasoningEfforts.some(
-        (candidate) => candidate.value === loaded.session.reasoningEffort,
-      )
-        ? loaded.session.reasoningEffort
-        : model.defaultReasoningEffort ?? model.supportedReasoningEfforts[0]?.value;
-      if (!effort) throw new Error(`Model ${model.id} has no reasoning effort available for a Provider change.`);
+      const effort = selectProviderReasoningEffort(model, loaded.session.reasoningEffort);
       await this.changeProviderSettings(loaded, {
         modelProvider: nextValue,
         model: model.id,
@@ -1697,13 +1695,12 @@ export class ProxySessionController {
         permissionMode: loaded.session.permissionMode,
       });
     } else if (setting === "model" && nextValue) {
-      const models = await loaded.runtime.listModels();
+      const models = await loaded.runtime.listModels(loaded.session.modelProvider, loaded.session.model);
       const selected = models.find((candidate) => candidate.id === nextValue);
       if (!selected) throw new Error(`Unknown model: ${nextValue}`);
       const currentEffort = loaded.session.reasoningEffort;
-      const nextEffort = currentEffort && selected.supportedReasoningEfforts.some(
-        (candidate) => candidate.value === currentEffort,
-      )
+      const nextEffort = currentEffort && (selected.supportedReasoningEfforts.length === 0
+        || selected.supportedReasoningEfforts.some((candidate) => candidate.value === currentEffort))
         ? currentEffort
         : selected.defaultReasoningEffort;
       await loaded.runtime.setModel(record.localSessionId, nextValue);
@@ -1712,7 +1709,7 @@ export class ProxySessionController {
       }
       this.store.updateRuntimeSession(record.localSessionId, { model: nextValue, reasoningEffort: nextEffort });
     } else if (setting === "thinking" && nextValue) {
-      const models = await loaded.runtime.listModels();
+      const models = await loaded.runtime.listModels(loaded.session.modelProvider, loaded.session.model);
       const currentModel = models.find((candidate) => candidate.id === loaded.session.model)
         ?? models.find((candidate) => candidate.isDefault);
       if (!currentModel) throw new Error("The current runtime has no model with configurable reasoning effort.");
@@ -1731,7 +1728,7 @@ export class ProxySessionController {
     }
     const session = this.store.getSession(record.localSessionId) ?? record;
     if (setting && setting !== "provider") await this.persistAgentExecutionDefaults(session.localSessionId);
-    const models = await loaded.runtime.listModels();
+    const models = await loaded.runtime.listModels(session.modelProvider, session.model);
     const currentModel = models.find((candidate) => candidate.id === session.model)
       ?? models.find((candidate) => candidate.isDefault);
     const providers = loaded.runtime.listModelProviders
@@ -2116,6 +2113,7 @@ export class ProxySessionController {
         session.title,
         session.cwd,
         this.agentLabel(session.agentName),
+        session.model,
       );
       if (!session.lastTurnId) continue;
       void this.outbound.resumeDelivery(session.localSessionId, turnContextKey, session.lastTurnId).catch((error: unknown) => {
@@ -2202,6 +2200,7 @@ export class ProxySessionController {
           session.title,
           session.cwd,
           this.agentLabel(session.agentName),
+          session.model,
         );
       }
       try {
@@ -2330,6 +2329,7 @@ export class ProxySessionController {
       session.title,
       session.cwd,
       this.agentLabel(session.agentName),
+      session.model,
     );
     if (announce) {
       await this.outbound.withReplyTarget(contextKey, replyTarget, () =>
@@ -2611,6 +2611,7 @@ export class ProxySessionController {
         record.title,
         record.cwd,
         this.agentLabel(record.agentName),
+        record.model,
       );
       await this.outbound.startPendingTurn(
         record.localSessionId,
@@ -2969,6 +2970,7 @@ export class ProxySessionController {
       forkTitle,
       source.cwd,
       this.agentLabel(source.agentName),
+      source.model,
     );
 
     try {
@@ -3329,6 +3331,7 @@ export class ProxySessionController {
         forked.title ?? plan.forkTitle,
         plan.cwd,
         this.agentLabel(plan.agentName),
+        plan.model,
       );
       this.store.audit(contextKey, "session_forked", {
         sourceLocalSessionId: plan.source?.localSessionId,
@@ -3838,6 +3841,7 @@ export class ProxySessionController {
       initialTitle,
       sessionCwd,
       this.agentLabel(agentName),
+      resolvedExecutionSettings.model,
     );
     const runtime = this.runtimes.forAgent(agentName);
     try {
@@ -3855,6 +3859,7 @@ export class ProxySessionController {
         permissionMode: resolvedExecutionSettings.permissionMode ?? "auto",
       });
       this.persistRuntimeSession(record, session, session.activeTurnId ? "running" : "ready");
+      this.outbound.updateSessionModel(localSessionId, session.model);
       const saved = this.store.getSession(localSessionId) ?? record;
       if (announce) {
         const task = initialTitle ? `${initialTitle}（${session.remoteSessionId}）` : session.remoteSessionId;
@@ -4127,6 +4132,7 @@ export class ProxySessionController {
       record.title,
       record.cwd,
       this.agentLabel(record.agentName),
+      record.model,
     );
     const loading = (async (): Promise<LoadedSession> => {
       if (record.lastTurnId) {
@@ -4277,14 +4283,20 @@ export class ProxySessionController {
       });
     }
 
+    const enrichedEvent: RuntimeEvent = event.type === "context_compaction"
+      ? {
+          ...event,
+          turnCount: event.turnCount ?? this.store.countTaskTurns(event.sessionId),
+        }
+      : event;
     const presentationEvent = event.type === "turn_failed"
       && isRetryableLlmTurnFailure(event.message)
       && (failedAttempt?.retryCount ?? 0) >= MAX_LLM_TURN_RETRIES
       ? {
-          ...event,
+          ...enrichedEvent,
           message: `${event.message}\n\n已自动重试 ${MAX_LLM_TURN_RETRIES} 次，仍未成功。`,
         }
-      : event;
+      : enrichedEvent;
     let presentationError: unknown;
     try {
       await this.outbound.onEvent(presentationEvent);
@@ -4863,6 +4875,7 @@ export class ProxySessionController {
       forked.title ?? current.title,
       current.cwd,
       this.agentLabel(current.agentName),
+      current.model,
     );
     this.store.audit(contextKey, "session_reset_to_turn", {
       localSessionId: current.localSessionId,
@@ -4926,12 +4939,13 @@ export class ProxySessionController {
       };
     if (record) {
       const loaded = await this.loadSession(record);
-      const models = await loaded.runtime.listModels();
-      const currentModel = models.find((model) => model.id === loaded.session.model)
-        ?? models.find((model) => model.isDefault);
       const providerSupported = loaded.runtime.kind === "codex" && Boolean(loaded.runtime.listModelProviders);
       const providers = providerSupported ? await this.modelProviderOptions(loaded) : [];
       const currentProvider = loaded.session.modelProvider ?? providers.find((provider) => provider.isDefault)?.id;
+      const models = await loaded.runtime.listModels(currentProvider, loaded.session.model);
+      const currentModel = models.find((model) => model.id === loaded.session.model)
+        ?? models.find((model) => model.isDefault)
+        ?? models[0];
       const currentEffort = currentModel?.supportedReasoningEfforts.some(
         (option) => option.value === loaded.session.reasoningEffort,
       )
@@ -5000,16 +5014,10 @@ export class ProxySessionController {
     await this.outbound.sendText(contextKey, `正在切换到 Provider ${modelProvider}，请稍后。`);
     const loaded = await this.loadSession(record);
     await this.assertModelProvider(loaded, modelProvider);
-    const models = await loaded.runtime.listModels();
-    const model = models.find((candidate) => candidate.id === loaded.session.model)
-      ?? models.find((candidate) => candidate.isDefault);
+    const models = await loaded.runtime.listModels(modelProvider, loaded.session.model);
+    const model = selectProviderModel(models, loaded.session.model);
     if (!model) throw new Error("当前运行时没有可用于 Provider 切换的模型。");
-    const effort = model.supportedReasoningEfforts.some(
-      (candidate) => candidate.value === loaded.session.reasoningEffort,
-    )
-      ? loaded.session.reasoningEffort
-      : model.defaultReasoningEffort ?? model.supportedReasoningEfforts[0]?.value;
-    if (!effort) throw new Error(`模型 ${model.id} 没有可用于 Provider 切换的思考强度。`);
+    const effort = selectProviderReasoningEffort(model, loaded.session.reasoningEffort);
     await this.applyProviderSettings(contextKey, {
       provider: modelProvider,
       model: model.id,
@@ -5034,11 +5042,11 @@ export class ProxySessionController {
   ): Promise<void> {
     const loaded = await this.loadSession(this.requireSession(contextKey, sessionId));
     await this.assertModelProvider(loaded, modelProvider);
-    const models = await loaded.runtime.listModels();
+    const models = await loaded.runtime.listModels(modelProvider, loaded.session.model);
     const card = this.cardRenderer.renderModelSelector({
       sessionId,
       contextKey,
-      currentModel: loaded.session.model ?? models.find((model) => model.isDefault)?.id,
+      currentModel: selectProviderModel(models, loaded.session.model)?.id,
       reasoningEffort: loaded.session.reasoningEffort,
       models,
       modelProvider,
@@ -5058,21 +5066,24 @@ export class ProxySessionController {
   ): Promise<void> {
     const loaded = await this.loadSession(this.requireSession(contextKey, sessionId));
     await this.assertModelProvider(loaded, modelProvider);
-    const models = await loaded.runtime.listModels();
+    const models = await loaded.runtime.listModels(modelProvider, model);
     const selected = models.find((candidate) => candidate.id === model);
     if (!selected) throw new Error(`未知模型：${model}`);
-    const currentEffort = selected.supportedReasoningEfforts.some(
+    const options = selected.supportedReasoningEfforts.length > 0
+      ? selected.supportedReasoningEfforts
+      : [{ value: selectProviderReasoningEffort(selected, loaded.session.reasoningEffort) }];
+    const currentEffort = options.some(
       (option) => option.value === loaded.session.reasoningEffort,
     )
       ? loaded.session.reasoningEffort
-      : selected.defaultReasoningEffort;
+      : selected.defaultReasoningEffort ?? options[0]?.value;
     const card = this.cardRenderer.renderReasoningSelector({
       sessionId,
       contextKey,
       modelProvider,
       model,
       currentEffort,
-      options: selected.supportedReasoningEfforts,
+      options,
       permissionMode,
       unifiedSettings: true,
     });
@@ -5173,9 +5184,10 @@ export class ProxySessionController {
     effort: string,
   ): Promise<void> {
     await this.assertModelProvider(loaded, modelProvider);
-    const selected = (await loaded.runtime.listModels()).find((candidate) => candidate.id === model);
+    const selected = (await loaded.runtime.listModels(modelProvider, model)).find((candidate) => candidate.id === model);
     if (!selected) throw new Error(`未知模型：${model}`);
-    if (!selected.supportedReasoningEfforts.some((option) => option.value === effort)) {
+    if (selected.supportedReasoningEfforts.length > 0
+      && !selected.supportedReasoningEfforts.some((option) => option.value === effort)) {
       const supported = selected.supportedReasoningEfforts.map((option) => option.value).join("、") || "无";
       throw new Error(`模型 ${model} 不支持思考强度 ${effort}。支持的强度：${supported}`);
     }
@@ -5209,12 +5221,13 @@ export class ProxySessionController {
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
     const loaded = await this.loadSession(record);
-    const models = await loaded.runtime.listModels();
+    const models = await loaded.runtime.listModels(loaded.session.modelProvider, loaded.session.model);
     const selected = models.find((item) => item.id === model);
     if (!selected) throw new Error(`未知模型：${model}`);
     const currentEffort = loaded.session.reasoningEffort;
     const compatible = currentEffort
-      ? selected.supportedReasoningEfforts.some((option) => option.value === currentEffort)
+      ? selected.supportedReasoningEfforts.length === 0
+        || selected.supportedReasoningEfforts.some((option) => option.value === currentEffort)
       : false;
     const nextEffort = compatible ? currentEffort : selected.defaultReasoningEffort;
 
@@ -5645,7 +5658,7 @@ export class ProxySessionController {
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
     const loaded = await this.loadSession(record);
-    const models = await loaded.runtime.listModels();
+    const models = await loaded.runtime.listModels(loaded.session.modelProvider, loaded.session.model);
     const currentModel = models.find((item) => item.id === loaded.session.model)
       ?? models.find((item) => item.isDefault);
     if (!currentModel) throw new Error("当前运行时没有可配置思考强度的模型。");
@@ -6400,6 +6413,7 @@ export class ProxySessionController {
         existing.title,
         existing.cwd,
         this.agentLabel(existing.agentName),
+        existing.model,
       );
       await this.outbound.sendText(contextKey, `已切换到任务：${existing.title ?? existing.remoteSessionId ?? taskId}`);
       return;
@@ -6433,6 +6447,7 @@ export class ProxySessionController {
       remote.title ?? remote.preview,
       remote.cwd,
       this.agentLabel(agentName),
+      remote.model,
     );
     await this.outbound.sendText(
       contextKey,
@@ -6732,6 +6747,7 @@ export class ProxySessionController {
     }
 
     let remote: RemoteSessionSummary | undefined;
+    let metrics: RemoteSessionMetrics | undefined;
     if (current?.status === "running") {
       const runtime = this.runtimes.forAgent(current.agentName);
       if (runtime.getSession(current.localSessionId)) {
@@ -6762,6 +6778,13 @@ export class ProxySessionController {
           goal = await runtime.getGoal(loaded.localSessionId);
         } catch (error) {
           this.logger.warn({ error, sessionId: current.localSessionId }, "Failed to inspect Agent goal status.");
+        }
+      }
+      if (runtime.readRemoteSessionMetrics) {
+        try {
+          metrics = await runtime.readRemoteSessionMetrics(current.remoteSessionId);
+        } catch (error) {
+          this.logger.warn({ error, sessionId: current.localSessionId }, "Failed to inspect App Server task metrics.");
         }
       }
     }
@@ -6798,6 +6821,7 @@ export class ProxySessionController {
         `**Agent**：${cardCode(agent.title)}`,
         `**权限 / 任务范围**：${current.permissionMode === "confirm" ? "执行前确认" : "自动执行"} / ${detectProjectlessWorkspace(current.cwd) ? "未指定项目" : "指定项目"}`,
         `**App Server 任务 ID**：${cardCode(current.remoteSessionId ?? "尚未创建")}`,
+        statusTaskMetricsLine(metrics?.turnCount ?? this.store.countTaskTurns(current.localSessionId), metrics?.storageBytes),
         `**当前执行 / 排队消息**：${activeTurnId ? cardCode(activeTurnId) : "无"} / ${queued} 条`,
         `**创建时间 / 最近活动**：${formatStatusTime(current.createdAt)} / ${formatStatusTime(current.updatedAt)}`,
       );
@@ -6864,6 +6888,15 @@ export class ProxySessionController {
     options: StatusCardOptions = {},
   ): Promise<void> {
     const { agentName, remote } = await this.resolveRemoteCodexSession(reference, { view: "latest-full" });
+    const runtime = this.runtimes.forAgent(agentName);
+    let metrics: RemoteSessionMetrics | undefined;
+    if (runtime.readRemoteSessionMetrics) {
+      try {
+        metrics = await runtime.readRemoteSessionMetrics(remote.id);
+      } catch (error) {
+        this.logger.warn({ error, remoteSessionId: remote.id }, "Failed to inspect App Server task metrics.");
+      }
+    }
     const actionReference = remoteSessionReference(agentName, remote.id);
     const sections: CardSection[] = [
       {
@@ -6874,6 +6907,7 @@ export class ProxySessionController {
           `**状态 / 当前任务**：${remoteSessionDetailStatus(remote)} / 未切换`,
           `**Agent**：${cardCode(agentName)}`,
           `**App Server 任务 ID**：${cardCode(remote.id)}`,
+          statusTaskMetricsLine(metrics?.turnCount, metrics?.storageBytes),
           `**最近回合**：${cardCode(remote.lastTurnId ?? "无")}　${remoteTurnStatusLabel(remote.lastTurnStatus)}`,
           `**创建时间 / 最近活动**：${formatRemoteTime(remote.createdAt)} / ${formatRemoteTime(latestRemoteTimestamp(remote.recencyAt, remote.updatedAt))}`,
         ],
@@ -8101,6 +8135,12 @@ function formatDuration(milliseconds: number): string {
   return milliseconds < 1_000 ? `${milliseconds}ms` : `${(milliseconds / 1_000).toFixed(1)}s`;
 }
 
+function statusTaskMetricsLine(turnCount: number | undefined, storageBytes: number | undefined): string {
+  const turns = turnCount === undefined ? "未知" : `${Math.max(0, Math.round(turnCount)).toLocaleString("en-US")} 轮`;
+  const storage = storageBytes === undefined ? "未知" : formatStorageSize(storageBytes);
+  return `**已执行轮次 / 磁盘占用**：${turns} / ${storage}`;
+}
+
 function formatStatusTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -8572,6 +8612,23 @@ function deduplicateFileReferences(
     seen.add(key);
     return true;
   });
+}
+
+function selectProviderModel(models: ModelOption[], previousModel?: string): ModelOption | undefined {
+  return models.find((model) => model.id === previousModel)
+    ?? models.find((model) => model.isDefault)
+    ?? models[0];
+}
+
+function selectProviderReasoningEffort(model: ModelOption, previousEffort?: string): string {
+  if (previousEffort && (model.supportedReasoningEfforts.length === 0
+    || model.supportedReasoningEfforts.some((option) => option.value === previousEffort))) {
+    return previousEffort;
+  }
+  return model.defaultReasoningEffort
+    ?? model.supportedReasoningEfforts[0]?.value
+    ?? previousEffort
+    ?? "medium";
 }
 
 function recoveryCardPrompt(prompt: string): string {

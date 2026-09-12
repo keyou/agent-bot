@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -18,6 +19,47 @@ describe("CodexRuntime", () => {
     expect(client.requests.filter((r) => r.method === "thread/read")).toEqual([
       { method: "thread/read", params: { threadId: "empty", includeTurns: false } },
     ]);
+  });
+
+  test("counts paginated Turns and reads rollout disk usage without loading full history", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-metrics-"));
+    const rolloutPath = path.join(directory, "rollout.jsonl");
+    fs.writeFileSync(rolloutPath, "x".repeat(12_345));
+    try {
+      const client = new FakeAppServerClient();
+      client.readResult = { thread: { id: "large", name: "Large task", path: rolloutPath } };
+      client.turnListResults.push(
+        {
+          data: Array.from({ length: 100 }, (_, index) => ({ id: `turn_${123 - index}`, status: "completed" })),
+          nextCursor: "page_2",
+        },
+        {
+          data: Array.from({ length: 23 }, (_, index) => ({ id: `turn_${23 - index}`, status: "completed" })),
+          nextCursor: null,
+        },
+      );
+      const runtime = new CodexRuntime(provider(client), logger());
+
+      await expect(runtime.readRemoteSessionMetrics("large")).resolves.toEqual({
+        turnCount: 123,
+        storageBytes: 12_345,
+      });
+      expect(client.requests).toEqual([
+        { method: "thread/read", params: { threadId: "large", includeTurns: false } },
+        {
+          method: "thread/turns/list",
+          params: { threadId: "large", limit: 100, sortDirection: "desc", itemsView: "summary" },
+        },
+        {
+          method: "thread/turns/list",
+          params: {
+            threadId: "large", cursor: "page_2", limit: 100, sortDirection: "desc", itemsView: "summary",
+          },
+        },
+      ]);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test("uses TraeX's explicit updated_at sorting without a failed Codex-protocol probe", async () => {
@@ -477,6 +519,18 @@ describe("CodexRuntime", () => {
     client.emit("item/started", {
       threadId: "thr_1",
       turnId,
+      startedAtMs: 1_000,
+      item: { type: "contextCompaction", id: "compact_1" },
+    });
+    client.emit("item/completed", {
+      threadId: "thr_1",
+      turnId,
+      completedAtMs: 3_500,
+      item: { type: "contextCompaction", id: "compact_1" },
+    });
+    client.emit("item/started", {
+      threadId: "thr_1",
+      turnId,
       item: { type: "commandExecution", id: "command_1", command: "npm test", status: "inProgress" },
     });
     client.emit("item/commandExecution/outputDelta", {
@@ -499,6 +553,27 @@ describe("CodexRuntime", () => {
       turnId,
       lastTokens: 2_445,
       cumulativeTokens: 9_265,
+      contextTokens: 12_445,
+    });
+    expect(events).toContainEqual({
+      type: "context_compaction",
+      sessionId: "s1",
+      turnId,
+      phase: "started",
+      compactionId: "compact_1",
+      timestampMs: 1_000,
+      turnCount: 1,
+      storageBytes: undefined,
+    });
+    expect(events).toContainEqual({
+      type: "context_compaction",
+      sessionId: "s1",
+      turnId,
+      phase: "completed",
+      compactionId: "compact_1",
+      timestampMs: 3_500,
+      turnCount: 1,
+      storageBytes: undefined,
     });
     expect(events).toContainEqual(expect.objectContaining({
       type: "tool_started",
@@ -870,6 +945,66 @@ describe("CodexRuntime", () => {
       { id: "openai", displayName: "OpenAI", isDefault: true },
       { id: "ai_coding", displayName: "AI Coding" },
     ]);
+  });
+
+  test("lists only models returned by the selected custom Provider", async () => {
+    const client = new FakeAppServerClient();
+    client.configResult = {
+      config: {
+        model_providers: {
+          azure: { name: "Azure OpenAI", base_url: "https://azure.example/v1", env_key: "AZURE_TOKEN" },
+        },
+      },
+    };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      data: [{ id: "azure-only", is_default: true }],
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const runtime = new CodexRuntime({
+        ...provider(client),
+        getAgentFamily: () => "codex",
+        getEnvironmentVariable: (name) => name === "AZURE_TOKEN" ? "azure-secret" : undefined,
+      }, logger());
+
+      await expect(runtime.listModels("azure")).resolves.toEqual([{
+        id: "azure-only",
+        isDefault: true,
+        supportedReasoningEfforts: [],
+      }]);
+      expect(client.requests.map((request) => request.method)).toEqual(["config/read", "model/list"]);
+      const fetchCalls = fetchMock.mock.calls as unknown as Array<[URL, RequestInit?]>;
+      const headers = new Headers(fetchCalls[0]?.[1]?.headers);
+      expect(headers.get("authorization")).toBe("Bearer azure-secret");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("keeps a custom Provider usable when it does not expose a model list", async () => {
+    const client = new FakeAppServerClient();
+    client.configResult = {
+      config: {
+        model_providers: {
+          single: { name: "Single Model", base_url: "https://single.example/v1" },
+        },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("not found", { status: 404 })));
+    try {
+      const runtime = new CodexRuntime({
+        ...provider(client),
+        getAgentFamily: () => "codex",
+      }, logger());
+
+      await expect(runtime.listModels("single", "single-default")).resolves.toEqual([{
+        id: "single-default",
+        isDefault: true,
+        supportedReasoningEfforts: [],
+      }]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   test("does not add the Codex OpenAI Provider to TraeX", async () => {
@@ -1406,6 +1541,42 @@ describe("CodexRuntime", () => {
         sourceKinds: ["cli", "vscode", "exec", "appServer"],
       }),
     }));
+  });
+
+  test.each(["codex", "traex"] as const)("lists every Provider on %s for initial and searched cursor pages", async (family) => {
+    const client = new FakeAppServerClient();
+    const threads = [
+      { id: "default_task", name: "Default task", modelProvider: "openai", cwd: "D:\\dev\\agent-bot" },
+      { id: "custom_task", name: "各种优化", modelProvider: "ai_coding", cwd: "D:\\dev\\agent-bot" },
+    ];
+    client.listResult = { data: threads, nextCursor: "page_2" };
+    const runtime = new CodexRuntime({ ...provider(client), getAgentFamily: () => family }, logger());
+
+    const first = await runtime.listRemoteSessions({ limit: 2 });
+    expect(first.sessions.map((session) => session.id)).toEqual(["default_task", "custom_task"]);
+    expect(first.nextCursor).toBe("page_2");
+    client.listResult = { data: [threads[1]], nextCursor: null };
+    const next = await runtime.listRemoteSessions({ cursor: "page_2", searchTerm: "优化", limit: 2 });
+    expect(next.sessions).toEqual([expect.objectContaining({ id: "custom_task", title: "各种优化" })]);
+    expect(next.nextCursor).toBeUndefined();
+    const common = {
+      limit: 2,
+      modelProviders: [],
+      sortKey: family === "traex" ? "updated_at" : "recency_at",
+      sortDirection: "desc",
+      sourceKinds: ["cli", "vscode", "exec", "appServer"],
+      archived: false,
+    };
+    expect(client.requests.filter((request) => request.method === "thread/list")).toEqual([
+      { method: "thread/list", params: { ...common, cursor: undefined, searchTerm: undefined } },
+      { method: "thread/list", params: { ...common, cursor: "page_2", searchTerm: "优化" } },
+    ]);
+    expect(client.requests.every((request) => ["thread/list", "thread/turns/list"].includes(request.method))).toBe(true);
+    expect(client.requests.filter((request) => request.method === "thread/turns/list"))
+      .toEqual(threads.concat(threads.slice(1)).map((thread) => ({
+        method: "thread/turns/list",
+        params: { threadId: thread.id, limit: 1, sortDirection: "desc", itemsView: "summary" },
+      })));
   });
 
   test("reports the latest completed turn while a newer turn is still running", async () => {

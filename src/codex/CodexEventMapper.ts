@@ -8,6 +8,15 @@ export type MappedCodexNotification =
       turnId: string;
       lastTokens: number;
       cumulativeTokens: number;
+      contextTokens?: number;
+    }
+  | {
+      kind: "context_compaction";
+      threadId: string;
+      turnId: string;
+      phase: "started" | "completed";
+      compactionId?: string;
+      timestampMs?: number;
     }
   | { kind: "agent_delta"; threadId: string; turnId: string; itemId: string; text: string }
   | {
@@ -61,7 +70,18 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
     const lastTokens = effectiveTokenCount(params.tokenUsage.last);
     const cumulativeTokens = effectiveTokenCount(params.tokenUsage.total);
     if (lastTokens === undefined || cumulativeTokens === undefined) return undefined;
-    return { kind: "token_usage", threadId, turnId, lastTokens, cumulativeTokens };
+    return {
+      kind: "token_usage",
+      threadId,
+      turnId,
+      lastTokens,
+      cumulativeTokens,
+      contextTokens: numberValue(params.tokenUsage.last.totalTokens),
+    };
+  }
+
+  if (method === "thread/compacted") {
+    return { kind: "context_compaction", threadId, turnId, phase: "completed" };
   }
 
   if (method === "item/agentMessage/delta") {
@@ -98,6 +118,16 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
     return { kind: "plan", threadId, turnId, steps };
   }
   if ((method === "item/started" || method === "item/completed") && isRecord(params.item)) {
+    if (params.item.type === "contextCompaction") {
+      return {
+        kind: "context_compaction",
+        threadId,
+        turnId,
+        phase: method === "item/started" ? "started" : "completed",
+        compactionId: stringValue(params.item.id),
+        timestampMs: numberValue(method === "item/started" ? params.startedAtMs : params.completedAtMs),
+      };
+    }
     if (params.item.type === "agentMessage") {
       const itemId = stringValue(params.item.id);
       const phase = messagePhase(params.item.phase);

@@ -1332,6 +1332,15 @@ export class StateStore {
     }));
   }
 
+  countTaskTurns(localSessionId: string): number {
+    const turnIds = new Set(this.listTaskTurnGraphIndex(localSessionId).map((turn) => turn.turnId));
+    const own = this.db.prepare(
+      "SELECT turn_id AS turnId FROM turn_snapshots WHERE local_session_id = ?",
+    ).all(localSessionId) as Array<{ turnId: string }>;
+    for (const turn of own) turnIds.add(turn.turnId);
+    return turnIds.size;
+  }
+
   listTaskTurnGraphIndex(localSessionId: string): CompletedTurnIndexRecord[] {
     const backfilled = new Set<string>();
     const backfill = (id: string): void => {

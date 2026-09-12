@@ -111,6 +111,10 @@ export class CodexProcessManager implements AppServerClientProvider {
     return this.env.CODEX_HOME ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
   }
 
+  getEnvironmentVariable(name: string): string | undefined {
+    return this.env[name] ?? process.env[name];
+  }
+
   close(): void {
     this.client?.close();
     if (this.child && !this.child.killed) this.child.kill();

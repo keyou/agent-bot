@@ -76,6 +76,7 @@ export class FeishuTurnPresenter {
   private readonly sessionTitles = new Map<string, string>();
   private readonly sessionCwds = new Map<string, string>();
   private readonly sessionAgentLabels = new Map<string, string>();
+  private readonly sessionModels = new Map<string, string>();
   private readonly entries = new Map<string, TurnEntry>();
   private readonly pendingEntries = new Map<string, TurnEntry>();
   private readonly renderer: CardRenderer;
@@ -95,11 +96,25 @@ export class FeishuTurnPresenter {
     taskTitle?: string,
     projectCwd?: string,
     agentLabel?: string,
+    model?: string,
   ): void {
     this.sessionContexts.set(sessionId, contextKey);
     if (taskTitle) this.sessionTitles.set(sessionId, taskTitle);
     if (projectCwd) this.sessionCwds.set(sessionId, projectCwd);
     if (agentLabel) this.sessionAgentLabels.set(sessionId, agentLabel);
+    if (model) {
+      this.updateSessionModel(sessionId, model);
+    }
+  }
+
+  updateSessionModel(sessionId: string, model?: string): void {
+    if (!model) return;
+    this.sessionModels.set(sessionId, model);
+    const pending = this.pendingEntries.get(sessionId);
+    if (!pending || pending.state.model === model) return;
+    pending.state = { ...pending.state, model };
+    this.store.saveTurnSnapshot(pending.state.turnId, sessionId, pending.state, pending.contextKey);
+    if (!pending.historySnapshot) pending.scheduler?.update(pending.state, "critical");
   }
 
   updateSessionTitle(sessionId: string, taskTitle: string): void {
@@ -117,6 +132,7 @@ export class FeishuTurnPresenter {
     this.sessionTitles.delete(sessionId);
     this.sessionCwds.delete(sessionId);
     this.sessionAgentLabels.delete(sessionId);
+    this.sessionModels.delete(sessionId);
   }
 
   async startPendingTurn(
@@ -147,6 +163,7 @@ export class FeishuTurnPresenter {
       this.sessionCwds.get(sessionId),
       prompt,
       this.sessionAgentLabels.get(sessionId),
+      this.sessionModels.get(sessionId),
     );
     const entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
     this.entries.set(state.turnId, entry);
@@ -257,6 +274,7 @@ export class FeishuTurnPresenter {
               this.sessionCwds.get(sessionId),
               undefined,
               this.sessionAgentLabels.get(sessionId),
+              this.sessionModels.get(sessionId),
             ),
             status: "running" as const,
           };
@@ -292,6 +310,7 @@ export class FeishuTurnPresenter {
             pending.state.projectCwd,
             pending.state.prompt,
             pending.state.agentLabel,
+            pending.state.model,
           ),
           event,
         );
@@ -428,6 +447,7 @@ export class FeishuTurnPresenter {
           this.sessionCwds.get(event.sessionId),
           undefined,
           this.sessionAgentLabels.get(event.sessionId),
+          this.sessionModels.get(event.sessionId),
         );
     const state = reduceTurnEvent(
       initial,
@@ -642,7 +662,13 @@ function brandedFinalChunks(response: string, maxLength: number): string[] {
 }
 
 function eventPriority(event: AgentEvent): "normal" | "critical" {
-  if (event.type === "turn_started" || event.type === "approval_requested" || event.type === "approval_resolved" || event.type === "tool_started") {
+  if (
+    event.type === "turn_started"
+    || event.type === "approval_requested"
+    || event.type === "approval_resolved"
+    || event.type === "tool_started"
+    || event.type === "context_compaction"
+  ) {
     return "critical";
   }
   return "normal";

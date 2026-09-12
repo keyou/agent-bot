@@ -322,14 +322,14 @@ describe("FeishuTurnPresenter", () => {
 
   test("persists and renders the registered Agent label on the starting card", async () => {
     const { presenter, outbound, store } = createFixture();
-    presenter.registerSession("s1", "chat_id:c1", undefined, "D:\\dev\\agent-bot", "TraeX");
+    presenter.registerSession("s1", "chat_id:c1", undefined, "D:\\dev\\agent-bot", "TraeX", "gpt-5.3-codex");
 
     await presenter.startPendingTurn("s1", "chat_id:c1");
 
     expect(store.saveTurnSnapshot).toHaveBeenCalledWith(
       expect.stringMatching(/^pending_/),
       "s1",
-      expect.objectContaining({ agentLabel: "TraeX" }),
+      expect.objectContaining({ agentLabel: "TraeX", model: "gpt-5.3-codex" }),
       "chat_id:c1",
     );
     expect(JSON.stringify((outbound.sendInteractiveCard as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]))

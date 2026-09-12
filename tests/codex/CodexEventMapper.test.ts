@@ -70,6 +70,51 @@ describe("mapCodexNotification", () => {
       turnId: "turn_1",
       lastTokens: 2_445,
       cumulativeTokens: 9_265,
+      contextTokens: 12_445,
+    });
+  });
+
+  test("maps context compaction item lifecycle and the legacy completion notification", () => {
+    expect(
+      mapCodexNotification("item/started", {
+        threadId: "thr_1",
+        turnId: "turn_1",
+        startedAtMs: 1_000,
+        item: { type: "contextCompaction", id: "compact_1" },
+      }),
+    ).toEqual({
+      kind: "context_compaction",
+      threadId: "thr_1",
+      turnId: "turn_1",
+      phase: "started",
+      compactionId: "compact_1",
+      timestampMs: 1_000,
+    });
+    expect(
+      mapCodexNotification("item/completed", {
+        threadId: "thr_1",
+        turnId: "turn_1",
+        completedAtMs: 3_500,
+        item: { type: "contextCompaction", id: "compact_1" },
+      }),
+    ).toEqual({
+      kind: "context_compaction",
+      threadId: "thr_1",
+      turnId: "turn_1",
+      phase: "completed",
+      compactionId: "compact_1",
+      timestampMs: 3_500,
+    });
+    expect(
+      mapCodexNotification("thread/compacted", {
+        threadId: "thr_1",
+        turnId: "turn_1",
+      }),
+    ).toEqual({
+      kind: "context_compaction",
+      threadId: "thr_1",
+      turnId: "turn_1",
+      phase: "completed",
     });
   });
 

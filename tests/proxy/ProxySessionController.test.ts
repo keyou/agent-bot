@@ -363,6 +363,14 @@ function fixture(
       if (!session) throw new Error(`Unknown remote session: ${id}`);
       return session;
     }),
+    readRemoteSessionMetrics: vi.fn(async (id: string) => {
+      const session = remoteSessions.find((candidate) => candidate.id === id);
+      if (!session) throw new Error(`Unknown remote session: ${id}`);
+      return {
+        turnCount: session.completedTurns?.length ?? (session.lastTurnId ? 1 : 0),
+        storageBytes: 700 * 1_024 * 1_024,
+      };
+    }),
     readRemoteForkSource: vi.fn(async (id: string) => {
       const session = remoteSessions.find((candidate) => candidate.id === id);
       if (!session) throw new Error(`Unknown remote session: ${id}`);
@@ -518,6 +526,7 @@ function fixture(
   };
   const presenter: TurnPresenter = {
     registerSession: vi.fn(),
+    updateSessionModel: vi.fn(),
     updateSessionTitle: vi.fn(),
     unregisterSession: vi.fn(),
     startPendingTurn: vi.fn(async () => undefined),
@@ -7706,6 +7715,8 @@ describe("ProxySessionController", () => {
     const serialized = JSON.stringify(card);
     expect(serialized).toContain("Agent 状态：Status target");
     expect(serialized).toContain("status_target");
+    expect(serialized).toContain("已执行轮次 / 磁盘占用");
+    expect(serialized).toContain("1 轮 / 700 MB");
     expect(serialized).toContain("Status result");
     expect(serialized).toContain('"element_id":"status_execution_details"');
     expect(serialized).toContain('"expanded":false');
@@ -8965,6 +8976,101 @@ describe("ProxySessionController", () => {
     expect(store.getSession(id)).toMatchObject({ remoteSessionId: "replacement", modelProvider: "azure" });
     expect(config.agents.codex?.defaults?.modelProvider).toBe("azure");
     expect(persistAgentExecutionDefaults).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    {
+      caseName: "the Provider default",
+      providerModels: [
+        { id: "azure-first", supportedReasoningEfforts: [{ value: "medium" }], defaultReasoningEffort: "medium" },
+        { id: "azure-default", isDefault: true, supportedReasoningEfforts: [{ value: "high" }], defaultReasoningEffort: "high" },
+      ],
+      expectedModel: "azure-default",
+      expectedEffort: "high",
+    },
+    {
+      caseName: "the first Provider model when no default exists",
+      providerModels: [
+        { id: "azure-first", supportedReasoningEfforts: [], defaultReasoningEffort: undefined },
+        { id: "azure-second", supportedReasoningEfforts: [{ value: "low" }], defaultReasoningEffort: "low" },
+      ],
+      expectedModel: "azure-first",
+      expectedEffort: "high",
+    },
+  ])("falls back to $caseName while switching Provider", async ({
+    providerModels, expectedModel, expectedEffort,
+  }) => {
+    const { controller, runtime, store } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const globalModels = await runtime.listModels();
+    vi.mocked(runtime.listModels).mockImplementation(async (provider) => (
+      provider === "azure" ? providerModels : globalModels
+    ));
+
+    const result = await controller.controlTaskSettings(id, "provider", "azure");
+
+    expect(runtime.setExecutionSettings).toHaveBeenLastCalledWith(id, {
+      modelProvider: "azure",
+      model: expectedModel,
+      reasoningEffort: expectedEffort,
+      permissionMode: "auto",
+    }, expect.any(Function));
+    expect(result.session).toMatchObject({
+      modelProvider: "azure",
+      model: expectedModel,
+      reasoningEffort: expectedEffort,
+    });
+    expect(result.models.map((model) => model.id)).toEqual(providerModels.map((model) => model.id));
+  });
+
+  test("keeps the previous model when the selected Provider supports it and renders that Provider's models", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const globalModels = await runtime.listModels();
+    const providerModels = [
+      { id: "azure-only", supportedReasoningEfforts: [{ value: "medium" }], defaultReasoningEffort: "medium" },
+      { id: "gpt-test", supportedReasoningEfforts: [{ value: "high" }], defaultReasoningEffort: "high" },
+    ];
+    vi.mocked(runtime.listModels).mockImplementation(async (provider) => (
+      provider === "azure" ? providerModels : globalModels
+    ));
+
+    await controller.onCardAction({
+      actionId: "provider-azure",
+      contextKey: "chat_id:c1",
+      messageId: "om_provider_models",
+      value: {
+        action: "settings_provider_select",
+        sessionId: id,
+        contextKey: "chat_id:c1",
+        provider: "azure",
+      },
+    });
+    await controller.onCardAction({
+      actionId: "open-model-tab",
+      contextKey: "chat_id:c1",
+      messageId: "om_provider_models",
+      value: {
+        action: "settings_tab_open",
+        sessionId: id,
+        contextKey: "chat_id:c1",
+        tab: "model",
+      },
+    });
+
+    expect(runtime.setExecutionSettings).toHaveBeenLastCalledWith(id, expect.objectContaining({
+      modelProvider: "azure",
+      model: "gpt-test",
+      reasoningEffort: "high",
+    }), expect.any(Function));
+    const card = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1];
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain("azure-only");
+    expect(serialized).toContain("gpt-test");
+    expect(serialized).not.toContain("gpt-next");
+    expect(runtime.listModels).toHaveBeenCalledWith("azure", "gpt-test");
   });
 
   test.each(["cli", "card"])("rejects old Provider responses through %s without saving or reporting success", async (entry) => {
