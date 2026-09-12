@@ -158,8 +158,10 @@ describe("Turn Preview", () => {
   });
 
   test("expands the cleaned command once and collapses identical output and error into one disclosure", () => {
+    const startedAt = new Date(2026, 8, 12, 7, 30, 1).getTime();
     const { content } = renderTurnPreviewSnapshot(state({
       status: "failed", exitCode: 1,
+      startedAt, completedAt: startedAt + 1_500,
       output: "Command failed.\r\n<script>bad</script>\r\n",
       error: "Command failed.\n<script>bad</script>",
     }));
