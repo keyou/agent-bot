@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-09-16
+
 - Check stable npm updates once daily between 10:00 and 17:00, notify the owner privately with release notes and a cancellable 60-second countdown, then prepare updates in the background and activate only after tasks and final deliveries finish. Persist per-version reminders and cancellations across restarts, and retain npm-only installation and rollback protections.
 - Simplify Turn Preview tools to one collapsed level with command summaries, compact live durations, status icons, a shared scroll area, and a fixed detail footer. Hide touch-device scrollbars while preserving gesture scrolling, and display project files using relative paths.
 - Refresh the model shown in subsequent Turn previews after changing Model or Provider, without relabeling running or completed Turns.
