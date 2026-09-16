@@ -10,6 +10,7 @@ import type {
 } from "../../src/codex/ThreadWriterProcess.js";
 import type { AppConfig } from "../../src/config/schema.js";
 import { generateGroupAvatarPng, resolveGroupAvatarProjectName } from "../../src/feishu/GroupAvatarGenerator.js";
+import { FeishuTurnPresenter } from "../../src/feishu/FeishuTurnPresenter.js";
 import type { FeishuOutbound, IncomingMessage } from "../../src/feishu/types.js";
 import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
@@ -9259,16 +9260,69 @@ describe("ProxySessionController", () => {
   });
 
   test("does not change task settings when saving Provider defaults fails", async () => {
-    const { controller, runtime, store, config, persistAgentExecutionDefaults } = fixture();
+    const { controller, runtime, store, config, presenter, persistAgentExecutionDefaults } = fixture();
     await controller.onMessage(message("/new"));
     const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
     const original = store.getSession(id)!;
     const defaults = config.agents.codex?.defaults;
+    vi.mocked(presenter.updateSessionModel).mockClear();
     persistAgentExecutionDefaults.mockRejectedValueOnce(new Error("config is read-only"));
     await expect(controller.controlTaskSettings(id, "provider", "azure")).rejects.toThrow("config is read-only");
     expect(store.getSession(id)).toEqual(original);
     expect(runtime.getSession(id)?.modelProvider).toBe(original.modelProvider);
     expect(config.agents.codex?.defaults).toEqual(defaults);
+    expect(presenter.updateSessionModel).not.toHaveBeenCalled();
+  });
+
+  test.each(["model-card", "model-cli", "provider-card", "provider-cli"])(
+    "persists the execution model in the next Preview after %s changes",
+    async (entry) => {
+      const { controller, runtime, store, presenter, outbound } = fixture();
+      const actualPresenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
+      vi.mocked(presenter.registerSession).mockImplementation(actualPresenter.registerSession.bind(actualPresenter));
+      vi.mocked(presenter.updateSessionModel).mockImplementation(actualPresenter.updateSessionModel.bind(actualPresenter));
+      vi.mocked(presenter.startPendingTurn).mockImplementation(actualPresenter.startPendingTurn.bind(actualPresenter));
+      vi.mocked(presenter.onEvent).mockImplementation(actualPresenter.onEvent.bind(actualPresenter));
+      await controller.onMessage(message("/new"));
+      const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+      expect(runtime.getSession(id)?.model).toBe("gpt-test");
+      vi.mocked(presenter.updateSessionModel).mockClear();
+      const listModels = vi.mocked(runtime.listModels).getMockImplementation()!;
+      vi.mocked(runtime.listModels).mockImplementation(async (provider, model) => {
+        const models = await listModels(provider, model);
+        return provider === "azure" ? models.filter((candidate) => candidate.id === "gpt-next") : models;
+      });
+      if (entry.endsWith("-cli")) {
+        await controller.controlTaskSettings(id, entry.startsWith("model") ? "model" : "provider", entry.startsWith("model") ? "gpt-next" : "azure");
+      } else {
+        await controller.onMessage(message(entry.startsWith("model") ? "/model" : "/provider"));
+        await controller.onCardAction({
+          actionId: entry, contextKey: "chat_id:c1", messageId: "settings",
+          value: entry.startsWith("model")
+            ? { action: "settings_model_select", sessionId: id, model: "gpt-next" }
+            : { action: "settings_provider_select", sessionId: id, provider: "azure" },
+        });
+      }
+      expect(presenter.updateSessionModel).toHaveBeenLastCalledWith(id, "gpt-next");
+      await controller.onMessage(message("run with the selected model"));
+      await vi.waitFor(() => expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "gpt-next" }));
+      expect(runtime.getSession(id)?.model).toBe("gpt-next");
+      await actualPresenter.onEvent({ type: "turn_completed", sessionId: id, turnId: "turn_1", finalResponse: "done" });
+      expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "gpt-next", status: "completed" });
+    },
+  );
+
+  test("refreshes a loaded task's model before preparing its next turn", async () => {
+    const { controller, runtime, store, presenter } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    runtime.getSession(id)!.model = "gpt-next";
+    vi.mocked(presenter.updateSessionModel).mockClear();
+    vi.mocked(presenter.startPendingTurn).mockClear();
+    await controller.onMessage(message("use current runtime settings"));
+    expect(presenter.updateSessionModel).toHaveBeenLastCalledWith(id, "gpt-next");
+    expect(vi.mocked(presenter.updateSessionModel).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(presenter.startPendingTurn).mock.invocationCallOrder[0]!);
   });
 
   test("switches Provider, Model, Thinking, and Permission through one tabbed card", async () => {

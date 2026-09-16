@@ -1712,6 +1712,7 @@ export class ProxySessionController {
         await loaded.runtime.setReasoningEffort(record.localSessionId, nextEffort);
       }
       this.store.updateRuntimeSession(record.localSessionId, { model: nextValue, reasoningEffort: nextEffort });
+      this.outbound.updateSessionModel(record.localSessionId, nextValue);
     } else if (setting === "thinking" && nextValue) {
       const models = await loaded.runtime.listModels(loaded.session.modelProvider, loaded.session.model);
       const currentModel = models.find((candidate) => candidate.id === loaded.session.model)
@@ -3738,6 +3739,10 @@ export class ProxySessionController {
       while (true) {
         let pendingTurnId: string | undefined;
         try {
+          this.outbound.updateSessionModel(
+            loaded.record.localSessionId,
+            loaded.runtime.getSession(loaded.record.localSessionId)?.model ?? loaded.session.model,
+          );
           pendingTurnId = await this.outbound.startPendingTurn(
             loaded.record.localSessionId,
             loaded.record.contextKey,
@@ -5191,7 +5196,9 @@ export class ProxySessionController {
         throw error;
       }
     };
-    return loaded.runtime.setExecutionSettings(loaded.record.localSessionId, settings, persist);
+    const session = await loaded.runtime.setExecutionSettings(loaded.record.localSessionId, settings, persist);
+    this.outbound.updateSessionModel(loaded.record.localSessionId, session.model);
+    return session;
   }
 
   private async assertProviderModelSettings(
@@ -5253,6 +5260,7 @@ export class ProxySessionController {
       await loaded.runtime.setReasoningEffort(loaded.record.localSessionId, nextEffort);
     }
     this.store.updateRuntimeSession(loaded.record.localSessionId, { model, reasoningEffort: nextEffort });
+    this.outbound.updateSessionModel(loaded.record.localSessionId, model);
     await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
     const effortMessage = nextEffort && nextEffort !== currentEffort
       ? `，思考强度已自动调整为 ${nextEffort}`
