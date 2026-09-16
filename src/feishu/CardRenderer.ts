@@ -2398,7 +2398,7 @@ function truncateToolResult(result: string): string {
   return `${result.slice(0, headLength)}${marker}${result.slice(-tailLength)}`;
 }
 
-function displayFilePath(filePath: string, projectCwd?: string): string {
+export function displayFilePath(filePath: string, projectCwd?: string): string {
   if (!projectCwd) return filePath;
   const pathApi = usesWindowsPaths(projectCwd, filePath) ? path.win32 : path;
   const normalizedCwd = pathApi.resolve(projectCwd);
@@ -2421,8 +2421,12 @@ function usesWindowsPaths(...values: string[]): boolean {
   return values.some((value) => /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value));
 }
 
+export function toolStatusIcon(status: ToolState["status"]): string {
+  return status === "failed" ? "❌" : status === "running" ? "⏳" : "✅";
+}
+
 function toolPanelTitle(tool: ToolState): string {
-  const icon = tool.status === "failed" ? "❌" : tool.status === "running" ? "⏳" : "✅";
+  const icon = toolStatusIcon(tool.status);
   const command = stripAnsi(tool.command ?? tool.title).trim();
   const meaningfulCommand = tool.kind === "web_search"
     ? tool.title

@@ -685,7 +685,7 @@ describe("LocalFileViewerServer", () => {
       expect(update.content).toContain("npm test");
       expect(update.content).toContain("all passed");
       expect(update.content).not.toContain("/bin/zsh -lc");
-      expect(update.content).toContain("耗时 00:01");
+      expect(update.content).toContain('class="tool-header-timing">1s</span>');
       expect(update.content).toContain("完成 <strong>Preview</strong>。");
       const updatedImageUrl = /<img src="([^"]+)" alt="QR"/u.exec(update.content)?.[1]?.replaceAll("&amp;", "&");
       expect(updatedImageUrl).toBe(imageUrl);

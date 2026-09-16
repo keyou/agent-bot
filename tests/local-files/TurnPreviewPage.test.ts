@@ -72,12 +72,36 @@ describe("Turn Preview", () => {
     const { content } = renderTurnPreviewSnapshot(input, resolveUrl);
     expect(content.match(/class="file-link"/gu)).toHaveLength(3);
     expect(content).toContain('href="https://viewer.example/preview/signed?path=file&amp;mode=code" target="_blank" rel="noreferrer noopener"');
-    expect(content).toContain("<code>src/changed &amp; reviewed.ts</code></a>");
+    expect(content.split(`<code>${path.join("src", "changed &amp; reviewed.ts")}</code></a>`)).toHaveLength(4);
     expect(content).toContain('<span class="additions">+3</span>');
     expect(content).toContain('<span class="deletions">-1</span>');
     expect(content).toContain("<li><code>removed.ts</code></li>");
     expect(resolveUrl).toHaveBeenCalledWith(absolutePath);
     expect(resolveUrl).not.toHaveBeenCalledWith(file.path);
+  });
+
+  test.each([
+    [path.resolve("preview-project"), path.resolve("preview-project/src/file.ts"), path.join("src", "file.ts")],
+    [path.resolve("preview-project"), "./src/file.ts", path.join("src", "file.ts")],
+    [path.resolve("preview-project"), "../external.ts", path.resolve("external.ts")],
+    [path.resolve("preview-project"), path.resolve("preview-project-other/file.ts"), path.resolve("preview-project-other/file.ts")],
+    [path.resolve("preview-project"), "..cache/file.ts", path.join("..cache", "file.ts")],
+    ["C:\\project", "c:/project/src/file.ts", "src\\file.ts"],
+    ["C:\\project", "C:/project-other/file.ts", "C:\\project-other\\file.ts"],
+    ["C:\\project", "D:/project/file.ts", "D:\\project\\file.ts"],
+    ["\\\\server\\share\\project", "\\\\server\\share\\project\\src\\file.ts", "src\\file.ts"],
+    ["\\\\server\\share\\project", "\\\\server\\other\\file.ts", "\\\\server\\other\\file.ts"],
+  ])("displays %s / %s relative only when it belongs to the project", (projectCwd, filePath, expected) => {
+    const file = { path: filePath };
+    const input = state({ files: [file] });
+    input.projectCwd = projectCwd;
+    input.fileSummary = [file];
+    const resolveUrl = vi.fn(() => undefined);
+    for (const viewer of [undefined, resolveUrl]) {
+      const { content } = renderTurnPreviewSnapshot(input, viewer);
+      expect(content.split(`<code>${expected}</code>`)).toHaveLength(3);
+      expect(content).not.toContain('class="file-link"');
+    }
   });
 
   test("keeps file paths readable without a viewer or a project directory", () => {
@@ -103,8 +127,10 @@ describe("Turn Preview", () => {
     const snapshot = renderTurnPreviewSnapshot(input, undefined, "en");
     expect(snapshot.statusLabel).toBe("Processing");
     expect(snapshot.content).toContain('<code class="tool-command-title">npm test</code>');
-    expect(snapshot.content).toContain(">Output");
-    expect(snapshot.content).toContain("Duration 00:01");
+    expect(snapshot.content).toContain('aria-label="Output"');
+    expect(snapshot.content).toContain('title="Start time"');
+    expect(snapshot.content).toContain("14 characters");
+    expect(snapshot.content).toContain('class="tool-header-timing">1s</span>');
     expect(snapshot.content).toContain("Success");
     expect(snapshot.content).toContain("command output");
     expect(snapshot.content).not.toContain(">命令<");
@@ -156,8 +182,9 @@ describe("Turn Preview", () => {
     expect(content).not.toContain("Sixth thought.");
     expect(content).toContain("Checking the code.");
     expect(content).toContain("Also check mobile.");
-    expect(content).toContain('<section class="tool-step" ');
-    expect(content).not.toContain('<details class="tool-step"');
+    expect(content).toContain('<details class="tool-step" ');
+    expect(content).toContain('<summary class="tool-header">');
+    expect(content).not.toContain('<details class="tool-step" open');
   });
 
   test("does not render original reasoning when more reasoning arrives", () => {
@@ -198,7 +225,7 @@ describe("Turn Preview", () => {
     expect(body).toMatch(/<h1[^>]*>Turn Preview<\/h1>/u);
   });
 
-  test("expands the cleaned command once and collapses identical output and error into one disclosure", () => {
+  test("collapses the cleaned command to a summary and keeps the full command in the body", () => {
     const startedAt = new Date(2026, 8, 12, 7, 30, 1).getTime();
     const { content } = renderTurnPreviewSnapshot(state({
       status: "failed", exitCode: 1,
@@ -206,23 +233,68 @@ describe("Turn Preview", () => {
       output: "Command failed.\r\n<script>bad</script>\r\n",
       error: "Command failed.\n<script>bad</script>",
     }));
-    expect(content.split("npm test")).toHaveLength(2);
+    expect(content.split("npm test")).toHaveLength(3);
     expect(content).not.toContain("/bin/zsh");
-    expect(content).toMatch(/<section class="tool-step" /u);
+    expect(content).toMatch(/<details class="tool-step" /u);
+    expect(content).toContain('<summary class="tool-header">');
     expect(content).toContain('<code class="tool-command-title">npm test</code>');
-    expect(content).not.toContain('class="command-block"');
-    const header = /<div class="tool-header"[^>]*>([\s\S]*?)<\/div>/u.exec(content)?.[1] ?? "";
-    expect(header).not.toContain("tool-state");
-    expect(content).toContain('<span class="tool-output-meta"><span title="开始时间">07:30:01</span><span>耗时 00:01</span><span class="tool-state failed"');
-    expect(content).toMatch(/<details class="tool-output error-output" data-activity-id="tool:1:output">/u);
-    expect(content).not.toContain('data-activity-id="tool:1:error"');
+    expect(content).toContain('<pre class="command-block"');
+    const header = /<summary class="tool-header"[^>]*>([\s\S]*?)<\/summary>/u.exec(content)?.[1] ?? "";
+    expect(header).toContain('title="失败">❌</span>');
+    expect(header).not.toContain('class="tool-state');
+    expect(header).toContain('class="tool-header-timing">1s</span>');
+    expect(content.match(/class="tool-state failed"/gu)).toHaveLength(1);
+    expect(header).not.toContain('title="开始时间"');
+    expect(content).toContain('<pre class="tool-output error-output" aria-label="结果 / 错误">');
+    expect(content.match(/<details /gu)).toHaveLength(1);
+    expect(content).toContain('<span class="tool-command-prefix" aria-hidden="true">$</span>');
+    expect(content).toContain(`datetime="${new Date(startedAt).toISOString()}" title="开始时间">07:30:01</time>`);
+    expect(content).toContain("39 字符");
     expect(content.split("Command failed.")).toHaveLength(2);
     expect(content).toContain("&lt;script&gt;bad&lt;/script&gt;");
     expect(content).not.toContain("<script>");
     expect(content).not.toContain("退出码 1");
-    expect(content).toContain("耗时 00:01");
-    expect(content.indexOf(">命令<")).toBeLessThan(content.indexOf(">失败<"));
+    expect(content).not.toContain("耗时 00:01");
     expect(content).not.toContain(">完成<");
+  });
+
+  test("keeps the tool status visible and uses more than the first line in a command summary", () => {
+    const input = state({
+      command: "@'\nconst result = await inspectProject();\nconsole.log(result);\n'@ | node",
+      startedAt: 1_000, completedAt: 3_000,
+    });
+    const { content } = renderTurnPreviewSnapshot(input);
+    const header = /<summary class="tool-header"[^>]*>([\s\S]*?)<\/summary>/u.exec(content)?.[1] ?? "";
+    expect(header).toContain("@&#39; const result = await inspectProject(); console.log(result);");
+    expect(header).toContain('class="tool-header-timing">2s</span>');
+    expect(header).toContain('title="成功">✅</span>');
+    expect(content).toContain("const result = await inspectProject();\nconsole.log(result);");
+  });
+
+  test.each([
+    [0, ""], [500, ""], [58_000, "58s"], [60_000, "1:00"], [152_000, "2:32"],
+  ])("shows compact nonzero durations for %i ms in the header and fixed footer", (durationMs, expected) => {
+    const { content } = renderTurnPreviewSnapshot(state({
+      startedAt: 1_000, completedAt: 1_000 + durationMs,
+      output: "output contents", error: "error contents", files: [{ path: "changed.ts" }],
+    }));
+    const header = /<summary class="tool-header">([\s\S]*?)<\/summary>/u.exec(content)![1]!;
+    expect(header).toContain(`class="tool-header-timing">${expected}</span>`);
+    expect(header).toContain('title="成功">✅</span>');
+    const body = content.slice(content.indexOf('<div class="tool-body">'));
+    expect(body).toContain('class="tool-state completed">成功</span>');
+    expect(body).toContain(`class="tool-footer-timing">${expected}</span>`);
+    expect(body).not.toContain("tool-header-timing");
+    expect(body).toContain('title="开始时间"');
+    expect(body).toContain("29 字符");
+    expect(body).not.toContain("<details");
+    expect(body).not.toContain("耗时");
+    expect(body).toContain("输出");
+    expect(body).toContain("错误");
+    expect(body).toContain("文件");
+    expect(body).toContain("output contents");
+    expect(body).toContain("error contents");
+    expect(body).toContain("changed.ts");
   });
 
   test("formats REPL input as readable code instead of showing the argument JSON", () => {
@@ -243,7 +315,8 @@ describe("Turn Preview", () => {
     expect(content).not.toContain('class="command-block"');
     expect(content).toContain("const first = 1;\nconst second = first + 1;");
     expect(content).not.toContain('"input"');
-    expect(content).toContain(">结果<");
+    expect(content).toContain('aria-label="结果"');
+    expect(content).toContain("22 字符");
     expect(content).toContain("value: 2\nmessage: done");
     expect(content).not.toContain("structuredContent");
     expect(content).not.toContain("executionTimeMs");
@@ -305,24 +378,38 @@ describe("Turn Preview", () => {
     const { content } = renderTurnPreviewSnapshot(input);
     expect(content).toContain(`head ${"x".repeat(7_000)} tail`);
     expect(content).not.toContain("…tail");
+    expect(content).toContain("7,010 字符");
   });
 
   test("keeps distinct error details and tool images available", () => {
     const { content } = renderTurnPreviewSnapshot(state({
       output: "partial output", error: "a different failure", imagePath: "C:/test/image.png",
     }), () => "http://localhost/file?signed=1");
-    expect(content).toContain('data-activity-id="tool:1:output"');
-    expect(content).toContain('<details class="tool-output error-output" data-activity-id="tool:1:error">');
+    expect(content).toContain('<pre class="tool-output" aria-label="输出">');
+    expect(content).toContain('<pre class="tool-output error-output" aria-label="错误">');
+    expect(content.match(/<details /gu)).toHaveLength(1);
     expect(content).toContain("partial output");
     expect(content).toContain("a different failure");
     expect(content).toContain('src="http://localhost/file?signed=1&amp;raw=1"');
   });
 
+  test("shares one scroll region and keeps start time and result size outside it", () => {
+    const { content } = renderTurnPreviewSnapshot(state({
+      startedAt: undefined, completedAt: undefined,
+      command: "npm test", output: "test output", files: [{ path: "changed.ts" }],
+    }));
+    expect(content.match(/<details /gu)).toHaveLength(1);
+    expect(content.match(/data-scroll-id=/gu)).toHaveLength(1);
+    expect(content).toContain('class="tool-content" data-scroll-id="tool:1:content" tabindex="0"');
+    expect(content).toMatch(/<\/ul><\/div><div class="tool-footer"><span class="tool-state completed">成功<\/span><span title="开始时间">未知<\/span><span class="tool-footer-timing">\?<\/span><span>11 字符<\/span><\/div>/u);
+    expect(content.indexOf('class="command-block"')).toBeLessThan(content.indexOf('class="tool-output"'));
+  });
+
   test("ticks only live tools and leaves unknown terminal durations unknown", () => {
     const running = renderTurnPreviewSnapshot(state({ status: "running", completedAt: undefined }));
-    expect(running.content).toContain("data-live-tool-duration");
+    expect(running.content.match(/data-live-tool-duration/gu)).toHaveLength(2);
     const unknown = renderTurnPreviewSnapshot(state({ completedAt: undefined }));
-    expect(unknown.content).toContain("耗时未知");
+    expect(unknown.content).toContain('class="tool-header-timing">?</span>');
     expect(unknown.content).not.toContain("data-live-tool-duration");
     const completed = state({});
     completed.status = "failed";
@@ -330,5 +417,32 @@ describe("Turn Preview", () => {
     expect(page).not.toContain("data-live-elapsed");
     expect(page).not.toContain(">已完成<");
     expect(page).toContain(">执行失败<");
+  });
+
+  test.each([
+    ["running", "⏳", "进行中"], ["completed", "✅", "成功"], ["failed", "❌", "失败"],
+  ] as const)("places the %s icon before the title and the text status in the footer", (status, icon, label) => {
+    const { content } = renderTurnPreviewSnapshot(state({ status }));
+    const header = /<summary class="tool-header">([\s\S]*?)<\/summary>/u.exec(content)![1]!;
+    expect(content).toContain(`data-tool-status="${status}"`);
+    expect(header).toContain(`aria-label="${label}" title="${label}">${icon}</span>`);
+    expect(header.indexOf(icon)).toBeLessThan(header.indexOf('class="tool-command-title"'));
+    expect(header).not.toContain('class="tool-state');
+    expect(content).toContain(`<div class="tool-footer"><span class="tool-state ${status}">${label}</span>`);
+  });
+
+  test.each(["\\", "`", "^"])("omits %s line continuations in summaries while preserving paths and full commands", (continuation) => {
+    const command = `Get-Content C:\\src\\file.ts ${continuation}\n  -Raw`;
+    const { content } = renderTurnPreviewSnapshot(state({ command }));
+    const header = /<summary class="tool-header">([\s\S]*?)<\/summary>/u.exec(content)![1]!;
+    expect(header).toContain('<code class="tool-command-title">Get-Content C:\\src\\file.ts -Raw</code>');
+    expect(content).toContain(`<pre class="command-block">${command}</pre>`);
+  });
+
+  test("omits display-only shell continuation markers from compound command summaries", () => {
+    const { content } = renderTurnPreviewSnapshot(state({ command: "npm test && npm run build" }));
+    const header = /<summary class="tool-header">([\s\S]*?)<\/summary>/u.exec(content)![1]!;
+    expect(header).toContain('<code class="tool-command-title">npm test &amp;&amp; npm run build</code>');
+    expect(content).toContain("npm test &amp;&amp; \\\n  npm run build");
   });
 });

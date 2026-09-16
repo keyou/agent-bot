@@ -2,7 +2,7 @@ import path from "node:path";
 import MarkdownIt from "markdown-it";
 import type { ToolState } from "../runtime/types.js";
 import type { FileSummary, TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
-import { displayToolCommand, formatShellCommandForDisplay } from "../feishu/CardRenderer.js";
+import { displayFilePath, displayToolCommand, formatShellCommandForDisplay, toolStatusIcon } from "../feishu/CardRenderer.js";
 import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 
 const MARKDOWN = new MarkdownIt({
@@ -164,7 +164,12 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = `(() => {
       const duration = hours > 0
         ? String(hours).padStart(2, "0") + ":" + String(minutes).padStart(2, "0") + ":" + String(remainder).padStart(2, "0")
         : String(minutes).padStart(2, "0") + ":" + String(remainder).padStart(2, "0");
-      element.textContent = labels.elapsed + duration;
+      const shortDuration = hours > 0
+        ? String(hours * 60 + minutes) + ":" + String(remainder).padStart(2, "0")
+        : minutes > 0
+          ? String(minutes) + ":" + String(remainder).padStart(2, "0")
+          : remainder > 0 ? String(remainder) + "s" : "";
+      element.textContent = element.dataset.shortDuration === "1" ? shortDuration : labels.elapsed + duration;
     });
   };
   updateElapsed();
@@ -288,7 +293,7 @@ export function renderTurnPreviewSnapshot(
     return localFileUrl(path.resolve(state.projectCwd, filePath));
   } : undefined;
   const renderText = (value: string): string => renderMarkdown(value, state.projectCwd, localFileUrl);
-  const timeline = renderTimeline(state.activities ?? [], renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language);
+  const timeline = renderTimeline(state.activities ?? [], renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd);
   const sections = [
     state.prompt ? renderMessageActivity("prompt", state.prompt, "user prompt", renderText) : "",
     state.plan.length > 0 ? renderPlan(state, language) : "",
@@ -331,10 +336,11 @@ function renderTimeline(
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
+  projectCwd?: string,
 ): string {
   return activities
     .filter((activity): activity is Exclude<TurnActivity, { kind: "reasoning" }> => activity.kind !== "reasoning")
-    .map((activity) => renderActivity(activity, renderText, localFileUrl, fullToolOutputs, fullToolErrors, language))
+    .map((activity) => renderActivity(activity, renderText, localFileUrl, fullToolOutputs, fullToolErrors, language, projectCwd))
     .join("");
 }
 
@@ -345,6 +351,7 @@ function renderActivity(
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
+  projectCwd?: string,
 ): string {
   switch (activity.kind) {
     case "assistant":
@@ -352,7 +359,7 @@ function renderActivity(
     case "user":
       return renderMessageActivity(activity.id, activity.text, "user", renderText);
     case "tool":
-      return renderToolActivity(activity.id, activity.tool, localFileUrl, fullToolOutputs, fullToolErrors, language);
+      return renderToolActivity(activity.id, activity.tool, localFileUrl, fullToolOutputs, fullToolErrors, language, projectCwd);
   }
 }
 
@@ -367,6 +374,7 @@ function renderToolActivity(
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
+  projectCwd?: string,
 ): string {
   const labels = previewLabels(language);
   const command = tool.command ? (displayToolCommand(tool.command) || tool.command.trim()) : undefined;
@@ -376,29 +384,40 @@ function renderToolActivity(
     : command
       ? formatToolCommand(command)
       : undefined;
-  const commandInHeader = Boolean(displayCommand);
-  const title = commandInHeader ? displayCommand! : toolTitle(tool, command, repl, language);
+  const title = displayCommand ? summarizeToolCommand(displayCommand) : toolTitle(tool, command, repl, language);
   const output = fullToolOutputs?.[tool.id] ?? tool.output;
   const error = fullToolErrors?.[tool.id] ?? tool.error;
   const sameError = Boolean(output && error && normalizeOutput(output) === normalizeOutput(error));
+  const displayOutput = output && repl && !sameError ? formatReplOutput(output) : output;
+  const displayError = sameError ? undefined : error;
   const detailParts = [
-    displayCommand && !commandInHeader ? `<pre class="command-block${repl ? " repl-code" : ""}" data-scroll-id="${escapeAttribute(`${activityId}:command`)}">${escapeHtml(displayCommand)}</pre>` : "",
-    output
-      ? renderToolOutput(activityId, "output", sameError ? labels.resultError : repl ? labels.result : labels.output, output, sameError, repl, language, tool)
+    displayCommand ? `<div class="tool-command"><span class="tool-command-prefix" aria-hidden="true">$</span><pre class="command-block${repl ? " repl-code" : ""}">${escapeHtml(displayCommand)}</pre></div>` : "",
+    displayOutput
+      ? renderToolOutput(sameError ? labels.resultError : repl ? labels.result : labels.output, displayOutput, sameError, repl)
       : "",
-    error && !sameError
-      ? renderToolOutput(activityId, "error", labels.error, error, true, repl, language, tool)
+    displayError
+      ? renderToolOutput(labels.error, displayError, true, repl)
       : "",
-    !output && !error && !tool.files?.length ? renderToolStatusRow(tool, language) : "",
     renderToolImage(tool, localFileUrl, language),
     tool.files?.length
-      ? `<details class="tool-output" data-activity-id="${escapeAttribute(`${activityId}:files`)}"><summary><span class="tool-output-label">${escapeHtml(labels.files)}</span><span class="tool-output-meta">${renderToolTiming(tool, language)}<span class="tool-state ${tool.status}" aria-label="${escapeAttribute(tool.status)}">${toolStatusIcon(tool.status, language)}</span><span>${tool.files.length}</span></span></summary><ul class="files">${tool.files.map((file) => renderFileEntry(file, localFileUrl)).join("")}</ul></details>`
+      ? `<ul class="files" aria-label="${escapeAttribute(labels.files)}">${tool.files.map((file) => renderFileEntry(file, localFileUrl, projectCwd)).join("")}</ul>`
       : "",
   ].filter(Boolean).join("");
-  const titleMarkup = commandInHeader
+  const titleMarkup = displayCommand
     ? `<code class="tool-command-title">${escapeHtml(title)}</code>`
     : `<span class="tool-title">${escapeHtml(title)}</span>`;
-  return `<article class="activity tool"><section class="tool-step" data-activity-id="${escapeAttribute(activityId)}"><div class="tool-header" data-scroll-id="${escapeAttribute(`${activityId}:command`)}">${titleMarkup}</div><div class="tool-body">${detailParts || `<div class="muted">${escapeHtml(labels.noToolDetails)}</div>`}</div></section></article>`;
+  const timing = renderToolTiming(tool, "header");
+  const statusLabel = toolStatusLabel(tool.status, language);
+  const icon = `<span class="tool-status-icon" role="img" aria-label="${escapeAttribute(statusLabel)}" title="${escapeAttribute(statusLabel)}">${toolStatusIcon(tool.status)}</span>`;
+  const status = `<span class="tool-state ${tool.status}">${escapeHtml(statusLabel)}</span>`;
+  const header = `<summary class="tool-header">${icon}<span class="tool-summary-content">${titleMarkup}</span><span class="tool-meta">${timing}</span></summary>`;
+  const startedAt = tool.startedAt === undefined ? undefined : new Date(tool.startedAt);
+  const startTime = startedAt
+    ? `<time datetime="${startedAt.toISOString()}" title="${escapeAttribute(labels.startingTime)}">${new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(startedAt)}</time>`
+    : `<span title="${escapeAttribute(labels.startingTime)}">${escapeHtml(labels.unknown)}</span>`;
+  const characterCount = (displayOutput?.length ?? 0) + (displayError?.length ?? 0);
+  const footer = `<div class="tool-footer">${status}${startTime}${renderToolTiming(tool, "footer")}<span>${formatNumber(characterCount)} ${escapeHtml(labels.characters)}</span></div>`;
+  return `<article class="activity tool"><details class="tool-step" data-tool-status="${tool.status}" data-activity-id="${escapeAttribute(activityId)}">${header}<div class="tool-body"><div class="tool-content" data-scroll-id="${escapeAttribute(`${activityId}:content`)}" tabindex="0">${detailParts || `<div class="muted">${escapeHtml(labels.noToolDetails)}</div>`}</div>${footer}</div></details></article>`;
 }
 
 function toolTitle(tool: ToolState, command?: string, repl = false, language: TurnPreviewLanguage = "zh"): string {
@@ -406,6 +425,12 @@ function toolTitle(tool: ToolState, command?: string, repl = false, language: Tu
   if (command) return tool.kind === "command" ? previewLabels(language).command : tool.kind;
   const title = tool.title.trim();
   return title || tool.kind;
+}
+
+function summarizeToolCommand(command: string): string {
+  const summary = command.replace(/[\\`^][ \t]*\r?\n/gu, " ").replace(/\s+/gu, " ").trim();
+  if (summary.length <= 160) return summary;
+  return `${summary.slice(0, 157).trimEnd()}…`;
 }
 
 function isReplTool(tool: ToolState): boolean {
@@ -518,36 +543,29 @@ function normalizeReplText(value: string): string {
 }
 
 function renderToolOutput(
-  activityId: string,
-  kind: string,
   label: string,
   value: string,
   error = false,
   repl = false,
-  language: TurnPreviewLanguage = "zh",
-  tool?: ToolState,
 ): string {
-  const id = escapeAttribute(`${activityId}:${kind}`);
-  const displayValue = repl && !error ? formatReplOutput(value) : value;
-  const labels = previewLabels(language);
-  const status = tool?.status ?? "completed";
-  const timing = tool ? renderToolTiming(tool, language) : "";
-  return `<details class="tool-output${error ? " error-output" : ""}${repl ? " repl-result" : ""}" data-activity-id="${id}"><summary><span class="tool-output-label">${escapeHtml(label)}</span><span class="tool-output-meta">${timing}<span class="tool-state ${status}" aria-label="${escapeAttribute(status)}">${toolStatusIcon(status, language)}</span><span>${formatNumber(displayValue.length)} ${escapeHtml(labels.characters)}</span></span></summary><pre data-scroll-id="${id}">${escapeHtml(displayValue)}</pre></details>`;
+  return `<pre class="tool-output${error ? " error-output" : ""}${repl ? " repl-result" : ""}" aria-label="${escapeAttribute(label)}">${escapeHtml(value)}</pre>`;
 }
 
-function renderToolStatusRow(tool: ToolState, language: TurnPreviewLanguage): string {
-  const timing = renderToolTiming(tool, language);
-  return `<div class="tool-status-row"><span class="tool-output-meta">${timing}<span class="tool-state ${tool.status}" aria-label="${escapeAttribute(tool.status)}">${toolStatusIcon(tool.status, language)}</span></span></div>`;
-}
-
-function renderToolTiming(tool: ToolState, language: TurnPreviewLanguage): string {
-  const labels = previewLabels(language);
-  const start = tool.startedAt === undefined ? labels.unknown : formatTimestamp(tool.startedAt);
+function renderToolTiming(tool: ToolState, placement: "header" | "footer"): string {
+  const className = `tool-${placement}-timing`;
   const duration = toolDuration(tool);
-  const liveDuration = duration === undefined
-    ? `<span>${escapeHtml(labels.elapsed.trim())}${language === "zh" ? "" : " "}${escapeHtml(labels.unknown)}</span>`
-    : `<span${tool.status === "running" && tool.completedAt === undefined ? ` data-live-tool-duration data-started-at="${tool.startedAt}"` : ""}>${escapeHtml(labels.elapsed)}${escapeHtml(duration)}</span>`;
-  return `<span title="${escapeAttribute(labels.startingTime)}">${escapeHtml(start)}</span>${liveDuration}`;
+  if (duration === undefined) {
+    return `<span class="${className}">?</span>`;
+  }
+  const live = tool.status === "running" && tool.completedAt === undefined;
+  return `<span class="${className}"${live ? ` data-live-tool-duration data-started-at="${tool.startedAt}" data-short-duration="1"` : ""}>${formatShortDuration(duration)}</span>`;
+}
+
+function formatShortDuration(duration: string): string {
+  const parts = duration.split(":").map(Number);
+  const seconds = parts.at(-1) ?? 0;
+  const minutes = parts.length > 2 ? (parts.at(-2) ?? 0) + (parts.at(-3) ?? 0) * 60 : parts.at(-2) ?? 0;
+  return minutes > 0 ? `${minutes}:${String(seconds).padStart(2, "0")}` : seconds > 0 ? `${seconds}s` : "";
 }
 
 function renderToolImage(
@@ -573,12 +591,12 @@ function renderFileSummary(
   localFileUrl?: (filePath: string) => string | undefined,
 ): string {
   const labels = previewLabels(language);
-  const files = state.fileSummary.map((file) => renderFileEntry(file, localFileUrl)).join("");
-  return `<section class="files-summary"><h2>${escapeHtml(labels.fileChanges)} <span>${state.fileSummary.length}</span></h2><ul class="files">${files}</ul></section>`;
+  const files = state.fileSummary.map((file) => renderFileEntry(file, localFileUrl, state.projectCwd)).join("");
+  return `<details class="files-summary" data-activity-id="turn:files-summary"><summary><h2>${escapeHtml(labels.fileChanges)} <span>${state.fileSummary.length}</span></h2></summary><ul class="files">${files}</ul></details>`;
 }
 
-function renderFileEntry(file: FileSummary, localFileUrl?: (filePath: string) => string | undefined): string {
-  const label = `<code>${escapeHtml(file.path)}</code>`;
+function renderFileEntry(file: FileSummary, localFileUrl?: (filePath: string) => string | undefined, projectCwd?: string): string {
+  const label = `<code>${escapeHtml(displayFilePath(file.path, projectCwd))}</code>`;
   const url = localFileUrl?.(file.path);
   const link = url
     ? `<a class="file-link" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`
@@ -630,7 +648,7 @@ function statusLabel(status: TurnViewStatus, language: TurnPreviewLanguage): str
   return previewLabels(language).statuses[status];
 }
 
-function toolStatusIcon(status: ToolState["status"], language: TurnPreviewLanguage): string {
+function toolStatusLabel(status: ToolState["status"], language: TurnPreviewLanguage): string {
   return status === "completed"
     ? previewLabels(language).toolStatuses.completed
     : status === "failed"
@@ -652,15 +670,6 @@ function formatDuration(durationMs: number): string {
   return hours > 0
     ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
     : `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
-}
-
-function formatTimestamp(timestampMs: number): string {
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(new Date(timestampMs));
 }
 
 function formatNumber(value: number): string {
@@ -716,14 +725,19 @@ h2 span { margin-left: 6px; color: var(--muted); font-size: 12px; font-weight: 4
 .metadata > span + span::before { content: "·"; position: absolute; left: 0; top: 0; }
 .metadata strong { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 main { max-width: 1320px; margin: 0 auto; padding: 0 20px 40px; }
-.plan, .files-summary, .result { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.plan, .files-summary, .result { padding: 14px 0; }
+.files-summary, .result { border-top: 1px solid var(--line); }
+.files-summary > summary h2 { margin: 0; }
+.files-summary > .files { padding-top: 8px; }
 .plan ol { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
 .plan li { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 6px; overflow-wrap: anywhere; }
 .plan li.completed { color: var(--muted); }
 .plan li.in_progress { color: var(--accent); }
 .timeline { padding-top: 2px; }
 .activity { min-width: 0; }
-.message { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.message { padding: 12px 0; }
+.prompt { border-bottom: 1px solid var(--line); }
+.timeline .markdown hr { display: none; }
 .markdown { min-width: 0; overflow-wrap: anywhere; }
 .message > .markdown, .result > .markdown { font-size: 14px; font-weight: 400; }
 .markdown > :first-child { margin-top: 0; }
@@ -748,47 +762,52 @@ summary:hover { background: transparent; }
 summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .tool { margin: 8px 0; }
 .tool-step { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: transparent; }
-.tool-header { display: flex; align-items: flex-start; gap: 8px; min-height: 32px; max-height: calc(15 * 12px * 1.55 + 14px); padding: 7px 10px; overflow: auto; background: transparent; font-weight: 400; }
-.tool-header, .tool-body pre { --tool-scrollbar-thumb: var(--scrollbar-thumb); scrollbar-width: thin; scrollbar-color: var(--tool-scrollbar-thumb) transparent; }
+.tool-step[data-tool-status="running"] { border-color: var(--accent); }
+.tool-header { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 7px 10px; overflow: hidden; background: transparent; font-weight: 400; }
+.tool-content { max-height: calc(30 * 12px * 1.55 + 16px); padding: 8px 12px; overflow: auto; --tool-scrollbar-thumb: var(--scrollbar-thumb); scrollbar-width: thin; scrollbar-color: var(--tool-scrollbar-thumb) transparent; }
+.tool-content > * + * { margin-top: 8px; }
+.tool-content pre { max-width: none; max-height: none; padding: 0; overflow: visible; background: transparent; }
+.tool-command { display: flex; align-items: flex-start; gap: 8px; width: max-content; min-width: 100%; }
+.tool-command-prefix { flex: none; color: var(--muted); font: 12px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace; }
+.tool-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 12px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tool-footer > * { white-space: nowrap; }
+.tool-footer > * + *::before { content: "·"; margin-right: 8px; }
 @media (hover: hover) and (pointer: fine) {
-  .tool-header, .tool-body pre { --tool-scrollbar-thumb: transparent; }
-  .tool-header:is(:hover, :focus-visible, :focus-within),
-  .tool-body pre:is(:hover, :focus-visible, :focus-within) { --tool-scrollbar-thumb: var(--scrollbar-thumb); }
+  .tool-content { --tool-scrollbar-thumb: transparent; }
+  .tool-content:is(:hover, :focus-visible, :focus-within) { --tool-scrollbar-thumb: var(--scrollbar-thumb); }
 }
 @supports selector(::-webkit-scrollbar) {
-  .tool-header, .tool-body pre { scrollbar-width: auto; scrollbar-color: auto; }
-  :is(.tool-header, .tool-body pre)::-webkit-scrollbar { width: 6px; height: 6px; }
-  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-track,
-  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-corner { background: transparent; }
-  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-thumb { background: var(--tool-scrollbar-thumb); border-radius: 3px; }
-  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
-  :is(.tool-header, .tool-body pre)::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+  .tool-content { scrollbar-width: auto; scrollbar-color: auto; }
+  .tool-content::-webkit-scrollbar { width: 6px; height: 6px; }
+  .tool-content::-webkit-scrollbar-track,
+  .tool-content::-webkit-scrollbar-corner { background: transparent; }
+  .tool-content::-webkit-scrollbar-thumb { background: var(--tool-scrollbar-thumb); border-radius: 3px; }
+  .tool-content::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+  .tool-content::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
 }
-.tool-state { display: inline-flex; flex: none; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; font-weight: 650; white-space: nowrap; }
+@media (hover: none), (pointer: coarse) {
+  .tool-content { scrollbar-width: none; }
+  .tool-content::-webkit-scrollbar { display: none; width: 0; height: 0; }
+}
+.tool-status-icon { display: inline-flex; flex: 0 0 16px; align-items: center; justify-content: center; font-size: 13px; line-height: 18px; }
+.tool-state { display: inline-flex; flex: none; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
 .tool-state.completed { color: var(--success); }
 .tool-state.running { color: var(--accent); }
 .tool-state.failed { color: var(--danger); }
-.tool-title { min-width: 0; flex: 1 0 auto; overflow-wrap: normal; font-size: 12px; font-weight: 400; line-height: 1.45; white-space: pre; }
-.tool-command-title { display: block; min-width: 0; flex: 1 0 auto; margin: 0; padding: 0; overflow-wrap: normal; background: transparent; color: var(--text); font: 12px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace; font-weight: 400; white-space: pre; }
-.tool-meta { display: flex; flex: 0 1 auto; flex-wrap: nowrap; gap: 12px; max-width: 48%; overflow: hidden; color: var(--muted); font-size: 11px; font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tool-summary-content { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+.tool-title, .tool-command-title { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-title { font-size: 12px; font-weight: 400; line-height: 1.45; }
+.tool-command-title { margin: 0; padding: 0; background: transparent; color: var(--text); font: 12px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace; font-weight: 400; }
+.tool-meta { display: flex; flex: 0 0 auto; flex-wrap: nowrap; align-items: center; gap: 12px; max-width: none; margin-left: auto; color: var(--muted); font-size: 11px; font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tool-meta span { white-space: nowrap; }
-.tool-body { border-top: 1px solid var(--line); }
-.tool-body > .muted { padding: 8px 12px; }
-.tool-output { border-top: 1px solid var(--line); }
-.tool-output:first-child { border-top: 0; }
-.tool-output > summary { padding: 4px 12px; background: transparent; color: var(--muted); font-size: 12px; }
-.tool-output-label { min-width: 0; }
-.tool-output-meta { display: inline-flex; align-items: center; gap: 12px; margin-left: auto; font-size: 11px; }
-.tool-status-row { display: flex; justify-content: flex-end; padding: 5px 12px; border-top: 1px solid var(--line); }
-.tool-output > pre { max-height: none; border-top: 1px solid var(--line); background: transparent; }
-.repl-code { background: transparent; }
-.repl-result > pre { white-space: pre; overflow-wrap: normal; background: transparent; }
-.error-output > summary, .error-result h2 { color: var(--danger); }
+.tool-header-timing { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tool-header-timing:empty, .tool-footer-timing:empty { display: none; }
+.error-output, .error-result h2 { color: var(--danger); }
 .muted, .empty { color: var(--muted); }
-.notice, .empty { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.notice, .empty { padding: 10px 0; }
 .notice { color: #926a08; }
 .files { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
-.tool-output .files { padding: 8px 12px; }
+.tool-content .files code { background: transparent; }
 .files li { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .files code { min-width: 0; }
 .files .file-link { min-width: 0; color: var(--accent); text-underline-offset: 2px; }
@@ -796,7 +815,6 @@ summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; 
 .additions { color: var(--success); }
 .deletions { color: var(--danger); }
 .file-delta { display: inline-flex; flex: none; gap: 6px; font: 12px "Cascadia Mono", Consolas, monospace; }
-.tool-image { padding: 8px 12px; border-top: 1px solid var(--line); }
 .tool-image img { display: block; max-width: 100%; max-height: 720px; }
 .final-result h2 { color: var(--success); }
 @media (max-width: 700px) {
@@ -809,9 +827,8 @@ summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; 
   .message { padding: 10px 0; }
   .tool-header { gap: 6px; padding: 7px 9px; }
   .tool-state { font-size: 11px; }
-  .tool-meta { flex: 0 1 auto; gap: 10px; max-width: 50%; font-size: 11px; }
-  .tool-output > summary { min-height: 40px; padding: 6px 10px; }
-  .tool-output-meta { gap: 10px; }
+  .tool-meta { gap: 10px; font-size: 11px; }
+  .tool-content, .tool-footer { padding-left: 10px; padding-right: 10px; }
   pre { padding: 8px 10px; }
 }
 @media (prefers-color-scheme: dark) {
