@@ -572,6 +572,7 @@ function fixture(
   const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } as unknown as Logger;
   const restart = vi.fn(async () => undefined);
   const cancelSafeRestart = vi.fn(async () => true);
+  const cancelAutomaticUpdate = vi.fn(async () => undefined);
   const rememberFeishuUserOpenId = vi.fn(async () => undefined);
   const persistAgentExecutionDefaults = vi.fn(async () => undefined);
   const shellCommandExecutor = vi.fn(async () => ({
@@ -596,6 +597,7 @@ function fixture(
       restart,
       supervised: true,
       cancelSafeRestart,
+      cancelAutomaticUpdate,
       rememberFeishuUserOpenId,
       persistAgentExecutionDefaults,
     },
@@ -622,6 +624,7 @@ function fixture(
     listeners,
     restart,
     cancelSafeRestart,
+    cancelAutomaticUpdate,
     rememberFeishuUserOpenId,
     persistAgentExecutionDefaults,
     shellCommandExecutor,
@@ -1274,6 +1277,22 @@ describe("ProxySessionController", () => {
     expect(vi.mocked(outbound.addReaction!).mock.invocationCallOrder[0]).toBeLessThan(
       rememberFeishuUserOpenId.mock.invocationCallOrder[0]!,
     );
+  });
+
+  test("routes automatic update cancellation once without creating an Agent turn", async () => {
+    const { controller, cancelAutomaticUpdate, config, runtime } = fixture();
+    config.feishu.userOpenId = "ou_owner";
+    config.feishu.respondToOwnerOnly = true;
+    const action = {
+      actionId: "cancel-auto-update", contextKey: "chat_id:private", messageId: "om_update", userId: "ou_owner",
+      value: { action: "agentbot_update_cancel", version: "0.1.23", token: "update-token" },
+    };
+    await controller.onCardAction({ ...action, actionId: "not-owner", userId: "ou_other" });
+    expect(cancelAutomaticUpdate).not.toHaveBeenCalled();
+    await controller.onCardAction(action);
+    await controller.onCardAction(action);
+    expect(cancelAutomaticUpdate).toHaveBeenCalledExactlyOnceWith(action);
+    expect(runtime.startTurn).not.toHaveBeenCalled();
   });
 
   test("cancels a safe restart from its card action once", async () => {

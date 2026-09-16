@@ -303,8 +303,9 @@ export class FeishuMessageClient implements FeishuOutbound {
   async sendInteractiveCard(
     contextKey: string,
     card: Record<string, unknown>,
+    idempotencyKey?: string,
   ): Promise<string | undefined> {
-    return this.sendMessage(contextKey, "interactive", await this.prepareInteractiveCard(card));
+    return this.sendMessage(contextKey, "interactive", await this.prepareInteractiveCard(card), idempotencyKey);
   }
 
   async replyText(

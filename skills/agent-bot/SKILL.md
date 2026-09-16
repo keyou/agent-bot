@@ -158,6 +158,8 @@ agentbot server stop
 
 `update` is only for npm-installed Agent Bot packages. It verifies the new package, sends a safe-restart card, waits for active tasks, and restarts immediately when the service is already idle. It automatically restores the prior version if activation fails. It refuses source checkouts and `npm link` installations.
 
+The Feishu service also checks stable npm `latest` once daily at a persisted random time between 10:00 and 17:00 (server local time). A new version sends the owner a private release-notes card with 60 seconds to cancel. If not cancelled, preparation runs in the background and activation waits for tasks, final deliveries, and the quiet inbound window before restarting. Each version is notified once per Profile; cancellation survives restarts. An interrupted countdown resumes with a fresh minute on the same card. No private recipient, unconfirmed notification delivery, or missing release notes means no automatic installation. Source/npm-link protections still apply. Set `updates.enabled: false` in the Profile config and safely restart to disable checks. Do not bypass the countdown or idle gate.
+
 Autostart is Profile-specific. Use `server autostart enable` for login startup, `server autostart enable --linger` on Linux only when the user explicitly requests startup before login, and `server autostart disable` to remove registration without stopping the current Server. Disabling Agent Bot autostart must not disable Linux user lingering because other services may use it.
 
 Use safe restart by default. Prefer `agentbot task restart` when hosted so the current task is resolved automatically. Use `--immediate` or `task restart --force` only when the user explicitly accepts interruption.

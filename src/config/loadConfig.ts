@@ -26,6 +26,10 @@ const DEFAULT_CONFIG = `feishu:
 console:
   enabled: true
 
+updates:
+  # Daily stable update check, private 60-second cancellation window, then safe update.
+  enabled: true
+
 fileViewer:
   enabled: true
   # Use 0.0.0.0 to accept LAN connections and automatically prefer

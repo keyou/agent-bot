@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { migrations } from "./migrations.js";
+import type { UpdateCheckSchedule, UpdateNotice } from "../updates/types.js";
 
 export type SessionStatus = "starting" | "ready" | "running" | "closed" | "failed";
 
@@ -285,6 +286,36 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS idx_chat_contexts_activity
       ON chat_contexts(last_activity_at)
     `);
+  }
+
+  getUpdateCheckSchedule(): UpdateCheckSchedule | undefined {
+    const row = this.db.prepare("SELECT value_json FROM update_check_schedule WHERE id = 1")
+      .get() as { value_json: string } | undefined;
+    return row ? JSON.parse(row.value_json) as UpdateCheckSchedule : undefined;
+  }
+
+  saveUpdateCheckSchedule(schedule: UpdateCheckSchedule): void {
+    this.db.prepare(`INSERT INTO update_check_schedule (id, value_json) VALUES (1, ?)
+      ON CONFLICT(id) DO UPDATE SET value_json = excluded.value_json`).run(JSON.stringify(schedule));
+  }
+
+  getUpdateNotice(version: string): UpdateNotice | undefined {
+    const row = this.db.prepare("SELECT value_json FROM update_notices WHERE version = ?")
+      .get(version) as { value_json: string } | undefined;
+    return row ? JSON.parse(row.value_json) as UpdateNotice : undefined;
+  }
+
+  saveUpdateNotice(notice: UpdateNotice): void {
+    this.db.prepare(`INSERT INTO update_notices (version, status, value_json) VALUES (?, ?, ?)
+      ON CONFLICT(version) DO UPDATE SET status = excluded.status, value_json = excluded.value_json`)
+      .run(notice.version, notice.status, JSON.stringify(notice));
+  }
+
+  listPendingUpdateNotices(): UpdateNotice[] {
+    const rows = this.db.prepare(`SELECT value_json FROM update_notices
+      WHERE status IN ('announcing', 'countdown', 'preparing', 'scheduled')`)
+      .all() as Array<{ value_json: string }>;
+    return rows.map((row) => JSON.parse(row.value_json) as UpdateNotice);
   }
 
   saveGoalCardDelivery(localSessionId: string, contextKey: string, messageId: string): void {

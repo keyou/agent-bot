@@ -72,7 +72,7 @@ export interface FeishuOutbound {
   sendText(contextKey: string, text: string): Promise<string | undefined>;
   sendFile?(contextKey: string, filePath: string): Promise<string | undefined>;
   sendMarkdown(contextKey: string, markdown: string, idempotencyKey?: string): Promise<string | undefined>;
-  sendInteractiveCard(contextKey: string, card: Record<string, unknown>): Promise<string | undefined>;
+  sendInteractiveCard(contextKey: string, card: Record<string, unknown>, idempotencyKey?: string): Promise<string | undefined>;
   replyText?(
     contextKey: string,
     target: MessageReplyTarget,

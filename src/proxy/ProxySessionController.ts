@@ -487,6 +487,7 @@ export interface ProxyLifecycle {
   supervised?: boolean;
   restart(contextKey: string, force: boolean, replyTarget?: MessageReplyTarget): Promise<void>;
   cancelSafeRestart?(scheduleId: number): Promise<boolean>;
+  cancelAutomaticUpdate?(action: CardAction): Promise<void>;
   rememberFeishuUserOpenId?(userOpenId: string): Promise<void> | void;
   persistAgentExecutionDefaults?(
     agentName: string,
@@ -975,7 +976,10 @@ export class ProxySessionController {
     await this.outbound.withReplyTarget(contextKey, replyTarget, async () => {
       try {
         const kind = String(scopedAction.value.action ?? "");
-        if (kind === "help_command") {
+        if (kind === "agentbot_update_cancel") {
+          if (!this.lifecycle?.cancelAutomaticUpdate) throw new Error("自动更新功能未启用。");
+          await this.lifecycle.cancelAutomaticUpdate(scopedAction);
+        } else if (kind === "help_command") {
           await this.executeHelpCommandAction(scopedAction, contextKey, replyTarget);
         } else if (kind === "turn_details") {
           await this.outbound.showDetails(contextKey, String(scopedAction.value.turnId ?? ""));

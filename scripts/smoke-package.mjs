@@ -212,6 +212,22 @@ try {
     throw new Error(`Installed self-update check returned an unexpected result: ${globalUpdateResult.stdout}`);
   }
 
+  const automaticUpdateEntry = path.join(globalPackageRoot, "dist", "updates", "AutomaticUpdatePreparer.js");
+  const support = JSON.parse(run(
+    process.execPath, [automaticUpdateEntry, "--check"], temporaryRoot, globalEnvironment,
+  ).stdout);
+  if (support.status !== "supported") {
+    throw new Error("Packaged automatic updater did not recognize the isolated global installation.");
+  }
+  if (!packageJson.version.includes("-")) {
+    const automaticUpdate = JSON.parse(run(
+      process.execPath, [automaticUpdateEntry, packageJson.version], temporaryRoot, globalEnvironment,
+    ).stdout);
+    if (automaticUpdate.status !== "current" || automaticUpdate.targetVersion !== packageJson.version) {
+      throw new Error("Packaged automatic updater did not preserve the requested stable version.");
+    }
+  }
+
   process.stdout.write(
     `Installed and initialized ${packageJson.name}@${packageJson.version} successfully.\n`,
   );

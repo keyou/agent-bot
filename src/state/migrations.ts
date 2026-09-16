@@ -195,4 +195,16 @@ export const migrations = [
   CREATE INDEX IF NOT EXISTS idx_card_action_bindings_created
     ON card_action_bindings(created_at);
   `,
+  `
+  CREATE TABLE IF NOT EXISTS update_check_schedule (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value_json TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS update_notices (
+    version TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    value_json TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_update_notices_status ON update_notices(status);
+  `,
 ] as const;

@@ -702,6 +702,19 @@ describe("FeishuMessageClient", () => {
     expect(content).not.toContain('"tag":"img"');
   });
 
+  test("sends private update cards with a durable idempotency key", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", data: { message_id: "om_update" } }));
+    globalThis.fetch = fetchMock;
+    const client = new FeishuMessageClient(config(), logger());
+    await expect(client.sendInteractiveCard("open_id:ou_owner", { schema: "2.0", body: { elements: [] } }, "update-uuid"))
+      .resolves.toBe("om_update");
+    const body = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({ receive_id: "ou_owner", uuid: "update-uuid", msg_type: "interactive" });
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("receive_id_type=open_id");
+  });
+
   test("uploads view_image previews in cards once and reuses the image key on updates", async () => {
     const imagePath = createImage("view.png");
     const fetchMock = vi.fn()

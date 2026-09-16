@@ -29,6 +29,9 @@ import { ProxySessionController } from "./proxy/ProxySessionController.js";
 import type { AgentEnvironmentContext } from "./runtime/agentEnvironment.js";
 import { createAgentRuntimeRegistry } from "./runtime/createAgentRuntimeRegistry.js";
 import { StateStore } from "./state/StateStore.js";
+import { DailyUpdateMonitor } from "./updates/DailyUpdateMonitor.js";
+import { readLatestStableVersion, readReleaseNotes } from "./updates/PublishedRelease.js";
+import { checkAutomaticUpdateSupport, prepareAutomaticUpdate } from "./updates/AutomaticUpdatePreparer.js";
 import { StartupNotifier } from "./startup/StartupNotifier.js";
 import { SessionMetadataHydrator } from "./startup/SessionMetadataHydrator.js";
 import { startFeishu } from "./startup/startFeishu.js";
@@ -106,6 +109,7 @@ let feishuConnector: FeishuConnector | undefined;
 let consoleConnector: ConsoleConnector | undefined;
 let startupNotifier: StartupNotifier | undefined;
 let safeRestartNotifier: SafeRestartNotifier | undefined;
+let dailyUpdateMonitor: DailyUpdateMonitor | undefined;
 let controlServer: LocalControlServer | undefined;
 let serverReady = false;
 
@@ -157,14 +161,48 @@ const safeRestart = new SafeRestartScheduler({
   onStatus: (status) => safeRestartNotifier?.update(status),
   onStatusError: (error) => logger.warn({ error }, "Failed to publish safe restart status."),
 });
+if (feishuOutbound && config.updates?.enabled !== false) {
+  dailyUpdateMonitor = new DailyUpdateMonitor({
+    store, outbound: feishuOutbound, logger, currentVersion: agentBotVersion,
+    userOpenId: () => config.feishu.userOpenId,
+    readLatest: readLatestStableVersion,
+    readNotes: readReleaseNotes,
+    checkSupport: () => checkAutomaticUpdateSupport({ home: agentBotHome(), configPath: activeConfigPath }),
+    hasPendingUpdate: () => shuttingDown || restartRequested || !!pendingSelfUpdatePlanPath || safeRestart.scheduled,
+    pendingVersion: () => pendingSelfUpdatePlanPath ? readPendingSelfUpdate(agentBotHome())?.plan.toVersion : undefined,
+    applyUpdate: async (version) => {
+      const prepared = await prepareAutomaticUpdate(version, { home: agentBotHome(), configPath: activeConfigPath });
+      try {
+        if (shuttingDown || restartRequested || pendingSelfUpdatePlanPath || safeRestart.scheduled) {
+          throw new Error("服务正在停止或已有更新/重启等待执行，本次自动更新已停止。");
+        }
+        const target = privateRestartNotificationTarget(config.feishu.userOpenId);
+        if (prepared.status === "prepared") {
+          assertSelfUpdatePlanPath(prepared.planPath, agentBotHome());
+          pendingSelfUpdatePlanPath = prepared.planPath;
+        }
+        safeRestart.schedule(`Agent Bot 自动更新到 ${version}`, target);
+      } catch (error) {
+        if (prepared.status === "prepared") releaseSelfUpdatePlan(prepared.planPath);
+        throw error;
+      }
+    },
+  });
+}
 const controller = new ProxySessionController(config, store, runtimes, outbound, logger, {
   supervised,
   restart: requestRestart,
+  cancelAutomaticUpdate: async (action) => {
+    if (!dailyUpdateMonitor) throw new Error("自动更新功能未启用。");
+    await dailyUpdateMonitor.cancel(action);
+  },
   cancelSafeRestart: async (scheduleId) => {
     const cancelled = await safeRestart.cancelScheduled(scheduleId);
     if (cancelled && pendingSelfUpdatePlanPath) {
+      const version = readPendingSelfUpdate(agentBotHome())?.plan.toVersion;
       releaseSelfUpdatePlan(pendingSelfUpdatePlanPath);
       pendingSelfUpdatePlanPath = undefined;
+      if (version) await dailyUpdateMonitor?.cancelPreparedUpdate(version);
     }
     return cancelled;
   },
@@ -229,6 +267,7 @@ await controller.recoverInterruptedTasks().catch((error: unknown) => {
 });
 consoleConnector?.start();
 recoverPendingSelfUpdate();
+await dailyUpdateMonitor?.start();
 
 function recoverPendingSelfUpdate(): void {
   const pending = readPendingSelfUpdate(agentBotHome());
@@ -530,6 +569,7 @@ async function shutdown(
 ): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  await dailyUpdateMonitor?.stop();
   if (pendingSelfUpdatePlanPath) {
     releaseSelfUpdatePlan(pendingSelfUpdatePlanPath);
     pendingSelfUpdatePlanPath = undefined;

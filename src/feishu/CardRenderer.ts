@@ -12,6 +12,7 @@ import type {
 } from "../runtime/types.js";
 import type { TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
+import type { UpdateNotice } from "../updates/types.js";
 import { localCardImage } from "./LocalCardImage.js";
 
 export interface StartupStatusView {
@@ -951,6 +952,33 @@ export class CardRenderer {
         elements,
       },
     };
+  }
+
+  renderUpdateNotice(view: UpdateNotice, now = Date.now()): Record<string, unknown> {
+    const cancellable = view.status === "announcing" || view.status === "countdown";
+    const status = cancellable
+      ? `**自动更新倒计时：${Math.max(0, Math.ceil(((view.deadline ?? now + 60_000) - now) / 1_000))} 秒**`
+      : view.status === "cancelled" ? "已取消本版本自动更新，不再提醒。"
+        : view.status === "preparing" ? "正在下载并校验更新；任务结束后自动安装并重启。"
+          : view.status === "scheduled" ? "更新已就绪，等待任务和结果投递完成后自动重启。"
+            : view.status === "completed" ? "更新已完成。"
+              : "自动更新未完成，当前版本继续运行。";
+    const elements = [
+      markdown(`**Agent Bot** ${inlineCode(view.currentVersion)} → ${inlineCode(view.version)}`),
+      markdown(`**本版更新**\n${truncateText(view.notes, 4_000)}`),
+      { tag: "hr" },
+      markdown(status),
+    ];
+    if (view.error) elements.push(markdown(inlineCode(truncateText(view.error, 600))));
+    if (cancellable) {
+      elements.push(markdown("> 1 分钟内未取消将自动更新；不会中断正在执行的任务。"));
+      elements.push(taskActionRow([{
+        text: "取消本次更新",
+        value: { action: "agentbot_update_cancel", version: view.version, token: view.token },
+      }]));
+    }
+    return sectionCard("Agent Bot 更新提醒", elements,
+      view.status === "completed" ? "green" : view.status === "cancelled" ? "grey" : "blue");
   }
 
   renderSafeRestartStatus(view: SafeRestartStatusView): Record<string, unknown> {

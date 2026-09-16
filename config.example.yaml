@@ -18,6 +18,11 @@ feishu:
 console:
   enabled: true
 
+# Check npm latest once daily between 10:00 and 17:00 (server local time).
+# Notify the owner privately; allow 60 seconds to cancel, then update when idle.
+updates:
+  enabled: true
+
 # Signed, read-only pages for local files referenced in Agent replies.
 fileViewer:
   enabled: true

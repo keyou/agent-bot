@@ -11,9 +11,15 @@ import {
   AGENT_BOT_EXPLICIT_PROFILE_ENV,
   defaultConfigPath,
 } from "../../src/config/paths.js";
-import { agentConfigSchema } from "../../src/config/schema.js";
+import { agentConfigSchema, appConfigSchema } from "../../src/config/schema.js";
 
 describe("loadConfig", () => {
+  test("enables daily stable updates by default and permits disabling them", () => {
+    const minimal = { feishu: {}, agents: { codex: { title: "Codex", command: "codex" } } };
+    expect(appConfigSchema.parse(minimal).updates).toEqual({ enabled: true });
+    expect(appConfigSchema.parse({ ...minimal, updates: { enabled: false } }).updates).toEqual({ enabled: false });
+    expect(() => appConfigSchema.parse({ ...minimal, updates: { enabled: "false" } })).toThrow();
+  });
   test("creates and loads the default config from the user data directory", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-home-"));
     const previousHome = process.env.AGENT_BOT_HOME;
@@ -27,6 +33,7 @@ describe("loadConfig", () => {
       expect(defaultConfigPath()).toBe(path.join(directory, "config.yaml"));
       expect(fs.existsSync(path.join(directory, "config.yaml"))).toBe(true);
       expect(config.feishu.transport).toBe("auto");
+      expect(config.updates).toEqual({ enabled: true });
       expect(Object.keys(config.feishu).sort()).toEqual(
         [
           "appId",
@@ -70,6 +77,7 @@ describe("loadConfig", () => {
 
   test("loads the checked-in example config", () => {
     const config = loadConfig(path.resolve("config.example.yaml"));
+    expect(config.updates).toEqual({ enabled: true });
 
     expect(config.defaults.agent).toBe("codex");
     expect(config.agents.codex?.kind).toBe("app-server");
