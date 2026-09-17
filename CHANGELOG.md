@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.0] - 2026-09-17
+
 - Load each Codex Agent's `CODEX_HOME/.env` at Worker startup for Provider model discovery and the Codex process, without overriding existing environment or explicit Agent settings or sharing those values with other Agents.
 - Retrieve original quoted and merged-forwarded card content, including available text and images, instead of client-upgrade placeholders.
 - Retry ignored Provider and model changes on a thread forked through the latest completed Turn, verify the result before rebinding, and preserve the previous settings on failure.
