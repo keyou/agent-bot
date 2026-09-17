@@ -92,18 +92,6 @@ export interface ControlResponse {
   data?: unknown;
 }
 
-export function assertCompatibleTaskNewGroupRequest(request: {
-  action: "task_new_group";
-  [key: string]: unknown;
-}): void {
-  if (request.sessionId !== undefined) {
-    throw new Error(
-      "This Agent Bot Worker no longer accepts --session through the legacy newgroup protocol. "
-      + "Restart the Agent Bot CLI and try again.",
-    );
-  }
-}
-
 export interface TaskStatusControlData {
   session: SessionRecord;
   snapshot?: TurnViewState;

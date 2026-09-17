@@ -8,10 +8,7 @@ import {
   isServerRunning,
   sendControlRequest,
 } from "../../src/cli/LocalControlClient.js";
-import {
-  assertCompatibleTaskNewGroupRequest,
-  controlEndpoint,
-} from "../../src/cli/controlProtocol.js";
+import { controlEndpoint } from "../../src/cli/controlProtocol.js";
 
 const servers: LocalControlServer[] = [];
 
@@ -121,7 +118,7 @@ describe("local CLI control", () => {
     });
   });
 
-  test("round-trips task group creation, fork, and existing Session requests", async () => {
+  test("round-trips task group creation and fork requests", async () => {
     const endpoint = controlEndpoint(path.join(os.tmpdir(), `agent-bot-control-group-${process.pid}-${Date.now()}.sqlite`));
     const server = new LocalControlServer(endpoint, async (request) => ({ ok: true, data: request }));
     servers.push(server);
@@ -173,19 +170,12 @@ describe("local CLI control", () => {
     });
   });
 
-  test("fails closed against a Worker that predates existing Session groups", async () => {
+  test("reports an unsupported request from an older Worker", async () => {
     const endpoint = controlEndpoint(path.join(
       os.tmpdir(),
-      "agent-bot-control-legacy-group-" + process.pid + "-" + Date.now() + ".sqlite",
+      `agent-bot-control-legacy-group-${process.pid}-${Date.now()}.sqlite`,
     ));
-    let createdGroups = 0;
-    const server = new LocalControlServer(endpoint, async (request) => {
-      if (request.action === "task_new_group") {
-        createdGroups += 1;
-        return { ok: true };
-      }
-      return undefined as never;
-    });
+    const server = new LocalControlServer(endpoint, async () => undefined as never);
     servers.push(server);
     await server.start();
 
@@ -193,21 +183,7 @@ describe("local CLI control", () => {
       action: "task_new_group_session",
       localSessionId: "session_1",
       sessionId: "019f-thread",
-    })).rejects.toThrow();
-    expect(createdGroups).toBe(0);
-  });
-
-  test("rejects the previous CLI session field before legacy newgroup dispatch", () => {
-    expect(() => assertCompatibleTaskNewGroupRequest({
-      action: "task_new_group",
-      localSessionId: "session_1",
-      sessionId: "019f-thread",
-    })).toThrow("legacy newgroup protocol");
-    expect(() => assertCompatibleTaskNewGroupRequest({
-      action: "task_new_group",
-      localSessionId: "session_1",
-      title: "Regular group",
-    })).not.toThrow();
+    })).rejects.toThrow("does not support this request");
   });
 
   test("round-trips a live task status request", async () => {

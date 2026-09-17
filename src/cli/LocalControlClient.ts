@@ -29,7 +29,14 @@ export async function sendControlRequest(
       const newline = input.indexOf("\n");
       if (newline < 0) return;
       try {
-        const response = JSON.parse(input.slice(0, newline)) as ControlResponse;
+        const line = input.slice(0, newline);
+        if (line.trim() === "undefined") {
+          throw new Error(cliText(
+            "The running Agent Bot server does not support this request. Restart or update the server and try again.",
+            "当前运行中的 Agent Bot 服务不支持此请求，请重启或更新服务后重试。",
+          ));
+        }
+        const response = JSON.parse(line) as ControlResponse;
         finish(() => resolve(response));
       } catch (error) {
         finish(() => reject(error));

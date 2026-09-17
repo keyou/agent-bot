@@ -256,7 +256,10 @@ function parseNewTaskOptions(
     if (projectless) throw new Error(`${commandName} 的 --dir 和 --nodir 不能同时使用。`);
     if (cwd !== undefined) throw new Error(`${commandName} 只能指定一次 --dir。`);
     const directory = args[index + 1];
-    if (!directory || directory.startsWith("--")) {
+    if (!directory
+      || directory === "--dir"
+      || directory === "--nodir"
+      || (allowSession && directory.startsWith("--"))) {
       throw new Error(
         `请在 --dir 后指定${directoryLabel}，例如：${commandName} 修复会话列表 --dir ${exampleDirectory}。`,
       );

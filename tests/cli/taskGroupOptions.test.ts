@@ -104,45 +104,29 @@ describe("task group CLI options", () => {
       .toThrow("does not support option: --nodir");
   });
 
-  test("parses newgroup Session IDs and titles", () => {
+  test("parses newgroup existing Session options", () => {
     expect(parseTaskNewGroupOptions([
       "source-task",
       "Existing",
       "task",
       "--session",
       "codex://threads/019f-thread",
+      "--agent",
+      "traex",
       "--json",
     ], "en")).toEqual({
       reference: "source-task",
-      sessionId: "codex://threads/019f-thread",
       title: "Existing task",
       cwd: undefined,
+      agentName: "traex",
       projectless: false,
+      sessionId: "codex://threads/019f-thread",
       json: true,
     });
     expect(() => parseTaskNewGroupOptions(["source-task", "--session"], "en"))
       .toThrow("requires an App Server Session ID after --session");
-    expect(() => parseTaskNewGroupOptions(["source-task", "--session", "019f-thread", "--move"], "en"))
-      .toThrow("does not support option: --move");
-    expect(parseTaskNewGroupOptions([
-      "source-task",
-      "--session",
-      "019f-thread",
-      "--agent",
-      "traex",
-    ], "en")).toMatchObject({
-      sessionId: "019f-thread",
-      agentName: "traex",
-    });
-    for (const option of ["--dir", "--nodir"] as const) {
-      const value = option === "--nodir" ? [] : ["~/project"];
-      expect(() => parseTaskNewGroupOptions([
-        "source-task",
-        "--session",
-        "019f-thread",
-        option,
-        ...value,
-      ], "en")).toThrow("cannot combine --session with --dir or --nodir");
-    }
+    expect(() => parseTaskNewGroupOptions([
+      "source-task", "--session", "019f-thread", "--nodir",
+    ], "en")).toThrow("cannot combine --session with --dir or --nodir");
   });
 });

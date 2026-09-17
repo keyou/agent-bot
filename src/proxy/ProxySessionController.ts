@@ -3,7 +3,6 @@ import { promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Logger } from "pino";
-import { AppServerRequestError } from "../codex/AppServerConnection.js";
 import { createProjectlessWorkspace, detectProjectlessWorkspace } from "../codex/ProjectlessWorkspace.js";
 import { CodexVersionError } from "../codex/CodexVersion.js";
 import { assertProviderSettingsApplied, isMissingRolloutError } from "../codex/ProviderSwitch.js";
@@ -208,8 +207,6 @@ const CHANGE_TITLE_STARTED_MESSAGE = "正在修改任务标题，请稍后。";
 const STOP_TASK_STARTED_MESSAGE = "正在停止任务，请稍后。";
 const CLOSE_WRITER_STARTED_MESSAGE = "正在检查并关闭占用进程，请稍后。";
 const REMOTE_SESSION_REFERENCE_PREFIX = "agent-runtime:";
-const FAILED_GROUP_ATTACHMENT_EVENT = "group_attachment_rollback_failed";
-const ROLLED_BACK_GROUP_GUARD_MS = 10 * 60 * 1_000;
 const WINDOWS_DRIVES_DIRECTORY = "agentbot://windows-drives";
 const IMAGE_FILE_EXTENSIONS = new Set([
   ".avif", ".bmp", ".gif", ".heic", ".heif", ".ico", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp",
@@ -483,18 +480,6 @@ export interface ControlTaskReleaseResult {
   blockingTaskCount: number;
 }
 
-interface PreparedSessionAttachment {
-  agentName: string;
-  remote: RemoteSessionSummary;
-}
-
-type SessionAttachmentGroupState = "pending" | "rolled_back" | "rollback_failed";
-
-interface SessionAttachmentGroupCreationBarrier {
-  promise: Promise<void>;
-  release(): void;
-}
-
 export interface ProxyLifecycle {
   supervised?: boolean;
   restart(contextKey: string, force: boolean, replyTarget?: MessageReplyTarget): Promise<void>;
@@ -543,10 +528,6 @@ export class ProxySessionController {
   private readonly relatedReactionMessageIds = new Map<string, string[]>();
   private readonly shellCommandJobMonitors = new Map<string, ShellCommandJobMonitor>();
   private readonly appServerReleaseSchedules = new Map<string, AppServerReleaseSchedule>();
-  private readonly sessionAttachmentOperations = new Map<string, Promise<void>>();
-  private readonly sessionAttachmentGroupStates = new Map<string, SessionAttachmentGroupState>();
-  private readonly rolledBackGroupGuardTimers = new Map<string, NodeJS.Timeout>();
-  private readonly sessionAttachmentGroupCreationBarriers = new Set<SessionAttachmentGroupCreationBarrier>();
   private nextAppServerReleaseScheduleId = 1;
   private readonly unsubscribe: Array<() => void> = [];
   private readonly recoveryActivityHeartbeat: NodeJS.Timeout;
@@ -612,21 +593,13 @@ export class ProxySessionController {
     // For accepted messages, claim durable deduplication before acknowledgement so event
     // retries cannot add duplicate reactions.
     if (!this.store.claimInboundEvent(message.messageId, "message")) return;
-    if (message.chatType === "group"
-      && message.chatId
-      && !this.store.getChatContext(baseChatContextKey(message.contextKey))) {
-      await this.waitForSessionAttachmentGroupCreation();
-    }
-    const initialAttachmentGroupState = this.sessionAttachmentGroupState(message);
-    const attachmentReservation = initialAttachmentGroupState || message.mergedForwardMessageId
+    const attachmentReservation = message.mergedForwardMessageId
       ? undefined
       : this.reserveForwardAttachment(message);
-    const pendingMergedForward = !initialAttachmentGroupState && message.mergedForwardMessageId
+    const pendingMergedForward = message.mergedForwardMessageId
       ? this.registerPendingForwardAttachment(message, this.pendingMergedForwards)
       : undefined;
-    const pendingResourceForward = !initialAttachmentGroupState
-      && !attachmentReservation
-      && isStandaloneResourceMessage(message)
+    const pendingResourceForward = !attachmentReservation && isStandaloneResourceMessage(message)
       ? this.registerPendingForwardAttachment(message, this.pendingResourceForwards)
       : undefined;
     try {
@@ -644,23 +617,7 @@ export class ProxySessionController {
         "Failed to acknowledge the incoming Feishu message with a reaction.",
       );
     }
-    if (!initialAttachmentGroupState) await this.waitForCurrentSessionReset(message.contextKey);
-    const attachmentGroupState = initialAttachmentGroupState ?? this.sessionAttachmentGroupState(message);
-    if (attachmentGroupState) {
-      if (pendingMergedForward && this.pendingMergedForwards.get(message.messageId) === pendingMergedForward) {
-        this.pendingMergedForwards.delete(message.messageId);
-        pendingMergedForward.resolveAttachment(undefined);
-      }
-      if (pendingResourceForward && this.pendingResourceForwards.get(message.messageId) === pendingResourceForward) {
-        this.pendingResourceForwards.delete(message.messageId);
-        pendingResourceForward.resolveAttachment(undefined);
-      }
-      if (attachmentReservation?.pending.attachmentMessageId === message.messageId) {
-        attachmentReservation.pending.attachmentMessageId = undefined;
-      }
-      await this.rejectSessionAttachmentGroupMessage(message, attachmentGroupState);
-      return;
-    }
+    await this.waitForCurrentSessionReset(message.contextKey);
     if (attachmentReservation && this.completeForwardAttachment(message, attachmentReservation)) {
       this.store.audit(message.contextKey, `${attachmentReservation.sourceKind}_attachment_coalesced`, {
         messageId: message.messageId,
@@ -794,11 +751,6 @@ export class ProxySessionController {
         );
         return;
       }
-    }
-    const delayedAttachmentGroupState = this.sessionAttachmentGroupState(message);
-    if (delayedAttachmentGroupState) {
-      await this.rejectSessionAttachmentGroupMessage(message, delayedAttachmentGroupState);
-      return;
     }
     const replyTarget = message.replyInThread
       ? { messageId: message.messageId, replyInThread: true as const }
@@ -1339,11 +1291,6 @@ export class ProxySessionController {
     for (const pending of this.pendingResourceForwards.values()) pending.resolveAttachment(undefined);
     this.pendingResourceForwards.clear();
     this.relatedReactionMessageIds.clear();
-    for (const barrier of this.sessionAttachmentGroupCreationBarriers) barrier.release();
-    this.sessionAttachmentGroupCreationBarriers.clear();
-    for (const timer of this.rolledBackGroupGuardTimers.values()) clearTimeout(timer);
-    this.rolledBackGroupGuardTimers.clear();
-    this.sessionAttachmentGroupStates.clear();
     for (const timer of this.queuedPromptRetryTimers.values()) clearTimeout(timer);
     this.queuedPromptRetryTimers.clear();
     for (const timer of this.recoveryRetryTimers.values()) clearTimeout(timer);
@@ -1519,9 +1466,9 @@ export class ProxySessionController {
     requestedProjectCwd?: string,
     forceProjectless = false,
     requestedAgentName?: string,
-    existingSession?: { sessionId: string },
+    existingSessionId?: string,
   ): Promise<ControlTaskGroupResult> {
-    if (existingSession) {
+    if (existingSessionId) {
       if (requestedProjectCwd !== undefined || forceProjectless) {
         throw new Error("task newgroup cannot combine --session with --dir or --nodir.");
       }
@@ -1531,7 +1478,7 @@ export class ProxySessionController {
       const created = await this.outbound.withReplyTarget(sourceContextKey, replyTarget, () =>
         this.createFeishuGroupForExistingSession(
           sourceContextKey,
-          existingSession.sessionId,
+          existingSessionId,
           requestedTitle,
           userOpenId,
           requestedAgentName,
@@ -4078,25 +4025,92 @@ export class ProxySessionController {
       throw new Error("/newgroup --session 只能由具有 open_id 的飞书用户消息触发。");
     }
     const scopedReference = this.scopeSessionAttachmentReference(reference, requestedAgentName);
-    const initial = await this.prepareSessionAttachment(scopedReference);
-    const attachmentKey = agentRemoteKey(initial.agentName, initial.remote.id);
-    return this.serializeSessionAttachment(attachmentKey, async () => {
-      const prepared = await this.prepareSessionAttachment(scopedReference);
-      if (agentRemoteKey(prepared.agentName, prepared.remote.id) !== attachmentKey) {
-        throw new Error("任务所属 Agent 在创建群前发生变化，请重试并使用 --agent <标准名> 明确指定 Agent。");
-      }
-      return this.createFeishuGroupForPreparedSession(
-        sourceContextKey,
-        prepared,
-        requestedTitle,
-        userId,
-        scopedReference,
+    const normalizedReference = normalizeAppServerSessionReference(scopedReference);
+    const direct = this.store.getSession(normalizedReference);
+    if (direct?.status === "closed") throw new Error("找不到任务：" + normalizedReference);
+    const local = direct ?? (parseRemoteSessionReference(normalizedReference)
+      ? this.findStoredSessionByReference(normalizedReference)
+      : undefined);
+    if (local) {
+      throw new Error("这个任务已关联 Agent Bot 会话（" + local.contextKey + "），不能重复创建群。");
+    }
+    const { agentName, remote } = await this.resolveRemoteCodexSession(normalizedReference);
+    const historical = this.store.findSessionByRemoteSessionIdIncludingClosed(remote.id, agentName);
+    if (historical) {
+      throw new Error(historical.status === "closed"
+        ? "这个任务已在 Agent Bot 中归档，不能重复创建群。"
+        : `这个任务已关联 Agent Bot 会话（${historical.contextKey}），不能重复创建群。`);
+    }
+    if (isRemoteSessionActive(remote)) {
+      throw new Error("这个任务正在外部 Agent 中执行。Agent Bot 不会接管或追加消息，请等待外部执行完成。");
+    }
+    if (!remote.cwd) throw new Error("这个 App Server 任务没有可用的工作目录，暂时无法关联新群。");
+
+    const taskTitle = normalizeTaskTitle(requestedTitle) ?? remote.title ?? remote.preview ?? remote.id;
+    const boundProjectCwd = detectProjectlessWorkspace(remote.cwd) ? undefined : remote.cwd;
+    const group = await this.createFeishuGroupContext(
+      sourceContextKey,
+      agentName,
+      taskTitle,
+      userId,
+      boundProjectCwd,
+      "/newgroup",
+    );
+    const localSessionId = createId("sess");
+    let task: SessionRecord;
+    try {
+      task = this.store.createSessionAsCurrent({
+        localSessionId,
+        contextKey: group.contextKey,
+        agentName,
+        cwd: remote.cwd,
+        status: "ready",
+        runtimeKind: "codex",
+        remoteSessionId: remote.id,
+        title: remote.title ?? remote.preview,
+        modelProvider: remote.modelProvider,
+        model: remote.model,
+        reasoningEffort: remote.reasoningEffort,
+        permissionMode: remote.permissionMode ?? "auto",
+        lastTurnId: remote.lastTurnId,
+        lastTurnStatus: mapRemoteTurnStatus(remote.lastTurnStatus),
+      }, {
+        eventType: "session_attached_to_group",
+        payload: { localSessionId, remoteSessionId: remote.id },
+      });
+    } catch (error) {
+      await this.outbound.sendText(
+        group.contextKey,
+        `群已创建，但关联已有任务失败：${error instanceof Error ? error.message : String(error)}`,
       );
-    });
+      throw error;
+    }
+    this.outbound.registerSession(
+      localSessionId,
+      group.contextKey,
+      remote.title ?? remote.preview,
+      remote.cwd,
+      this.agentLabel(agentName),
+    );
+
+    const taskDescription = task.title
+      ? task.title + "（" + task.remoteSessionId + "）"
+      : task.remoteSessionId ?? task.localSessionId;
+    await this.outbound.sendText(group.contextKey, [
+      "群已创建，并已关联已有任务。",
+      "当前任务：" + taskDescription,
+      "当前 Project 目录：" + (boundProjectCwd ?? "未绑定（Projectless）"),
+      "后续消息会继续这个 Session，不会创建或 Fork 新任务。",
+    ].join("\n"));
+    await this.outbound.sendText(
+      sourceContextKey,
+      "已创建飞书群：" + group.name + "，并关联已有任务 " + taskDescription + "。",
+    );
+    return { group, task };
   }
 
   private scopeSessionAttachmentReference(reference: string, requestedAgentName?: string): string {
-    if (!requestedAgentName) return reference;
+    if (!requestedAgentName) return normalizeAppServerSessionReference(reference);
     const agentName = requestedAgentName.trim();
     const agent = this.ensureAgent(agentName);
     if (agent.kind !== "app-server") {
@@ -4108,173 +4122,6 @@ export class ProxySessionController {
       throw new Error(`--agent ${agentName} 与 --session 中的 Agent ${scoped.agentName} 不一致。`);
     }
     return scoped ? normalizedReference : remoteSessionReference(agentName, normalizedReference);
-  }
-
-  private async createFeishuGroupForPreparedSession(
-    sourceContextKey: string,
-    prepared: PreparedSessionAttachment,
-    requestedTitle: string | undefined,
-    userId: string,
-    verificationReference: string,
-  ): Promise<CreatedFeishuTaskGroup> {
-    const taskTitle = normalizeTaskTitle(requestedTitle)
-      ?? prepared.remote.title
-      ?? prepared.remote.preview
-      ?? prepared.remote.id;
-    let boundProjectCwd = detectProjectlessWorkspace(prepared.remote.cwd)
-      ? undefined
-      : prepared.remote.cwd;
-    const group = await this.createFeishuGroupContext(
-      sourceContextKey,
-      prepared.agentName,
-      taskTitle,
-      userId,
-      boundProjectCwd,
-      "/newgroup",
-      true,
-    );
-
-    const localSessionId = createId("sess");
-    let task: SessionRecord;
-    try {
-      const refreshed = await this.prepareSessionAttachment(verificationReference);
-      if (agentRemoteKey(refreshed.agentName, refreshed.remote.id)
-        !== agentRemoteKey(prepared.agentName, prepared.remote.id)) {
-        throw new Error("远端 Session 身份在建群期间发生变化，已取消关联，请重试。");
-      }
-      boundProjectCwd = detectProjectlessWorkspace(refreshed.remote.cwd)
-        ? undefined
-        : refreshed.remote.cwd;
-      this.store.setBoundProjectCwd(group.contextKey, boundProjectCwd);
-      this.outbound.registerSession(
-        localSessionId,
-        group.contextKey,
-        refreshed.remote.title ?? refreshed.remote.preview,
-        refreshed.remote.cwd,
-        this.agentLabel(refreshed.agentName),
-      );
-      task = this.persistSessionAttachment(group.contextKey, localSessionId, refreshed);
-      this.sessionAttachmentGroupStates.delete(group.contextKey);
-    } catch (error) {
-      await this.rollbackCreatedFeishuGroup(group, localSessionId);
-      throw error;
-    }
-
-    const taskDescription = task.title
-      ? task.title + "（" + task.remoteSessionId + "）"
-      : task.remoteSessionId ?? task.localSessionId;
-    const notifications = [
-      {
-        contextKey: group.contextKey,
-        text: [
-          "群已创建，并已关联已有任务。",
-          "当前任务：" + taskDescription,
-          "当前 Project 目录：" + (boundProjectCwd ?? "未绑定（Projectless）"),
-          "后续消息会继续这个 Session，不会创建或 Fork 新任务。",
-        ].join("\n"),
-        target: "created_group",
-      },
-      {
-        contextKey: sourceContextKey,
-        text: "已创建飞书群：" + group.name + "，并关联已有任务 " + taskDescription + "。",
-        target: "source_context",
-      },
-    ] as const;
-    for (const notification of notifications) {
-      try {
-        await this.outbound.sendText(notification.contextKey, notification.text);
-      } catch (error) {
-        this.logger.warn(
-          {
-            error,
-            contextKey: notification.contextKey,
-            localSessionId: task.localSessionId,
-            remoteSessionId: task.remoteSessionId,
-            target: notification.target,
-          },
-          "Failed to send a group attachment notification after the task was committed.",
-        );
-      }
-    }
-    return { group, task };
-  }
-
-  private async serializeSessionAttachment<T>(
-    key: string,
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    const previous = this.sessionAttachmentOperations.get(key) ?? Promise.resolve();
-    const result = previous.catch(() => undefined).then(operation);
-    const tail = result.then(() => undefined, () => undefined);
-    this.sessionAttachmentOperations.set(key, tail);
-    try {
-      return await result;
-    } finally {
-      if (this.sessionAttachmentOperations.get(key) === tail) {
-        this.sessionAttachmentOperations.delete(key);
-      }
-    }
-  }
-
-  private async prepareSessionAttachment(
-    reference: string,
-  ): Promise<PreparedSessionAttachment> {
-    const normalizedReference = normalizeAppServerSessionReference(reference);
-    const direct = this.store.getSession(normalizedReference);
-    if (direct?.status === "closed") throw new Error("找不到任务：" + normalizedReference);
-    const local = direct ?? (parseRemoteSessionReference(normalizedReference)
-      ? this.findStoredSessionByReference(normalizedReference)
-      : undefined);
-    if (local) {
-      throw new Error("这个任务已关联 Agent Bot 会话（" + local.contextKey + "），不能重复创建群。");
-    }
-    const resolved = await this.resolveRemoteCodexSession(normalizedReference, {
-      requireUnambiguousLookup: true,
-    });
-    const agentName = resolved.agentName;
-    const remote = resolved.remote;
-    const historical = this.store.findSessionByRemoteSessionIdIncludingClosed(remote.id, agentName);
-    if (historical) {
-      if (historical.status === "closed") {
-        throw new Error("这个任务已在 Agent Bot 中归档，不能重复创建群。");
-      }
-      throw new Error(`这个任务已关联 Agent Bot 会话（${historical.contextKey}），不能重复创建群。`);
-    }
-    if (isRemoteSessionActive(remote)) {
-      throw new Error("这个任务正在外部 Agent 中执行。Agent Bot 不会接管或追加消息，请等待外部执行完成。");
-    }
-    if (!remote.cwd) throw new Error("这个 App Server 任务没有可用的工作目录，暂时无法关联新群。");
-
-    return { agentName, remote };
-  }
-
-  private persistSessionAttachment(
-    contextKey: string,
-    localSessionId: string,
-    prepared: PreparedSessionAttachment,
-  ): SessionRecord {
-    return this.store.createSessionAsCurrent({
-      localSessionId,
-      contextKey,
-      agentName: prepared.agentName,
-      cwd: prepared.remote.cwd,
-      status: "ready",
-      runtimeKind: "codex",
-      remoteSessionId: prepared.remote.id,
-      title: prepared.remote.title ?? prepared.remote.preview,
-      modelProvider: prepared.remote.modelProvider,
-      model: prepared.remote.model,
-      reasoningEffort: prepared.remote.reasoningEffort,
-      permissionMode: prepared.remote.permissionMode ?? "auto",
-      lastTurnId: prepared.remote.lastTurnId,
-      lastTurnStatus: mapRemoteTurnStatus(prepared.remote.lastTurnStatus),
-    }, {
-      eventType: "session_attached_to_group",
-      payload: {
-        localSessionId,
-        remoteSessionId: prepared.remote.id,
-      },
-    });
   }
 
   private async forkCurrentSessionToFeishuGroup(
@@ -4376,7 +4223,6 @@ export class ProxySessionController {
     userId: string | undefined,
     boundProjectCwd: string | undefined,
     commandName: "/newgroup" | "/forkgroup",
-    rollbackOnInitializationFailure = false,
   ): Promise<CreatedFeishuGroupContext> {
     if (!userId?.startsWith("ou_")) {
       throw new Error(`${commandName} 只能由具有 open_id 的飞书用户消息触发。`);
@@ -4388,142 +4234,19 @@ export class ProxySessionController {
       date: new Date(),
       format: this.config.feishu?.groupNameFormat,
     });
-    const creationBarrier = rollbackOnInitializationFailure
-      ? this.beginSessionAttachmentGroupCreation()
-      : undefined;
-    try {
-      const group = await this.outbound.createGroup(sourceContextKey, {
-        name: groupName,
-        userOpenId: userId,
-        avatarPng: generateGroupAvatarPng(
-          resolveGroupAvatarProjectName(boundProjectCwd, taskTitle),
-          boundProjectCwd,
-        ),
-      });
-      const groupContextKey = `chat_id:${group.chatId}`;
-      if (rollbackOnInitializationFailure) {
-        this.sessionAttachmentGroupStates.set(groupContextKey, "pending");
-      }
-      try {
-        this.store.recordChatContext(groupContextKey, "group");
-        this.store.getOrCreateUserContext(groupContextKey, agentName);
-        if (boundProjectCwd) this.store.setBoundProjectCwd(groupContextKey, boundProjectCwd);
-      } catch (error) {
-        if (rollbackOnInitializationFailure) {
-          await this.rollbackCreatedFeishuGroup(
-            { chatId: group.chatId, contextKey: groupContextKey, name: group.name },
-          );
-        }
-        throw error;
-      }
-      return { chatId: group.chatId, contextKey: groupContextKey, name: group.name };
-    } finally {
-      creationBarrier?.release();
-    }
-  }
-
-  private beginSessionAttachmentGroupCreation(): SessionAttachmentGroupCreationBarrier {
-    let resolve!: () => void;
-    const barrier: SessionAttachmentGroupCreationBarrier = {
-      promise: new Promise<void>((done) => { resolve = done; }),
-      release: () => {
-        if (!this.sessionAttachmentGroupCreationBarriers.delete(barrier)) return;
-        resolve();
-      },
-    };
-    this.sessionAttachmentGroupCreationBarriers.add(barrier);
-    return barrier;
-  }
-
-  private async waitForSessionAttachmentGroupCreation(): Promise<void> {
-    await Promise.all([...this.sessionAttachmentGroupCreationBarriers].map((barrier) => barrier.promise));
-  }
-
-  private async rollbackCreatedFeishuGroup(
-    group: CreatedFeishuGroupContext,
-    localSessionId?: string,
-  ): Promise<void> {
-    if (localSessionId) {
-      try {
-        this.outbound.unregisterSession(localSessionId);
-      } catch (error) {
-        this.logger.warn(
-          { error, localSessionId },
-          "Failed to unregister a rolled-back group attachment.",
-        );
-      }
-    }
-    try {
-      await this.outbound.deleteGroup(group.contextKey, group.chatId);
-    } catch (error) {
-      this.logger.warn(
-        { error, chatId: group.chatId, contextKey: group.contextKey },
-        "Failed to remove a rolled-back Lark group.",
-      );
-      try {
-        this.store.audit(group.contextKey, FAILED_GROUP_ATTACHMENT_EVENT, {
-          chatId: group.chatId,
-        });
-      } catch (auditError) {
-        this.logger.warn(
-          { error: auditError, chatId: group.chatId, contextKey: group.contextKey },
-          "Failed to mark a retained Lark group after attachment rollback.",
-        );
-      }
-      this.sessionAttachmentGroupStates.set(group.contextKey, "rollback_failed");
-      return;
-    }
-    this.sessionAttachmentGroupStates.set(group.contextKey, "rolled_back");
-    const guardCleanup = setTimeout(() => {
-      this.rolledBackGroupGuardTimers.delete(group.contextKey);
-      if (this.sessionAttachmentGroupStates.get(group.contextKey) === "rolled_back") {
-        this.sessionAttachmentGroupStates.delete(group.contextKey);
-      }
-    }, ROLLED_BACK_GROUP_GUARD_MS);
-    guardCleanup.unref?.();
-    this.rolledBackGroupGuardTimers.set(group.contextKey, guardCleanup);
-    try {
-      this.store.removeChatContext(group.contextKey);
-    } catch (error) {
-      this.logger.warn(
-        { error, chatId: group.chatId, contextKey: group.contextKey },
-        "Failed to remove local state for a rolled-back Lark group.",
-      );
-    }
-  }
-
-  private sessionAttachmentGroupState(message: IncomingMessage): SessionAttachmentGroupState | undefined {
-    if (message.chatType !== "group" || !message.chatId) return undefined;
-    const contextKey = baseChatContextKey(message.contextKey);
-    const inMemory = this.sessionAttachmentGroupStates.get(contextKey);
-    if (inMemory === "rollback_failed" && this.store.getUserContext(contextKey)?.currentSessionId) {
-      this.sessionAttachmentGroupStates.delete(contextKey);
-      return undefined;
-    }
-    if (inMemory) return inMemory;
-    if (this.store.getUserContext(contextKey)?.currentSessionId
-      || !this.store.hasAuditEvent(contextKey, FAILED_GROUP_ATTACHMENT_EVENT)) {
-      return undefined;
-    }
-    this.sessionAttachmentGroupStates.set(contextKey, "rollback_failed");
-    return "rollback_failed";
-  }
-
-  private async rejectSessionAttachmentGroupMessage(
-    message: IncomingMessage,
-    state: SessionAttachmentGroupState,
-  ): Promise<void> {
-    await this.finalizeStandaloneMessageReaction(message.messageId, "failed");
-    await this.sendError(
-      message.contextKey,
-      new Error(state === "pending"
-        ? "这个群正在关联已有 Session。为避免误建新任务，本条消息未处理；请稍后重试。"
-        : state === "rolled_back"
-          ? "这个群关联已有 Session 时失败并已自动解散。为避免误建新任务，本条消息未处理。"
-          : "这个群关联已有 Session 时失败，且自动解散群未成功。为避免误建新任务，本群已停止处理消息；请手动解散本群后重试 /newgroup --session。"),
-      { requestId: message.messageId, messageId: message.messageId, phase: "session_attachment_group_guard" },
-      false,
-    );
+    const group = await this.outbound.createGroup(sourceContextKey, {
+      name: groupName,
+      userOpenId: userId,
+      avatarPng: generateGroupAvatarPng(
+        resolveGroupAvatarProjectName(boundProjectCwd, taskTitle),
+        boundProjectCwd,
+      ),
+    });
+    const groupContextKey = `chat_id:${group.chatId}`;
+    this.store.recordChatContext(groupContextKey, "group");
+    this.store.getOrCreateUserContext(groupContextKey, agentName);
+    if (boundProjectCwd) this.store.setBoundProjectCwd(groupContextKey, boundProjectCwd);
+    return { chatId: group.chatId, contextKey: groupContextKey, name: group.name };
   }
 
   private async loadSession(record: SessionRecord): Promise<LoadedSession> {
@@ -6762,11 +6485,7 @@ export class ProxySessionController {
 
   private async resolveRemoteCodexSession(
     reference: string,
-    options: {
-      forFork?: boolean;
-      view?: "metadata" | "latest" | "latest-full";
-      requireUnambiguousLookup?: boolean;
-    } = {},
+    options: { forFork?: boolean; view?: "metadata" | "latest" | "latest-full" } = {},
   ): Promise<AgentRemoteSession> {
     const scoped = parseRemoteSessionReference(reference);
     const candidates = scoped
@@ -6790,26 +6509,9 @@ export class ProxySessionController {
     const matches = reads
       .filter((result): result is PromiseFulfilledResult<AgentRemoteSession> => result.status === "fulfilled")
       .map((result) => result.value);
-    if (matches.length === 1 && options.requireUnambiguousLookup) {
-      const unresolvedAgents = scoped
-        ? []
-        : reads.flatMap((result, index) => (
-            result.status === "rejected"
-              && !isMissingRemoteSessionLookupError(result.reason, reference)
-              ? [candidates[index]?.[0] ?? "unknown"]
-              : []
-          ));
-      if (unresolvedAgents.length === 0) return matches[0]!;
-      throw new Error(
-        `无法确认任务 ID ${reference} 在所有 Agent 中是否唯一（未能查询：${unresolvedAgents.join("、")}）。`
-        + "请稍后重试，或使用 --agent <标准名> 明确指定 Agent。",
-      );
-    }
     if (matches.length === 1) return matches[0]!;
     if (matches.length > 1) {
-      throw new Error(options.requireUnambiguousLookup
-        ? `多个 Agent 中存在相同任务 ID：${reference}。请使用 --agent <标准名> 指定 Agent，或从 /sessions 卡片中操作。`
-        : `多个 Agent 中存在相同任务 ID：${reference}。请先使用 /sessions，再通过序号选择任务。`);
+      throw new Error(`多个 Agent 中存在相同任务 ID：${reference}。请先使用 /sessions，再通过序号选择任务。`);
     }
     const details = reads
       .map((result, index) => result.status === "rejected"
@@ -8035,7 +7737,6 @@ export class ProxySessionController {
     contextKey: string,
     error: unknown,
     details: RequestFailureDetails = {},
-    lookupCurrentSession = true,
   ): Promise<void> {
     if (error instanceof PresentedRequestError) {
       this.logger.warn(
@@ -8044,7 +7745,7 @@ export class ProxySessionController {
       );
       return;
     }
-    const record = lookupCurrentSession ? this.currentSession(contextKey) : undefined;
+    const record = this.currentSession(contextKey);
     if (record) {
       try {
         if (await this.presentThreadWriterConflict(record, contextKey, error, false)) return;
@@ -8373,22 +8074,6 @@ function bindSessionCardAction(
 
 function runtimeErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isMissingRemoteSessionLookupError(error: unknown, remoteSessionId: string): boolean {
-  const message = (error instanceof AppServerRequestError
-    ? error.serverMessage
-    : runtimeErrorMessage(error).replace(/^thread\/read failed:\s*/iu, "")).trim();
-  if (/timed out|connection (?:closed|lost|refused)|method not found|unknown method|unsupported|not supported/iu
-    .test(message)) return false;
-  if (/(?:method|endpoint|route|handler|procedure|rpc)[^\n]*(?:not found|does not exist|unknown)/iu
-    .test(message)) return false;
-  if (/^(?:unknown (?:remote )?(?:thread|session)|no (?:such )?(?:thread|session)(?: found)?|(?:thread|session)\s+(?:not found|does not exist|不存在|找不到))(?:[.:：\s]|$)/iu
-    .test(message)) return true;
-  const normalizedId = remoteSessionId.trim().toLocaleLowerCase();
-  return Boolean(normalizedId)
-    && message.toLocaleLowerCase().includes(normalizedId)
-    && /^(?:thread|session)[^\n]*(?:not found|does not exist|不存在|找不到)/iu.test(message);
 }
 
 function isUnmaterializedCodexThreadError(error: unknown): boolean {

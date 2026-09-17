@@ -1634,7 +1634,7 @@ async function taskCommand(input: string[]): Promise<void> {
             },
         120_000,
       );
-      const result = taskGroupControlData(response, Boolean(options.sessionId));
+      const result = taskGroupControlData(response);
       if (options.json) printJson(result);
       else printTaskGroupResult(result, "newgroup");
       return;
@@ -2344,13 +2344,7 @@ function requireCliGroupUser(userOpenId: string | undefined): asserts userOpenId
   ));
 }
 
-function taskGroupControlData(
-  response: ControlResponse,
-  preserveServerError = false,
-): TaskGroupControlData {
-  if (!response.ok && preserveServerError && response.message?.trim()) {
-    throw new Error(response.message.trim());
-  }
+function taskGroupControlData(response: ControlResponse): TaskGroupControlData {
   ensureOk(response);
   const data = response.data as Partial<TaskGroupControlData> | undefined;
   if (

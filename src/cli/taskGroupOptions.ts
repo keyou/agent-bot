@@ -30,12 +30,7 @@ export function parseTaskNewOptions(
   action: "new" | "newgroup" = "new",
   language: CliLanguage = cliLanguage,
 ): TaskNewOptions {
-  const { sessionId: _sessionId, ...options } = parseTaskCreationOptions(
-    input,
-    action,
-    language,
-  );
-  return options;
+  return parseTaskCreationOptions(input, action, language);
 }
 
 function parseTaskCreationOptions(

@@ -2,12 +2,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { LocalControlServer } from "./cli/LocalControlServer.js";
-import {
-  assertCompatibleTaskNewGroupRequest,
-  controlEndpoint,
-  type ControlRequest,
-  type ControlResponse,
-} from "./cli/controlProtocol.js";
+import { controlEndpoint, type ControlRequest, type ControlResponse } from "./cli/controlProtocol.js";
 import { readPackageVersion } from "./cli/packageVersion.js";
 import { loadConfig } from "./config/loadConfig.js";
 import { persistFeishuUserOpenIdIfMissing } from "./config/FeishuUserOpenIdStore.js";
@@ -502,8 +497,7 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
       };
     case "task_send_file":
       return { ok: true, data: { messageId: await controller.controlSendTaskFile(request.localSessionId, request.filePath) } };
-    case "task_new_group": {
-      assertCompatibleTaskNewGroupRequest(request);
+    case "task_new_group":
       return {
         ok: true,
         data: await controller.controlCreateTaskGroup(
@@ -515,7 +509,6 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
           request.agentName,
         ),
       };
-    }
     case "task_new_group_session": {
       return {
         ok: true,
@@ -526,7 +519,7 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
           undefined,
           false,
           request.agentName,
-          { sessionId: request.sessionId },
+          request.sessionId,
         ),
       };
     }
