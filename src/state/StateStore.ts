@@ -3,6 +3,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { migrations } from "./migrations.js";
 import type { UpdateCheckSchedule, UpdateNotice } from "../updates/types.js";
+import type { ConversationTurn } from "../runtime/types.js";
 
 export type SessionStatus = "starting" | "ready" | "running" | "closed" | "failed";
 
@@ -1076,6 +1077,43 @@ export class StateStore {
       .prepare("SELECT snapshot_json FROM turn_snapshots WHERE turn_id = ?")
       .get(turnId) as { snapshot_json: string } | undefined;
     return row ? JSON.parse(row.snapshot_json) : undefined;
+  }
+
+  *readConversation(localSessionId: string, throughTurnId?: string): Iterable<ConversationTurn> {
+    const index = this.listTaskTurnGraphIndex(localSessionId);
+    const byId = new Map(index.map((turn) => [turn.turnId, turn]));
+    const current = this.getSession(localSessionId)?.lastTurnId;
+    const parent = current ? this.getTurnParent(current, localSessionId) : undefined;
+    const head = throughTurnId ?? (current && byId.has(current) ? current : undefined)
+      ?? (parent && byId.has(parent) ? parent : undefined)
+      ?? this.findLatestCompletedTurnId(localSessionId) ?? index[0]?.turnId;
+    const branch: string[] = [];
+    const seen = new Set<string>();
+    let turnId: string | undefined = head;
+    while (turnId && !seen.has(turnId)) {
+      seen.add(turnId);
+      const turn = byId.get(turnId);
+      if (!turn) throw new Error("上下文历史不完整，无法导出当前分支。");
+      branch.push(turnId);
+      turnId = turn.parentTurnId;
+    }
+    if (turnId) throw new Error("上下文历史包含循环，无法导出当前分支。");
+    const read = this.db.prepare(`SELECT
+      json_extract(snapshot_json, '$.prompt') AS prompt,
+      json_extract(snapshot_json, '$.finalResponse') AS answer,
+      (SELECT json_group_array(json_extract(value, '$.text'))
+        FROM json_each(snapshot_json, '$.activities')
+        WHERE json_extract(value, '$.kind') = 'user') AS followups
+      FROM turn_snapshots WHERE turn_id = ?`);
+    for (const id of branch.reverse()) {
+      const row = read.get(id) as { prompt: string | null; answer: string | null; followups: string };
+      const messages: ConversationTurn["messages"] = [];
+      for (const text of [row.prompt, ...(JSON.parse(row.followups) as string[])]) {
+        if (text?.trim()) messages.push({ role: "user", text });
+      }
+      if (row.answer?.trim()) messages.push({ role: "assistant", text: row.answer });
+      yield { turnId: id, messages };
+    }
   }
 
   getTurnPromptSummary(turnId: string): TurnPromptSummary | undefined {

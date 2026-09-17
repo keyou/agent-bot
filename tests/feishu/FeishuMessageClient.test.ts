@@ -181,7 +181,7 @@ describe("FeishuMessageClient", () => {
     });
 
     expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
-      "https://open.feishu.cn/open-apis/im/v1/messages/om_merged",
+      "https://open.feishu.cn/open-apis/im/v1/messages/om_merged?card_msg_content_type=user_card_content",
     );
     expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
       headers: { Authorization: "Bearer token" },
@@ -212,8 +212,50 @@ describe("FeishuMessageClient", () => {
       files: [],
     });
     expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
-      "https://open.feishu.cn/open-apis/im/v1/messages/om_quoted_image",
+      "https://open.feishu.cn/open-apis/im/v1/messages/om_quoted_image?card_msg_content_type=user_card_content",
     );
+  });
+
+  test("reads original Card 2.0 text and images instead of the compatibility placeholder", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
+      .mockImplementationOnce(async (input: string | URL) => {
+        const originalCard = new URL(input).searchParams.get("card_msg_content_type") === "user_card_content";
+        return response({
+          code: 0,
+          msg: "ok",
+          data: { items: [{
+            message_id: "om_quoted_card",
+            msg_type: "interactive",
+            body: { content: JSON.stringify(originalCard ? {
+              schema: "2.0",
+              header: { title: { tag: "plain_text", content: "Diagnostic report" } },
+              body: { elements: [
+                { tag: "markdown", content: "**Provider error**\nThe configured API key is missing." },
+                { tag: "column_set", columns: [{ tag: "column", elements: [
+                  { tag: "markdown", content: "Check the Provider environment." },
+                  { tag: "img", img_key: "img_diagnostic", alt: { tag: "plain_text", content: "Screenshot" } },
+                ] }] },
+              ] },
+            } : {
+              title: null,
+              elements: [[
+                { tag: "img", image_key: "img_diagnostic" },
+                { tag: "text", text: "请升级至最新版本客户端，以查看内容" },
+              ]],
+            }) },
+          }] },
+        });
+      });
+    globalThis.fetch = fetchMock;
+    const client = new FeishuMessageClient(config(), logger());
+
+    await expect(client.readReferencedMessage("om_quoted_card")).resolves.toEqual({
+      text: "[消息类型：卡片]\nDiagnostic report\n**Provider error**\nThe configured API key is missing.\nCheck the Provider environment.\n[图片 1]\nScreenshot",
+      messageType: "interactive",
+      images: [{ messageId: "om_quoted_card", imageKey: "img_diagnostic" }],
+      files: [],
+    });
   });
 
   test("uploads a local file and sends it as a Feishu file message", async () => {

@@ -4,6 +4,16 @@ import { CommandRouter } from "../../src/commands/CommandRouter.js";
 describe("CommandRouter", () => {
   const router = new CommandRouter();
 
+  test("parses clone commands, explicit Agents, titles, and abbreviations", () => {
+    expect(router.parse("/clone")).toEqual({ type: "clone", title: undefined, agentName: undefined });
+    expect(router.parse('/clone "新的任务" --agent traex')).toEqual({ type: "clone", title: "新的任务", agentName: "traex" });
+    expect(router.parse("/cg --agent codex 新群")).toEqual({ type: "clonegroup", title: "新群", agentName: "codex" });
+    expect(() => router.parse("/cl")).toThrow("不唯一");
+    expect(() => router.parse("/clone --agent")).toThrow("指定 Agent");
+    expect(() => router.parse("/clone --agent a --agent b")).toThrow("只能指定一次");
+    expect(() => router.parse("/clonegroup --dir project")).toThrow("不支持参数");
+  });
+
   test("parses local shell commands before prompt routing", () => {
     expect(router.parse("! ls")).toEqual({ type: "shell", command: "ls" });
     expect(router.parse("！git status")).toEqual({ type: "shell", command: "git status" });

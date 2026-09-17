@@ -1,8 +1,11 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 import type { Logger } from "pino";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   spawnStdioCommand: vi.fn(),
@@ -13,13 +16,142 @@ vi.mock("../../src/utils/spawnCommand.js", () => ({
 }));
 
 import { CodexProcessManager } from "../../src/codex/CodexProcessManager.js";
+import { CodexRuntime } from "../../src/codex/CodexRuntime.js";
+import { loadConfig } from "../../src/config/loadConfig.js";
+
+let home: string;
+beforeEach(() => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-codex-env-"));
+  vi.spyOn(os, "homedir").mockReturnValue(home);
+  vi.stubEnv("CODEX_HOME", undefined);
+  vi.stubEnv("TEST_CODEX_FILE_KEY", undefined);
+});
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.clearAllMocks();
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+  fs.rmSync(home, { recursive: true, force: true });
 });
 
 describe("CodexProcessManager", () => {
+  test("loads the default Codex .env at startup without mutating the Worker environment", async () => {
+    const directory = path.join(home, ".codex");
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, ".env"), [
+      '# Provider credentials',
+      'TEST_CODEX_FILE_KEY="file-value"',
+      'FEISHU_APP_SECRET=must-not-reach-agent',
+      'AGENT_BOT_RESTART_REASON=must-not-reach-agent',
+      'CODEX_HOME=must-not-redirect-the-child',
+    ].join("\n"));
+    const workerHome = process.env.AGENT_BOT_HOME;
+    const manager = new CodexProcessManager("codex", ["app-server"], {}, logger());
+    expect(manager.getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBe("file-value");
+    expect(manager.getEnvironmentVariable("CODEX_HOME")).toBe(directory);
+    expect(process.env.TEST_CODEX_FILE_KEY).toBeUndefined();
+    expect(process.env.AGENT_BOT_HOME).toBe(workerHome);
+
+    const child = fakeChildProcess();
+    mocks.spawnStdioCommand.mockReturnValue(child.child);
+    const starting = manager.getClient();
+    const environment = mocks.spawnStdioCommand.mock.calls[0]?.[2] as NodeJS.ProcessEnv;
+    expect(environment.TEST_CODEX_FILE_KEY).toBe("file-value");
+    expect(environment.CODEX_HOME).toBe(directory);
+    expect(environment.FEISHU_APP_SECRET).toBeUndefined();
+    expect(environment.AGENT_BOT_RESTART_REASON).toBeUndefined();
+    child.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    await starting;
+    manager.close();
+  });
+
+  test("prefers Agent settings and Profile environment over Codex .env, including empty values", () => {
+    const directory = path.join(home, ".codex");
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, ".env"), "TEST_CODEX_FILE_KEY=file-value\n");
+    vi.stubEnv("AGENT_BOT_HOME", path.join(home, "profile"));
+    vi.stubEnv("AGENT_BOT_CONFIG", "");
+    vi.stubEnv("TEST_CODEX_FILE_KEY", undefined);
+    fs.mkdirSync(path.join(home, "profile"));
+    fs.writeFileSync(path.join(home, "profile", ".env"), "TEST_CODEX_FILE_KEY=profile-value\n");
+    loadConfig();
+    expect(new CodexProcessManager("codex", [], {}, logger())
+      .getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBe("profile-value");
+    expect(new CodexProcessManager("codex", [], { TEST_CODEX_FILE_KEY: "agent-value" }, logger())
+      .getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBe("agent-value");
+    vi.stubEnv("TEST_CODEX_FILE_KEY", "");
+    expect(new CodexProcessManager("codex", [], {}, logger())
+      .getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBe("");
+  });
+
+  test("keeps separate CODEX_HOME files isolated and does not load them for other Agents", () => {
+    const primary = path.join(home, "primary");
+    const rescue = path.join(home, "rescue");
+    for (const [directory, value] of [[primary, "primary-value"], [rescue, "rescue-value"]] as const) {
+      fs.mkdirSync(directory);
+      fs.writeFileSync(path.join(directory, ".env"), `TEST_CODEX_FILE_KEY=${value}\n`);
+    }
+    vi.stubEnv("CODEX_HOME", primary);
+    expect(new CodexProcessManager("codex", [], {}, logger())
+      .getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBe("primary-value");
+    const isolated = new CodexProcessManager("codex", [], { CODEX_HOME: rescue }, logger());
+    expect(isolated.getCodexHome()).toBe(rescue);
+    expect(isolated.getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBe("rescue-value");
+    for (const command of ["traex", "custom-app-server"]) {
+      expect(new CodexProcessManager(command, [], {}, logger())
+        .getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBeUndefined();
+    }
+    expect(process.env.TEST_CODEX_FILE_KEY).toBeUndefined();
+  });
+
+  test.each(["~/settings", "settings"])("resolves CODEX_HOME %s consistently with the child working directory", (configured) => {
+    const directory = path.join(home, "settings");
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, ".env"), "TEST_CODEX_FILE_KEY=resolved\n");
+    const manager = new CodexProcessManager("node", ["codex.js"], { CODEX_HOME: configured }, logger(),
+      () => ({ profilePath: home }));
+    expect(manager.getCodexHome()).toBe(directory);
+    expect(manager.getEnvironmentVariable("TEST_CODEX_FILE_KEY")).toBe("resolved");
+  });
+
+  test("tolerates a missing file and warns about unreadable files without logging contents", () => {
+    const log = logger();
+    new CodexProcessManager("codex", [], {}, log);
+    expect(log.warn).not.toHaveBeenCalled();
+    fs.mkdirSync(path.join(home, ".codex", ".env"), { recursive: true });
+    expect(() => new CodexProcessManager("codex", [], {}, log)).not.toThrow();
+    expect(log.warn).toHaveBeenCalledWith(
+      { path: path.join(home, ".codex", ".env"), code: "EISDIR" },
+      expect.any(String),
+    );
+  });
+
+  test("uses a key from Codex .env when Agent Bot queries the Provider model endpoint", async () => {
+    const directory = path.join(home, ".codex");
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, ".env"), "TEST_CODEX_FILE_KEY=provider-token\n");
+    const child = fakeChildProcess();
+    mocks.spawnStdioCommand.mockReturnValue(child.child);
+    const manager = new CodexProcessManager("codex", ["app-server"], {}, logger());
+    const runtime = new CodexRuntime(manager, logger());
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [{ id: "provider-model" }] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const models = runtime.listModels("private-provider");
+    child.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    await vi.waitFor(() => expect(child.writtenJson()).toContainEqual(expect.objectContaining({ method: "config/read" })));
+    child.pushStdout({ id: 2, result: { config: { model_providers: { "private-provider": {
+      base_url: "https://provider.example/v1", env_key: "TEST_CODEX_FILE_KEY",
+    } } } } });
+    await vi.waitFor(() => expect(child.writtenJson()).toContainEqual(expect.objectContaining({ method: "model/list" })));
+    child.pushStdout({ id: 3, result: { data: [] } });
+    expect(await models).toEqual([expect.objectContaining({ id: "provider-model" })]);
+    expect(fetchMock.mock.calls[0]?.[0].toString()).toBe("https://provider.example/v1/models");
+    expect((fetchMock.mock.calls[0]?.[1].headers as Headers).get("Authorization")).toBe("Bearer provider-token");
+    expect(process.env.TEST_CODEX_FILE_KEY).toBeUndefined();
+    runtime.close();
+  });
+
   test("resolves Agent-specific environment values before inherited values", () => {
     vi.stubEnv("INHERITED_PROVIDER_KEY", "parent-value");
     vi.stubEnv("OVERRIDDEN_PROVIDER_KEY", "parent-value");

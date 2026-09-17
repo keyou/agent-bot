@@ -187,7 +187,7 @@ function renderMessageContent(
     case "sticker":
       return "[表情包]";
     case "interactive":
-      return renderInteractiveCard(content) || "[消息卡片]";
+      return renderInteractiveCard(content, imageLabel) || "[消息卡片]";
     case "share_chat":
       return "[群名片]";
     case "share_user":
@@ -235,25 +235,47 @@ function messageTypeLabel(messageType: string): string {
   }
 }
 
-function renderInteractiveCard(content: Record<string, unknown>): string {
+function renderInteractiveCard(
+  content: Record<string, unknown>,
+  imageLabel: (imageKey: string) => string,
+): string {
   const values: string[] = [];
-  collectCardText(content, undefined, values);
+  collectCardText(content, undefined, values, imageLabel);
   return [...new Set(values.map((value) => normalizeFeishuPostText(value)).filter(Boolean))].join("\n");
 }
 
-function collectCardText(value: unknown, key: string | undefined, output: string[]): void {
+function collectCardText(
+  value: unknown,
+  key: string | undefined,
+  output: string[],
+  imageLabel: (imageKey: string) => string,
+): void {
   if (typeof value === "string") {
-    if (key === "content" || key === "text" || key === "title" || key === "subtitle") output.push(value);
+    if (
+      (key === "content" || key === "text" || key === "title" || key === "subtitle")
+      && !isUnsupportedCardClientPlaceholder(value)
+    ) {
+      output.push(value);
+    }
     return;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectCardText(item, key, output);
+    for (const item of value) collectCardText(item, key, output, imageLabel);
     return;
   }
   if (!isRecord(value)) return;
-  for (const [childKey, childValue] of Object.entries(value)) {
-    collectCardText(childValue, childKey, output);
+  const imageKey = textValue(value.image_key ?? value.img_key);
+  if (imageKey) {
+    output.push(imageLabel(imageKey));
   }
+  for (const [childKey, childValue] of Object.entries(value)) {
+    collectCardText(childValue, childKey, output, imageLabel);
+  }
+}
+
+function isUnsupportedCardClientPlaceholder(value: string): boolean {
+  return value.trim() === "请升级至最新版本客户端，以查看内容"
+    || /^please upgrade to the latest .*client.* view/iu.test(value.trim());
 }
 
 function renderPost(

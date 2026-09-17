@@ -59,6 +59,7 @@ import type { AgentRuntimeRegistry } from "../runtime/AgentRuntimeRegistry.js";
 import type {
   AgentRuntime,
   ApprovalDecision,
+  ConversationTurn,
   ModelOption,
   PermissionMode,
   RemoteCompletedTurnSummary,
@@ -81,6 +82,7 @@ import {
 import {
   StateStore,
   type CardActionBinding,
+  type ForkHistorySourceRecord,
   type MessageReactionRecord,
   type MessageReactionStatus,
   type QueuedPromptRecord,
@@ -92,6 +94,7 @@ import { createId } from "../utils/id.js";
 import { formatStorageSize } from "../utils/formatStorageSize.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
 import { normalizeTaskTitle } from "../utils/taskTitle.js";
+import { conversationImportPrompt, exportConversation } from "./ConversationExport.js";
 import {
   executeShellCommand,
   type ShellCommandOptions,
@@ -260,6 +263,8 @@ const HELP_COMMAND_SECTIONS: Array<{
         usage: "[序号或任务 ID]",
         description: "从当前或指定任务最近完成轮次创建分支",
       },
+      { command: "/clone", usage: "[title] [--agent &#60;name&#62;]", description: "导出用户 Prompt 和最终回答，交给新 Agent 任务读取" },
+      { command: "/clonegroup", usage: "[title] [--agent &#60;name&#62;]", description: "将对话上下文交给新群中的 Agent 任务" },
       { command: "/turns", usage: "[Turn ID 或序号]", description: "浏览历史轮次，并可 Reset 对话上下文；带参数查看运行详情" },
       {
         command: "/title",
@@ -475,6 +480,14 @@ export interface ControlTaskGroupResult {
   sourceTurnId?: string;
   group: CreatedFeishuGroupContext;
   task: SessionRecord;
+}
+
+export interface ControlTaskCloneResult {
+  sourceLocalSessionId: string;
+  contextFile: string;
+  turnCount: number;
+  task: SessionRecord;
+  group?: CreatedFeishuGroupContext;
 }
 
 export interface ControlTaskReleaseResult {
@@ -1512,6 +1525,22 @@ export class ProxySessionController {
     };
   }
 
+  async controlCloneTask(
+    localSessionId: string,
+    requestedTitle?: string,
+    requestedAgentName?: string,
+    newGroup = false,
+    userOpenId?: string,
+  ): Promise<ControlTaskCloneResult> {
+    const source = this.requireControlSession(localSessionId);
+    const contextKey = this.controlSessionContextKey(source);
+    const replyTarget = this.controlSessionReplyTarget(source);
+    return this.outbound.withReplyTarget(contextKey, replyTarget, () => this.cloneSession(
+      contextKey, { ...source, contextKey }, requestedTitle, requestedAgentName,
+      newGroup, userOpenId, replyTarget,
+    ));
+  }
+
   async controlForkTaskGroup(
     localSessionId: string,
     requestedTitle: string | undefined,
@@ -2015,6 +2044,22 @@ export class ProxySessionController {
           command.projectless === true,
         );
         return;
+      case "clone":
+      case "clonegroup": {
+        let source = this.currentSession(contextKey);
+        let throughTurnId: string | undefined;
+        if (incomingMessage?.threadContext && (!source
+          || !this.store.findLatestCompletedTurnId(source.localSessionId, contextKey))) {
+          const resolved = this.resolveThreadForkAnchor(incomingMessage, false);
+          source = resolved.source;
+          throughTurnId = resolved.anchor.turnId;
+        }
+        await this.cloneSession(
+          contextKey, source ?? this.requireCurrentSession(contextKey), command.title,
+          command.agentName, command.type === "clonegroup", userId, replyTarget, throughTurnId,
+        );
+        return;
+      }
       case "forkgroup":
         await this.forkCurrentSessionToFeishuGroup(contextKey, command.title, userId, incomingMessage);
         return;
@@ -3018,7 +3063,7 @@ export class ProxySessionController {
     }
   }
 
-  private resolveThreadForkAnchor(message: IncomingMessage): ResolvedThreadForkAnchor {
+  private resolveThreadForkAnchor(message: IncomingMessage, includeSnapshot = true): ResolvedThreadForkAnchor {
     if (!message.threadContext || !message.threadId || !message.chatId) {
       throw new Error("当前消息不属于可识别的飞书话题。");
     }
@@ -3039,8 +3084,9 @@ export class ProxySessionController {
       throw new Error("话题来源任务不属于当前会话，已拒绝创建分支。");
     }
 
-    const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(anchor.turnId));
-    if (isTurnStillRunning(snapshot?.status)
+    const snapshot = includeSnapshot ? turnViewSnapshot(this.store.getTurnSnapshot(anchor.turnId)) : undefined;
+    const status = includeSnapshot ? snapshot?.status : this.store.getTurnPromptSummary(anchor.turnId)?.status;
+    if (isTurnStillRunning(status)
       || (source.lastTurnId === anchor.turnId && source.lastTurnStatus === "running")) {
       throw new Error("话题对应的轮次仍在执行，App Server 暂时不能从这一轮 fork。请等待该轮完成后再在话题中发送消息。");
     }
@@ -3837,6 +3883,7 @@ export class ProxySessionController {
     replyTarget?: MessageReplyTarget,
     requestedTitle?: string,
     executionSettings: SessionExecutionSettings = {},
+    activate = true,
   ): Promise<SessionRecord> {
     const agent = this.ensureAgent(agentName);
     const resolvedExecutionSettings = mergeExecutionSettings(agent.defaults ?? {}, executionSettings);
@@ -3856,7 +3903,7 @@ export class ProxySessionController {
         permissionMode: resolvedExecutionSettings.permissionMode,
       });
     }
-    this.store.setCurrentSession(contextKey, localSessionId);
+    if (activate) this.store.setCurrentSession(contextKey, localSessionId);
     this.outbound.registerSession(
       localSessionId,
       contextKey,
@@ -4009,6 +4056,105 @@ export class ProxySessionController {
     return { group, task };
   }
 
+  private async cloneSession(
+    sourceContextKey: string,
+    source: SessionRecord,
+    requestedTitle: string | undefined,
+    requestedAgentName: string | undefined,
+    newGroup: boolean,
+    userId?: string,
+    replyTarget?: MessageReplyTarget,
+    throughTurnId?: string,
+  ): Promise<ControlTaskCloneResult> {
+    const context = this.store.getOrCreateUserContext(sourceContextKey, this.config.defaults.agent!);
+    const agentName = requestedAgentName?.trim() || context.defaultAgent;
+    this.ensureAgent(agentName);
+    if (newGroup && !userId?.startsWith("ou_")) {
+      throw new Error("/clonegroup 只能由具有 open_id 的飞书用户触发。");
+    }
+    await this.outbound.sendText(sourceContextKey, `正在导出对话并创建 ${this.agentLabel(agentName)} 克隆任务，请稍后。`);
+    const exported = await exportConversation(
+      path.join(path.dirname(this.config.storage.sqlitePath), "context-transfers"),
+      this.readCloneConversation(source, throughTurnId),
+    );
+    const title = normalizeTaskTitle(requestedTitle) ?? `${source.title ?? "任务"}（克隆）`;
+    const cwd = detectProjectlessWorkspace(source.cwd) ? undefined : source.cwd;
+    const group = newGroup ? await this.createFeishuGroupContext(
+      sourceContextKey, agentName, title, userId, cwd, "/clonegroup",
+    ) : undefined;
+    const contextKey = group?.contextKey ?? sourceContextKey;
+    let task: SessionRecord;
+    try {
+      task = await this.createSession(
+        contextKey, agentName, cwd, false, false, undefined, undefined, title,
+        { permissionMode: source.permissionMode ?? "auto" }, false,
+      );
+    } catch (error) {
+      await this.outbound.sendText(contextKey,
+        `${group ? "群已创建，但" : ""}克隆任务创建失败；上下文文件已保留：${exported.filePath}`);
+      throw error;
+    }
+    this.store.audit(contextKey, "session_cloned", {
+      sourceLocalSessionId: source.localSessionId,
+      clonedLocalSessionId: task.localSessionId,
+      contextFile: exported.filePath,
+      turnCount: exported.turnCount,
+    });
+    try {
+      await this.startTurn(
+        await this.loadSession(task), conversationImportPrompt(exported.filePath),
+        group ? undefined : replyTarget, undefined,
+        { displayPrompt: `读取历史上下文（${exported.turnCount} 轮对话）` },
+      );
+    } catch (error) {
+      await this.outbound.sendText(contextKey,
+        `克隆任务已创建，但上下文读取启动失败。任务 ID：${task.localSessionId}；上下文文件：${exported.filePath}`);
+      throw error;
+    }
+    this.store.setCurrentSession(contextKey, task.localSessionId);
+    await this.outbound.sendText(sourceContextKey, group
+      ? `已创建克隆群：${group.name}，正在读取 ${exported.turnCount} 轮历史对话。`
+      : `已切换到 ${this.agentLabel(agentName)} 克隆任务：${title}，正在读取 ${exported.turnCount} 轮历史对话。`);
+    return {
+      sourceLocalSessionId: source.localSessionId,
+      contextFile: exported.filePath,
+      turnCount: exported.turnCount,
+      task: this.store.getSession(task.localSessionId) ?? task,
+      ...(group ? { group } : {}),
+    };
+  }
+
+  private async *readCloneConversation(source: SessionRecord, throughTurnId?: string): AsyncIterable<ConversationTurn> {
+    const runtime = this.runtimes.forAgent(source.agentName);
+    if (!source.remoteSessionId || !runtime.readConversation) {
+      yield* this.store.readConversation(source.localSessionId, throughTurnId);
+      return;
+    }
+    let localSessionId: string | undefined = source.localSessionId;
+    let remoteSessionId = source.remoteSessionId;
+    const visited = new Set<string>();
+    while (!visited.has(remoteSessionId)) {
+      visited.add(remoteSessionId);
+      const fork: ForkHistorySourceRecord | undefined = localSessionId
+        ? this.store.getForkHistorySource(localSessionId) : undefined;
+      if (fork && runtime.readRemoteForkSource) {
+        const remote = await runtime.readRemoteForkSource(remoteSessionId);
+        const completed = remote.lastCompletedTurnId
+          ?? (remote.lastTurnStatus === "completed" ? remote.lastTurnId : undefined);
+        if (!completed) {
+          if (!fork.sourceRemoteSessionId) throw new Error("找不到分支的原始任务，无法导出继承的上下文。");
+          throughTurnId ??= fork.sourceTurnId;
+          localSessionId = fork.sourceLocalSessionId;
+          remoteSessionId = fork.sourceRemoteSessionId;
+          continue;
+        }
+      }
+      yield* runtime.readConversation(remoteSessionId, throughTurnId);
+      return;
+    }
+    throw new Error("分支来源包含循环，无法导出上下文。");
+  }
+
   private async forkCurrentSessionToFeishuGroup(
     sourceContextKey: string,
     requestedTitle: string | undefined,
@@ -4107,7 +4253,7 @@ export class ProxySessionController {
     taskTitle: string,
     userId: string | undefined,
     boundProjectCwd: string | undefined,
-    commandName: "/newgroup" | "/forkgroup",
+    commandName: "/newgroup" | "/forkgroup" | "/clonegroup",
   ): Promise<CreatedFeishuGroupContext> {
     if (!userId?.startsWith("ou_")) {
       throw new Error(`${commandName} 只能由具有 open_id 的飞书用户消息触发。`);
@@ -8330,7 +8476,7 @@ function latestRemoteTimestamp(...values: Array<number | undefined>): number | u
   return timestamps.length > 0 ? Math.max(...timestamps) : undefined;
 }
 
-function isTurnStillRunning(status?: TurnViewState["status"]): boolean {
+function isTurnStillRunning(status?: string): boolean {
   return status === "starting"
     || status === "running"
     || status === "tool_running"

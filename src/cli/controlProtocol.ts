@@ -43,6 +43,7 @@ export type ControlRequest =
       projectless?: boolean;
     }
   | { action: "task_fork"; localSessionId: string }
+  | { action: "task_clone" | "task_clone_group"; localSessionId: string; title?: string; agentName?: string }
   | {
       action: "task_switch";
       localSessionId: string;
@@ -100,6 +101,14 @@ export interface TaskGroupControlData {
     name: string;
   };
   task: SessionRecord;
+}
+
+export interface TaskCloneControlData {
+  sourceLocalSessionId: string;
+  contextFile: string;
+  turnCount: number;
+  task: SessionRecord;
+  group?: TaskGroupControlData["group"];
 }
 
 export interface TaskDismissControlData {

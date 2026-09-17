@@ -21,6 +21,53 @@ describe("CodexRuntime", () => {
     ]);
   });
 
+  test("exports paginated prompts and final answers without tools, reasoning, or active Turns", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const answer = "long answer".repeat(2_000);
+    client.turnListResults.push(
+      { data: [{ id: "active", status: "inProgress" }, { id: "last", status: "completed" }], nextCursor: null },
+      { data: [{ id: "first", status: "completed", items: [
+        { type: "userMessage", content: [{ type: "text", text: "first prompt" }, { type: "image", url: "excluded" }] },
+        { type: "reasoning", text: "private reasoning" },
+        { type: "agentMessage", phase: "commentary", text: "progress" },
+        { type: "commandExecution", output: "huge output" },
+        { type: "agentMessage", phase: "final_answer", text: answer },
+      ] }], nextCursor: "page2" },
+      { data: [{ id: "failed", status: "failed", items: [{ type: "userMessage", content: [{ type: "text", text: "excluded failed prompt" }] }] }, { id: "last", status: "completed", items: [
+        { type: "userMessage", content: [{ type: "text", text: "second prompt" }] },
+        { type: "userMessage", content: [{ type: "text", text: "steered prompt" }] },
+        { type: "agentMessage", text: "legacy final" },
+      ] }, { id: "active", status: "inProgress" }], nextCursor: "unused" },
+    );
+    const turns = [];
+    for await (const turn of runtime.readConversation("source")) turns.push(turn);
+    expect(turns).toEqual([
+      { turnId: "first", messages: [{ role: "user", text: "first prompt" }, { role: "assistant", text: answer }] },
+      { turnId: "last", messages: [{ role: "user", text: "second prompt" }, { role: "user", text: "steered prompt" }, { role: "assistant", text: "legacy final" }] },
+    ]);
+    expect(client.requests.every((request) => request.method === "thread/turns/list")).toBe(true);
+    expect(client.requests.at(-1)?.params).toEqual({ threadId: "source", cursor: "page2", limit: 50, sortDirection: "asc", itemsView: "summary" });
+  });
+
+  test("conversation export respects an explicit boundary and rejects repeated cursors and missing anchors", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const collect = async () => {
+      const turns = [];
+      for await (const turn of runtime.readConversation("source", "anchor")) turns.push(turn);
+      return turns;
+    };
+    client.turnListResults.push({ data: [{ id: "anchor", status: "completed", items: [] }, { id: "later", status: "completed", items: [] }], nextCursor: null });
+    expect(await collect()).toEqual([{ turnId: "anchor", messages: [] }]);
+    client.turnListResults.push({ data: [], nextCursor: "repeat" }, { data: [], nextCursor: "repeat" });
+    await expect(collect()).rejects.toThrow("repeated");
+    client.turnListResults.push({ data: [], nextCursor: null });
+    await expect(collect()).rejects.toThrow("截止轮次");
+    client.turnListResults.push({ data: [{ id: "anchor", status: "inProgress" }], nextCursor: null });
+    await expect(collect()).rejects.toThrow("历史发生变化");
+  });
+
   test("counts paginated Turns and reads rollout disk usage without loading full history", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-metrics-"));
     const rolloutPath = path.join(directory, "rollout.jsonl");
@@ -1912,6 +1959,67 @@ describe("Provider switching", () => {
     expect(session).toMatchObject(target);
   });
 
+  test("forks the latest completed Turn when resume ignores Provider settings", async () => {
+    const { client, runtime, session } = await setup();
+    client.resumeResults.push(oldResponse);
+    client.turnListResults.push({
+      data: [
+        { id: "turn_failed", status: "failed" },
+        { id: "turn_interrupted", status: "interrupted" },
+        { id: "turn_latest", status: "completed" },
+      ],
+      nextCursor: null,
+    });
+    client.forkResult = {
+      thread: { id: "thr_provider_fork", turns: [] },
+      modelProvider: "azure",
+      model: "gpt-test",
+      reasoningEffort: "high",
+    };
+
+    await runtime.setExecutionSettings("s", target);
+
+    expect(client.requests).toContainEqual({
+      method: "thread/fork",
+      params: expect.objectContaining({
+        threadId: "thr_1",
+        lastTurnId: "turn_latest",
+        modelProvider: "azure",
+        model: "gpt-test",
+        excludeTurns: true,
+      }),
+    });
+    expect(client.requests).toContainEqual({
+      method: "thread/name/set",
+      params: { threadId: "thr_provider_fork", name: "Original" },
+    });
+    expect(client.requests).toContainEqual({
+      method: "thread/unsubscribe",
+      params: { threadId: "thr_1" },
+    });
+    expect(session).toMatchObject({
+      ...target,
+      remoteSessionId: "thr_provider_fork",
+      title: "Original",
+    });
+  });
+
+  test("does not fork unfinished history when no completed Turn exists", async () => {
+    const { client, runtime, session } = await setup();
+    client.resumeResults.push(oldResponse, oldResponse);
+    client.turnListResults.push({
+      data: [{ id: "failed", status: "failed" }, { id: "interrupted", status: "interrupted" }],
+      nextCursor: null,
+    });
+    const persist = vi.fn();
+
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow("已完成的 Turn");
+
+    expect(client.requests.some((request) => request.method === "thread/fork")).toBe(false);
+    expect(persist).not.toHaveBeenCalled();
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
+  });
+
   test("replaces only a proven empty thread and waits for persistence before starting a turn", async () => {
     const { client, runtime, session } = await setup(true);
     client.startResult = { ...targetResponse, thread: { id: "replacement" } };
@@ -1980,6 +2088,10 @@ describe("Provider switching", () => {
   ])("rejects %s and restores the old Provider without persisting", async (_name, response, expected) => {
     const { client, runtime, session } = await setup();
     client.resumeResults.push(response, oldResponse);
+    if (!(response instanceof Error)) {
+      client.turnListResults.push({ data: [{ id: "completed", status: "completed" }], nextCursor: null });
+      client.forkResult = response;
+    }
     const persist = vi.fn();
     await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow(String(expected));
     expect(persist).not.toHaveBeenCalled();

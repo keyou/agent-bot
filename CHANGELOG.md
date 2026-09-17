@@ -6,6 +6,11 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Load each Codex Agent's `CODEX_HOME/.env` at Worker startup for Provider model discovery and the Codex process, without overriding existing environment or explicit Agent settings or sharing those values with other Agents.
+- Retrieve original quoted and merged-forwarded card content, including available text and images, instead of client-upgrade placeholders.
+- Retry ignored Provider and model changes on a thread forked through the latest completed Turn, verify the result before rebinding, and preserve the previous settings on failure.
+- Add `/clone`, `/clonegroup`, and matching CLI commands to transfer user Prompts and final answers into a fresh task, optionally on another Agent or in a new group, without copying reasoning, tool logs, or image payloads.
+
 ## [0.1.23] - 2026-09-16
 
 - Check stable npm updates once daily between 10:00 and 17:00, notify the owner privately with release notes and a cancellable 60-second countdown, then prepare updates in the background and activate only after tasks and final deliveries finish. Persist per-version reminders and cancellations across restarts, and retain npm-only installation and rollback protections.

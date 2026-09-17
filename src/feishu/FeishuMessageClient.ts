@@ -259,8 +259,11 @@ export class FeishuMessageClient implements FeishuOutbound {
   private async readMessageItems(messageId: string, operation: string): Promise<MergedForwardMessageItem[]> {
     try {
       const token = await this.getTenantAccessToken();
+      const url = new URL(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`);
+      // The default compatibility format can replace Card 2.0 content with an upgrade notice.
+      url.searchParams.set("card_msg_content_type", "user_card_content");
       const response = await fetch(
-        `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+        url,
         { headers: { Authorization: `Bearer ${token}` } },
       );
       const payload = (await response.json()) as GetMessageResponse;

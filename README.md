@@ -206,6 +206,8 @@ agentbot task new [task] [title] [--agent <standard-name>] [--dir <path> | --nod
 agentbot task newgroup [task] [title] [--agent <standard-name>] [--dir <path> | --nodir]
 agentbot task fork [task]
 agentbot task forkgroup [task] [title]
+agentbot task clone [task] [title] [--agent <standard-name>]
+agentbot task clonegroup [task] [title] [--agent <standard-name>]
 agentbot task queue [task] "<prompt>"
 agentbot task model [task] [model]
 agentbot task goal [task] [action-or-objective]
@@ -223,6 +225,10 @@ Inside an Agent started by Agent Bot, `[task]` defaults to the current task; use
 
 `task newgroup` creates a Feishu group and a new task. By default, it inherits the source task's Agent and execution settings. `--agent <standard-name>` selects another configured Agent; the source project shape is still inherited, while Provider, model, reasoning effort, and permission mode use the target Agent's saved defaults. `--dir` overrides the project directory and supports `~`; `--nodir` forces a Projectless App Server task. Project and Projectless group names can be customized separately through `feishu.groupNameFormat`. `task forkgroup` forks from the source task's latest available completed turn without interrupting an active turn. Both commands require the Server to be running, invite the authorizing user saved in the Profile, leave the source conversation on its current task, and support `--json`.
 
+`task clone` and `task clonegroup` (also available as `/clone` and `/clonegroup`, abbreviated `/cg`) transfer lightweight dialogue, even between different Agents. They export user Prompts and final answers in order through the latest completed Turn to a local text file, then automatically ask a fresh Agent to read it, acknowledge, and wait for the next request. No LLM summary, reasoning, tool calls/results, image payloads, or native session files are copied. Large files can be read in sections. App Server history uses summary pagination; ACP sources export only dialogue already saved by Agent Bot.
+
+The target uses the conversation's default Agent unless `--agent` is supplied, even when that differs from the source Agent. Provider, model, and reasoning use the target Agent's saved defaults; permissions and project directory come from the source, with a fresh workspace for Projectless App Server tasks. `clone` switches the conversation only after task creation and import start succeed; `clonegroup` creates a new private group without switching the source conversation. Neither interrupts active source work or includes its unfinished Turn. In a topic without completed task history, the mapped source Turn is the cutoff. Both CLI commands support `--json`; group creation requires the Profile's authorized user. Files remain under `context-transfers` beside the configured SQLite file (normally `~/.agent-bot/data/context-transfers`); retain them while cloned tasks need them. This transfers text context, not executable session state or local file changes.
+
 ## Feishu Commands
 
 Send a message beginning with `/` to run a command. Use `/help` in Feishu for the latest command list.
@@ -237,6 +243,7 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 | `/dismiss`                                    | Archive the current task and dissolve the group after confirmation |
 | `/switch [task]`                              | Switch tasks or return to the previous task |
 | `/fork [task]`                                | Branch a task                        |
+| `/clone [title] [--agent <name>]`              | Transfer dialogue into a fresh task |
 | `/turn [Turn ID or index]`                     | Browse turn history or view one turn's runtime details |
 | `/status [task]`                              | View task status, Turn count, and disk usage |
 | `/title <title>`                              | Rename the current task              |
@@ -251,6 +258,7 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 | `/agent [name]`                               | Choose the Agent for new tasks       |
 | `/newgroup [title] [--dir <path> \| --nodir]` | Start a task in a new private group  |
 | `/forkgroup [title]`                          | Branch a task into a new private group |
+| `/clonegroup [title] [--agent <name>]`         | Transfer dialogue into a new private group |
 | `/restart [--force]`                          | Restart safely, or interrupt with `--force` |
 | `/release`                                    | Release Agent Bot's App Server tasks for Desktop |
 | `/mute [on\|off]`                            | Require @ mentions in the current group |
@@ -326,13 +334,19 @@ Provider changes require an idle task. Wait for an active turn to finish, or sto
 
 `feishu.groupNameFormat` defines separate name templates for new Project and Projectless groups, with variables for the operating system, Agent, project, task name, and date. See the [technical reference](docs/technical-reference.md#configuration-model) for the complete format.
 
+If Codex ignores the requested Provider or model when resuming an existing task, Agent Bot retries on a new Codex thread forked through the latest completed Turn. The local task, title, and directory remain unchanged; later failed or interrupted Turns remain only in the original thread. The replacement is adopted only after the settings are verified.
+
 Agent processes inherit ordinary parent-process variables and their explicit `agents.<name>.env` settings. Before starting an Agent, Agent Bot removes inherited `FEISHU_*` credentials and internal `AGENT_BOT_*` state, then provides only namespaced, non-secret Profile and Lark identity context. `FEISHU_APP_SECRET` is never forwarded to an Agent process.
+
+At startup, Agent Bot also reads each Codex Agent's `CODEX_HOME/.env` (default: `~/.codex/.env`) for Provider model discovery and the Codex process. You do not need to duplicate those keys in Agent Bot's `.env`. Existing environment values and explicit Agent settings take precedence. Safely restart Agent Bot after editing the file.
 
 By default, `feishu.respondToOwnerOnly: true` accepts only messages and card actions from the bot owner identified by `feishu.userOpenId`; other users are ignored before any processing reaction is added. Set it to `false` to allow collaborators. When enabled without an owner Open ID, all Feishu user input is ignored until the owner is configured.
 
 Agent Bot responds to ordinary owner messages in groups containing the bot. Set `feishu.respondToAllGroupMessages` to `false` to additionally require the owner to @ the bot in groups; private chats are unchanged. Initialization requests the manually published all-group-message permission only when this option is enabled. After changing it from `false` to `true`, rerun `agentbot init` and complete the final permission step.
 
 Thinking cards use the grouped layout by default: auxiliary Commentary and user steering remain visible, while each execution group shows only its latest native reasoning and expands to reveal complete tool commands and results. Common PowerShell, zsh, bash, and sh launcher prefixes are omitted from the displayed commands. A failed tool remains marked inside its own tool panel but does not turn the complete execution group red or give the group a failure icon. Execution groups start collapsed and keep stable component identities so a group manually opened in Feishu stays open across card updates. When Codex compacts its context, the card shows the live compaction state as a progress activity, including elapsed time, before/after context token counts, executed Turn count, and rollout disk usage when available. On long turns, pagination measures the fully rendered card content instead of using fixed message or tool counts. Set `feishu.thinkingCardLayout` to `timeline` to temporarily restore the original layout.
+
+Quoted cards and cards inside merged forwards include their available original text and images in the Agent's context.
 
 File-change summaries display paths as plain text, preserving Windows separators and literal underscores (including `\__init__.py`) instead of interpreting them as Markdown formatting.
 

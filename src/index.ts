@@ -550,6 +550,15 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
           request.agentName,
         ),
       };
+    case "task_clone":
+    case "task_clone_group":
+      return {
+        ok: true,
+        data: await controller.controlCloneTask(
+          request.localSessionId, request.title, request.agentName,
+          request.action === "task_clone_group", config.feishu.userOpenId,
+        ),
+      };
     case "task_fork_group":
       return {
         ok: true,

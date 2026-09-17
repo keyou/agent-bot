@@ -124,6 +124,11 @@ export interface RemoteCompletedTurnSummary {
   completedAt?: number;
 }
 
+export interface ConversationTurn {
+  turnId: string;
+  messages: Array<{ role: "user" | "assistant"; text: string }>;
+}
+
 export interface RemoteTurnPage {
   turns: RemoteCompletedTurnSummary[];
   nextCursor?: string;
@@ -256,6 +261,7 @@ export interface AgentRuntime {
   readRemoteSessionMetrics?(remoteSessionId: string): Promise<RemoteSessionMetrics>;
   readRemoteForkSource?(remoteSessionId: string): Promise<RemoteSessionSummary>;
   listRemoteTurnSummaries?(remoteSessionId: string, input: { cursor?: string; limit: number }): Promise<RemoteTurnPage>;
+  readConversation?(remoteSessionId: string, throughTurnId?: string): AsyncIterable<ConversationTurn>;
   inspectRemoteSessionActivity?(remoteSessionId: string): Promise<RemoteSessionActivity>;
   synchronizeSession(sessionId: string): Promise<RuntimeSession>;
   startTurn(sessionId: string, prompt: RuntimePrompt): Promise<string>;

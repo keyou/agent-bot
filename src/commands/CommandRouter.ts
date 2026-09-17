@@ -3,6 +3,8 @@ import type { Command } from "./commandTypes.js";
 export const COMMAND_NAMES = [
   "agent",
   "archive",
+  "clone",
+  "clonegroup",
   "dir",
   "dismiss",
   "file",
@@ -34,6 +36,7 @@ type CommandName = (typeof COMMAND_NAMES)[number];
 const COMMAND_INITIALISMS: Partial<Record<CommandName, string>> = {
   dir: "di",
   forkgroup: "fg",
+  clonegroup: "cg",
   newgroup: "ng",
   nosteer: "ns",
 };
@@ -67,6 +70,9 @@ export class CommandRouter {
         return parseNewCommand(args);
       case "newgroup":
         return parseNewGroupCommand(args);
+      case "clone":
+      case "clonegroup":
+        return parseCloneCommand(command, args);
       case "forkgroup":
         return parseForkGroupCommand(args);
       case "fork":
@@ -240,6 +246,24 @@ function parseNewTaskOptions(
     cwd,
     projectless,
   };
+}
+
+function parseCloneCommand(type: "clone" | "clonegroup", args: string[]): Command {
+  const title: string[] = [];
+  let agentName: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--agent") {
+      if (agentName !== undefined) throw new Error(`/${type} 只能指定一次 --agent。`);
+      const name = args[++index];
+      if (!name?.trim() || name.startsWith("--")) throw new Error("请在 --agent 后指定 Agent 名称。");
+      agentName = name.trim();
+    } else {
+      if (argument.startsWith("--")) throw new Error(`/${type} 不支持参数：${argument}。`);
+      title.push(argument);
+    }
+  }
+  return { type, title: title.join(" ").trim() || undefined, agentName };
 }
 
 function parseForkCommand(args: string[]): Extract<Command, { type: "fork" }> {

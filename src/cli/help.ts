@@ -30,6 +30,8 @@ export function renderCliHelp(version: string, language: CliLanguage = cliLangua
   task newgroup [任务] [标题]       创建新群；支持 --agent、--dir、--nodir
   task fork [任务]                  从任务最近完成的 Turn 创建分支
   task forkgroup [任务] [标题]      从任务 Fork 新群
+  task clone [任务] [标题]          用对话文件创建新任务；支持 --agent
+  task clonegroup [任务] [标题]     用对话文件创建新群；支持 --agent
   task switch [任务] [目标任务]     切换会话任务；--previous 切回上一任务
   task queue [任务] <提示词>        将提示词排队；nosteer 是别名
   task agent [任务] [名称]          查看或设置该会话的新任务默认 Agent
@@ -123,6 +125,8 @@ Task commands:
   task newgroup [task] [title]      Create a group; supports --agent, --dir, --nodir
   task fork [task]                  Fork the task's latest completed Turn
   task forkgroup [task] [title]     Fork a task into a new group
+  task clone [task] [title]         Create a task from a conversation file; supports --agent
+  task clonegroup [task] [title]    Create a group from a conversation file; supports --agent
   task switch [task] [target]       Switch the conversation task; --previous selects the prior task
   task queue [task] <prompt>        Queue a Prompt; nosteer is an alias
   task agent [task] [name]          Show or set the conversation's default Agent for new tasks

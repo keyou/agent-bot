@@ -113,8 +113,38 @@ export function parseTaskForkGroupOptions(
   };
 }
 
+export function parseTaskCloneOptions(
+  input: string[],
+  action: "clone" | "clonegroup",
+  language: CliLanguage = cliLanguage,
+): TaskForkGroupOptions & { agentName?: string } {
+  const positionals: string[] = [];
+  let agentName: string | undefined;
+  let json = false;
+  for (let index = 0; index < input.length; index += 1) {
+    const argument = input[index]!;
+    if (argument === "--json") {
+      json = true;
+    } else if (argument === "--agent") {
+      if (agentName !== undefined) throw optionError(action, "--agent", language);
+      const name = input[++index];
+      if (!name?.trim() || name.startsWith("--")) throw new Error(cliText(
+        `task ${action} requires an Agent name after --agent.`,
+        `task ${action} 需要在 --agent 后指定 Agent 名称。`, language,
+      ));
+      agentName = name.trim();
+    } else {
+      if (argument.startsWith("--")) throw unsupportedOption(action, argument, language);
+      positionals.push(argument);
+    }
+  }
+  const [reference, ...title] = positionals;
+  requireTaskReference(action, reference, language);
+  return { reference, title: title.join(" ").trim() || undefined, agentName, json };
+}
+
 function requireTaskReference(
-  action: "new" | "newgroup" | "forkgroup",
+  action: "new" | "newgroup" | "forkgroup" | "clone" | "clonegroup",
   reference: string | undefined,
   language: CliLanguage,
 ): asserts reference is string {
@@ -127,7 +157,7 @@ function requireTaskReference(
 }
 
 function optionError(
-  action: "new" | "newgroup",
+  action: "new" | "newgroup" | "clone" | "clonegroup",
   option: "--agent" | "--dir" | "--nodir",
   language: CliLanguage,
 ): Error {
@@ -147,7 +177,7 @@ function conflictingProjectOptions(action: "new" | "newgroup", language: CliLang
 }
 
 function unsupportedOption(
-  action: "new" | "newgroup" | "forkgroup",
+  action: "new" | "newgroup" | "forkgroup" | "clone" | "clonegroup",
   option: string,
   language: CliLanguage,
 ): Error {

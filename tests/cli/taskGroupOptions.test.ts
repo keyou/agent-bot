@@ -1,11 +1,22 @@
 import { describe, expect, test } from "vitest";
 import {
+  parseTaskCloneOptions,
   parseTaskForkGroupOptions,
   parseTaskNewOptions,
   parseTaskNewGroupOptions,
 } from "../../src/cli/taskGroupOptions.js";
 
 describe("task group CLI options", () => {
+  test.each(["clone", "clonegroup"] as const)("parses %s with an Agent and rejects invalid options", (action) => {
+    expect(parseTaskCloneOptions(["source", "New", "task", "--agent", "traex", "--json"], action)).toEqual({
+      reference: "source", title: "New task", agentName: "traex", json: true,
+    });
+    expect(() => parseTaskCloneOptions(["source", "--agent"], action)).toThrow("after --agent");
+    expect(() => parseTaskCloneOptions(["source", "--agent", "a", "--agent", "b"], action)).toThrow("only once");
+    expect(() => parseTaskCloneOptions(["source", "--dir", "x"], action)).toThrow("does not support");
+    expect(() => parseTaskCloneOptions(["--json"], action)).toThrow("requires a source task");
+  });
+
   test("parses a source task, title, directory, and JSON output for newgroup", () => {
     expect(parseTaskNewGroupOptions([
       "--json",

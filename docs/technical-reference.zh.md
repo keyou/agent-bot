@@ -54,6 +54,10 @@ CLI 通过 Node.js 国际化能力读取系统 Locale。以 `zh` 开头的 Local
 
 默认 `.env` 始终从 Agent Bot 用户目录加载。加载 `.env` 后，YAML 中的 `${NAME}` 会使用进程环境变量展开。
 
+Worker 启动并创建运行时时，还会为识别为 Codex 的 App Server Agent 读取各自 Codex 目录中的 `.env`。目录依次取 `agents.<name>.env.CODEX_HOME`、Worker 环境中的 `CODEX_HOME`、`~/.codex`。支持展开 `~`，相对路径按 Profile 目录解析，与子进程工作目录一致。解析后的目录会传给 Codex 进程，文件内的 `CODEX_HOME` 赋值不能改变该目录。
+
+Codex `.env` 优先级最低：Agent 显式 `env` 优先于 Worker 环境（含 Profile `.env`），Worker 环境优先于 Codex `.env`；显式空值也不会被覆盖。主 Profile 与显式 Profile 原有的环境变量优先级不变。Agent Bot 查询 Provider `/models` 的鉴权和 Codex 子进程共用这些值，但不会修改 `process.env`、影响 YAML 变量展开或把 Codex 凭据加载到其他 Agent。启动子进程前仍会过滤 Agent Bot 和飞书保留变量。文件不存在时忽略，无法读取时只记录路径和错误码。每次 Worker 启动读取一次，修改后需安全重启。
+
 相对形式的 `storage.sqlitePath` 和 `logging.path` 按配置文件所在目录解析；`defaults.cwd` 按进程启动目录解析。
 
 ## 初始化

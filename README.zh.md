@@ -206,6 +206,8 @@ agentbot task new [任务] [标题] [--agent <标准名>] [--dir <路径> | --no
 agentbot task newgroup [任务] [标题] [--agent <标准名>] [--dir <路径> | --nodir]
 agentbot task fork [任务]
 agentbot task forkgroup [任务] [标题]
+agentbot task clone [任务] [标题] [--agent <标准名>]
+agentbot task clonegroup [任务] [标题] [--agent <标准名>]
 agentbot task queue [任务] "<prompt>"
 agentbot task model [任务] [模型]
 agentbot task goal [任务] [操作或目标]
@@ -223,6 +225,10 @@ agentbot task dismiss [任务] --yes
 
 `task newgroup` 会创建飞书群和新任务。默认继承源任务的 Agent 和运行设置；`--agent <标准名>` 可选择另一个已配置的 Agent，此时仍继承源任务的项目形态，但 Provider、模型、思考强度和权限模式使用目标 Agent 已保存的默认值。`--dir` 可覆盖项目目录并支持 `~`，`--nodir` 会强制创建 Projectless App Server 任务。Project 与 Projectless 群名可在 `feishu.groupNameFormat` 中分别自定义。`task forkgroup` 从源任务最新可用的已完成 turn 创建分支，不会中断正在执行的 turn。两个命令都要求 Server 正在运行，邀请 Profile 中保存的授权用户，不会切换源会话的当前任务，并支持 `--json`。
 
+`task clone` 和 `task clonegroup`（飞书命令为 `/clone` 和 `/clonegroup`，后者可缩写为 `/cg`）支持跨 Agent 的轻量上下文迁移：按时间顺序将截至最近已完成 Turn 的用户 Prompt 和最终回答导出为本地文本文件，再自动让新 Agent 阅读、简短确认并等待后续指令。不调用模型生成摘要，不复制思考过程、工具调用及输出、图片数据或原生会话文件；大文本文件可分段读取。App Server 通过摘要分页读取历史，ACP 来源只导出 Agent Bot 已保存的对话。
+
+目标 Agent 默认取当前会话设置的默认 Agent，不一定与源任务相同；可用 `--agent` 显式指定。Provider、模型和思考强度使用目标 Agent 已保存的默认值，权限和项目目录继承源任务；Projectless App Server 任务会使用新的工作目录。`clone` 在新任务创建并启动上下文读取后切换当前任务，`clonegroup` 新建私有群且不切换源会话。两者都不中断源任务，也不导出未完成轮次；话题尚无已完成任务历史时，以对应的原始 Turn 为截止点。CLI 均支持 `--json`，建群需要 Profile 中的授权用户。文件保存在配置的 SQLite 旁的 `context-transfers` 目录，通常为 `~/.agent-bot/data/context-transfers`；克隆任务仍需使用时请保留文件。这是文本上下文迁移，不是原生会话状态或工作文件的复制。
+
 ## 飞书命令
 
 发送 `/` 开头的消息即可执行命令。使用飞书中的 `/help` 查看最新命令列表。
@@ -237,6 +243,7 @@ agentbot task dismiss [任务] --yes
 | `/dismiss`                                    | 确认后归档当前任务并解散群聊 |
 | `/switch [任务]`                              | 切换任务，或返回上一个任务   |
 | `/fork [任务]`                                | 创建任务分支                 |
+| `/clone [标题] [--agent <名称>]`               | 将对话上下文迁移到新任务     |
 | `/turn [Turn ID 或序号]`                       | 浏览历史轮次或查看指定轮次的运行信息 |
 | `/status [任务]`                              | 查看任务状态、轮次和磁盘占用 |
 | `/title <标题>`                               | 修改当前任务标题             |
@@ -251,6 +258,7 @@ agentbot task dismiss [任务] --yes
 | `/agent [名称]`                               | 选择新任务使用的 Agent       |
 | `/newgroup [标题] [--dir <路径> \| --nodir]`  | 在新私有群中开始任务         |
 | `/forkgroup [标题]`                           | 将任务分支到新私有群         |
+| `/clonegroup [标题] [--agent <名称>]`          | 将对话上下文迁移到新私有群   |
 | `/restart [--force]`                          | 安全重启；`--force` 会中断任务 |
 | `/release`                                    | 释放 Agent Bot 占用的 App Server 任务 |
 | `/mute [on\|off]`                            | 设置当前群仅响应 @ 消息      |
@@ -318,13 +326,19 @@ Provider、模型、思考强度和权限设置会作用于当前任务，同时
 
 `feishu.groupNameFormat` 可分别设置 Project 与 Projectless 新群的名称模板，支持系统、Agent、项目、任务名和日期变量。完整格式说明见[技术参考](docs/technical-reference.zh.md#配置模型)。
 
+如果 Codex 在恢复已有任务时忽略指定的 Provider 或模型，Agent Bot 会从最新已完成轮次创建新的 Codex 分支重试。本地任务、标题和目录保持不变，之后失败或中断的轮次仅保留在原线程中。新线程的设置通过校验后才会被采用。
+
 Agent 进程会继承普通父进程变量及其显式配置的 `agents.<name>.env`。启动 Agent 前，Agent Bot 会移除继承的 `FEISHU_*` 凭据和内部 `AGENT_BOT_*` 状态，再仅提供带命名空间的非敏感 Profile 与 Lark 身份上下文；`FEISHU_APP_SECRET` 永远不会传入 Agent 进程。
+
+Agent Bot 启动时还会读取每个 Codex Agent 的 `CODEX_HOME/.env`（默认 `~/.codex/.env`），供 Provider 模型发现和 Codex 进程使用，无需把这些密钥重复写入 Agent Bot 的 `.env`。已有环境变量和 Agent 显式配置优先。修改该文件后需安全重启 Agent Bot。
 
 默认配置 `feishu.respondToOwnerOnly: true` 只接受 `feishu.userOpenId` 所标识的机器人拥有者发送的消息和卡片操作；其他用户会在添加处理 reaction 之前被忽略。设为 `false` 可允许其他协作者使用。开启后若未配置拥有者 Open ID，Agent Bot 会忽略所有飞书用户输入，直到完成拥有者配置。
 
 Agent Bot 会响应机器人所在群内拥有者发送的普通消息。将 `feishu.respondToAllGroupMessages` 设为 `false` 后，还会要求拥有者在群消息中 @ 当前机器人；私聊不受这一项影响。只有开启该配置时，初始化才会申请需要手动发布的“接收所有群消息”权限。从 `false` 改为 `true` 后，需要重新运行 `agentbot init` 并完成最后的权限步骤。
 
 思考卡片默认使用分组布局：辅助 Commentary 和用户追加消息保持直接显示，每个执行组只显示最新一段原生思考，点击后可展开完整的工具命令和结果。显示命令时会省略常见的 PowerShell、zsh、bash 和 sh 启动包装前缀。失败工具仍会在自己的工具面板中标记，但不会让整个执行组显示失败图标或红色边框。执行组默认折叠，并使用稳定的组件标识，使用户在飞书中手动打开的面板在卡片更新后继续保持展开。Codex 压缩上下文时，卡片内部会把实时压缩状态显示为一条进度活动；协议提供数据时，还会显示耗时、压缩前后的上下文 token 数、已执行轮次和 rollout 磁盘占用。长任务会根据完整渲染后的卡片内容大小翻页，不再使用固定的消息数或工具数。将 `feishu.thinkingCardLayout` 设为 `timeline` 可临时恢复原版布局。
+
+引用卡片或合并转发中的卡片时，Agent 会收到可读取的原始文字和图片。
 
 文件变更摘要中的路径保持普通文本样式，完整保留 Windows 路径分隔符和下划线（包括 `\__init__.py`），不会将其解析为 Markdown 格式。
 

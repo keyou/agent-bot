@@ -8,6 +8,7 @@ import {
   controlEndpoint,
   type ControlResponse,
   type TaskAgentControlData,
+  type TaskCloneControlData,
   type TaskDirectoryControlData,
   type TaskDismissControlData,
   type TaskForkControlData,
@@ -108,6 +109,7 @@ import {
 import { isThreadContextKey } from "./feishu/contextKey.js";
 import { refreshedSystemEnvironment } from "./supervision/systemEnvironment.js";
 import {
+  parseTaskCloneOptions,
   parseTaskForkGroupOptions,
   parseTaskNewOptions,
   parseTaskNewGroupOptions,
@@ -1591,6 +1593,25 @@ async function taskCommand(input: string[]): Promise<void> {
       const target = resolveTaskCommandTarget(allSessions, rest, action);
       const translated = target.args.flatMap((value) => value === "--force" ? ["--immediate"] : [value]);
       await serverCommand(["restart", "--task", target.session.localSessionId, ...translated]);
+      return;
+    }
+    if (action === "clone" || action === "clonegroup") {
+      const target = resolveTaskCommandTarget(allSessions, rest, action);
+      const options = parseTaskCloneOptions([target.session.localSessionId, ...target.args], action);
+      if (action === "clonegroup") requireCliGroupUser(config.feishu.userOpenId);
+      const response = await sendControlRequest(controlEndpoint(config.storage.sqlitePath), {
+        action: action === "clonegroup" ? "task_clone_group" : "task_clone",
+        localSessionId: target.session.localSessionId,
+        ...(options.title ? { title: options.title } : {}),
+        ...(options.agentName ? { agentName: options.agentName } : {}),
+      }, 120_000);
+      if (!response.ok) throw new Error(response.message ?? cliText("Failed to clone the task.", "克隆任务失败。"));
+      const result = response.data as TaskCloneControlData;
+      if (options.json) printJson(result);
+      else process.stdout.write(cliText(
+        `Cloned task: ${result.task.title ?? result.task.localSessionId}\nAgent: ${result.task.agentName}\nContext: ${result.contextFile} (${result.turnCount} turns)\n${result.group ? `Group: ${result.group.name}\n` : ""}`,
+        `克隆任务：${result.task.title ?? result.task.localSessionId}\nAgent：${result.task.agentName}\n上下文：${result.contextFile}（${result.turnCount} 轮）\n${result.group ? `群：${result.group.name}\n` : ""}`,
+      ));
       return;
     }
     if (action === "newgroup") {

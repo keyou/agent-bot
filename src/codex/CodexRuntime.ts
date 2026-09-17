@@ -5,6 +5,7 @@ import type {
   AgentProcessInfo,
   ApprovalDecision,
   CreateRuntimeSessionInput,
+  ConversationTurn,
   ForkRuntimeSessionInput,
   ModelOption,
   ModelProviderOption,
@@ -383,6 +384,46 @@ export class CodexRuntime implements AgentRuntime {
     };
   }
 
+  async *readConversation(remoteSessionId: string, throughTurnId?: string): AsyncIterable<ConversationTurn> {
+    const client = await this.client();
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    const boundary = throughTurnId
+      ?? (await this.listRecentThreadTurnsThroughCompleted(client, remoteSessionId))
+        .find((turn) => turn.status === "completed")?.id;
+    if (!boundary) return;
+    do {
+      const page = await this.readTurnPage(client, remoteSessionId, {
+        cursor, limit: 50, itemsView: "summary", sortDirection: "asc",
+      }, CONTROL_REQUEST_TIMEOUT_MS);
+      for (const turn of page.data) {
+        if (turn.status === "inProgress" || (turn.id === boundary && turn.status !== "completed")) {
+          throw new Error("上下文历史发生变化，请重试。");
+        }
+        if (turn.status !== "completed") continue;
+        const messages: ConversationTurn["messages"] = [];
+        for (const item of turn.items ?? []) {
+          if (item.type === "userMessage") {
+            const text = (item.content ?? []).filter((block) => block.type === "text")
+              .map((block) => block.text ?? "").join("\n");
+            if (text.trim()) messages.push({ role: "user", text });
+          } else if (item.type === "agentMessage" && item.phase !== "commentary" && item.text?.trim()) {
+            messages.push({ role: "assistant", text: item.text });
+          }
+        }
+        yield { turnId: turn.id, messages };
+        if (turn.id === boundary) return;
+      }
+      const nextCursor = page.nextCursor ?? undefined;
+      if (nextCursor && (nextCursor === cursor || seenCursors.has(nextCursor))) {
+        throw new Error("App Server repeated a conversation history cursor.");
+      }
+      if (nextCursor) seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+    throw new Error("找不到上下文截止轮次，未创建克隆任务。");
+  }
+
   async readRemoteForkSource(remoteSessionId: string): Promise<RemoteSessionSummary> {
     const client = await this.client();
     const metadata = await client.request<ThreadReadResponse>(
@@ -454,14 +495,14 @@ export class CodexRuntime implements AgentRuntime {
   private async readTurnPage(
     client: AppServerClient,
     remoteSessionId: string,
-    input: { cursor?: string; limit: number; itemsView: "summary" | "full" },
+    input: { cursor?: string; limit: number; itemsView: "summary" | "full"; sortDirection?: "asc" | "desc" },
     timeoutMs = SYNC_REQUEST_TIMEOUT_MS,
   ): Promise<ThreadTurnsListResponse> {
     try {
       return await client.request<ThreadTurnsListResponse>("thread/turns/list", {
         threadId: remoteSessionId,
         ...(input.cursor ? { cursor: input.cursor } : {}),
-        limit: input.limit, sortDirection: "desc", itemsView: input.itemsView,
+        limit: input.limit, sortDirection: input.sortDirection ?? "desc", itemsView: input.itemsView,
       }, timeoutMs);
     } catch (error) {
       if (error instanceof AppServerRequestError && error.method === "thread/turns/list"
@@ -674,17 +715,38 @@ export class CodexRuntime implements AgentRuntime {
         await this.detachThreadForSettings(client, session);
         detached = true;
       }
-      const response = empty
-        ? await client.request<ThreadResponse>("thread/start", {
-            ...params, threadSource: "user", allowProviderModelFallback: false,
-          }, SESSION_REQUEST_TIMEOUT_MS)
-        : await client.request<ThreadResponse>("thread/resume", {
-            ...params, threadId: session.remoteSessionId, excludeTurns: true,
-          }, SESSION_REQUEST_TIMEOUT_MS);
-      if (empty) replacementId = response.thread.id;
+      let response: ThreadResponse;
+      if (empty) {
+        response = await client.request<ThreadResponse>("thread/start", {
+          ...params, threadSource: "user", allowProviderModelFallback: false,
+        }, SESSION_REQUEST_TIMEOUT_MS);
+        replacementId = response.thread.id;
+      } else {
+        response = await client.request<ThreadResponse>("thread/resume", {
+          ...params, threadId: session.remoteSessionId, excludeTurns: true,
+        }, SESSION_REQUEST_TIMEOUT_MS);
+        if (!providerSettingsMatch(response, settings)) {
+          this.logger.warn(
+            {
+              sessionId,
+              threadId: session.remoteSessionId,
+              requestedProvider: settings.modelProvider,
+              actualProvider: response.modelProvider,
+              requestedModel: settings.model,
+              actualModel: response.model,
+            },
+            "App Server did not apply Provider settings while resuming; forking the latest completed Turn.",
+          );
+          await this.detachThreadForSettings(client, session);
+          response = await this.forkThreadForSettings(client, session, settings);
+          replacementId = response.thread.id;
+        }
+      }
       assertProviderSettingsApplied(response, settings);
-      if (!empty && response.thread.id !== session.remoteSessionId) throw new Error("App Server 返回了不同的任务 ID，未保存设置。");
-      if (empty && session.title) await client.request("thread/name/set", {
+      if (!empty && !replacementId && response.thread.id !== session.remoteSessionId) {
+        throw new Error("App Server 返回了不同的任务 ID，未保存设置。");
+      }
+      if (session.title && (empty || replacementId)) await client.request("thread/name/set", {
         threadId: response.thread.id, name: session.title,
       }, SESSION_REQUEST_TIMEOUT_MS);
       const candidate = { ...session, ...settings, remoteSessionId: response.thread.id,
@@ -732,6 +794,29 @@ export class CodexRuntime implements AgentRuntime {
     if (result.status !== "unsubscribed" && result.status !== "notLoaded") {
       throw new Error("当前任务仍由其他客户端加载，无法安全切换 Provider。请先在原客户端释放任务。");
     }
+  }
+
+  private async forkThreadForSettings(
+    client: AppServerClient,
+    session: CodexSession,
+    settings: RuntimeExecutionSettings,
+  ): Promise<ThreadResponse> {
+    const turns = await this.listRecentThreadTurnsThroughCompleted(client, session.remoteSessionId);
+    const lastTurnId = turns.find((turn) => turn.status === "completed")?.id;
+    if (!lastTurnId) {
+      throw new Error("无法为 Provider 切换找到已完成的 Turn。请先完成一轮任务后重试。");
+    }
+    return client.request<ThreadResponse>("thread/fork", {
+      threadId: session.remoteSessionId,
+      lastTurnId,
+      cwd: session.cwd,
+      model: settings.model,
+      modelProvider: settings.modelProvider,
+      threadSource: "user",
+      excludeTurns: true,
+      ...threadLifecycleParams(session.cwd),
+      ...permissionParams(settings.permissionMode),
+    }, FORK_REQUEST_TIMEOUT_MS);
   }
 
   private async discardUnusedThread(client: AppServerClient, threadId: string): Promise<void> {
@@ -1686,6 +1771,13 @@ function remoteThreadStatus(value: string | undefined): RemoteSessionSummary["st
   if (value === "idle") return "idle";
   if (value === "systemError") return "error";
   return "not_loaded";
+}
+
+function providerSettingsMatch(
+  response: Pick<ThreadResponse, "modelProvider" | "model">,
+  settings: RuntimeExecutionSettings,
+): boolean {
+  return response.modelProvider === settings.modelProvider && response.model === settings.model;
 }
 
 function codexSourceLabel(source: unknown): string {

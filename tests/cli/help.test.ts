@@ -91,6 +91,8 @@ describe("CLI help", () => {
     const counterparts: Record<(typeof COMMAND_NAMES)[number], string> = {
       agent: "task agent",
       archive: "task archive",
+      clone: "task clone",
+      clonegroup: "task clonegroup",
       dir: "task dir",
       dismiss: "task dismiss",
       file: "task file",

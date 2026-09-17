@@ -96,6 +96,15 @@ agentbot task forkgroup [title]
 
 Choose `new` or `newgroup` for fresh context. Choose `fork` or `forkgroup` when the new task must retain conversation history through the latest completed Turn. Forking must not interrupt an active source turn.
 
+For lightweight context transfer, including between different Agents:
+
+```powershell
+agentbot task clone [title] [--agent <name>]
+agentbot task clonegroup [title] [--agent <name>]
+```
+
+These commands export only user Prompts and final answers through the latest completed Turn to a local text file, then start a fresh task with instructions to read it, acknowledge, and wait. They do not copy tools, reasoning, images, or native session files, and never interrupt the source task. Without `--agent`, they use the conversation's default Agent, not necessarily the source Agent. Provider, model, and reasoning use the target Agent's saved defaults; project shape and permissions come from the source. `clone` switches the current conversation after import starts; `clonegroup` leaves it unchanged and creates a separate group. Both support `--json` and explicit `--task` targeting. Feishu equivalents are `/clone` and `/clonegroup` (`/cg`). ACP sources use only dialogue already saved by Agent Bot. The context file remains beside the Profile SQLite file under `context-transfers`; keep it available for the cloned task.
+
 Feishu `/sessions [keyword]` lists and searches tasks across projects and all Providers, not just the App Server's current Provider. Switching Provider does not hide existing tasks; listing still uses paged metadata and the latest Turn summary only.
 
 Fork creation stores source-task and branch-Turn references without synchronizing the full local Turn list. The Feishu Turn card reuses local records and loads only the summary pages needed for the requested page, not the entire history. `task turns` loads the first page if necessary and returns available local records. This does not change the Agent's inherited context. Retry listing Turns after a temporary history-read failure; unsupported summary pagination never falls back to downloading full history.

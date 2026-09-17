@@ -155,4 +155,45 @@ describe("merged-forward message rendering", () => {
       ] }) },
     }]).text).toBe("[消息类型：卡片]\n卡片标题\n卡片正文");
   });
+
+  test("preserves original Card 2.0 content and child image references in merged forwards", () => {
+    const result = renderMergedForwardPrompt("om_parent", [{
+      message_id: "om_child_card",
+      upper_message_id: "om_parent",
+      msg_type: "interactive",
+      body: { content: JSON.stringify({
+        schema: "2.0",
+        header: { title: { tag: "plain_text", content: "Forwarded report" } },
+        body: { elements: [
+          { tag: "markdown", content: "The original card body." },
+          { tag: "collapsible_panel", header: { title: { tag: "plain_text", content: "Details" } }, elements: [
+            { tag: "markdown", content: "Nested diagnostic details." },
+            { tag: "img", img_key: "img_nested" },
+            { tag: "img", img_key: "img_nested" },
+          ] },
+        ] },
+      }) },
+    }]);
+    expect(result.text).toContain("Forwarded report\nThe original card body.\nDetails\nNested diagnostic details.\n[图片 1]");
+    expect(result.images).toEqual([{ messageId: "om_child_card", imageKey: "img_nested" }]);
+  });
+
+  test("preserves images from cards returned with the client-version placeholder", () => {
+    expect(renderReferencedMessage("om_card_image", [{
+      message_id: "om_card_image",
+      msg_type: "interactive",
+      body: { content: JSON.stringify({
+        title: null,
+        elements: [[
+          { tag: "img", image_key: "img_card" },
+          { tag: "text", text: "请升级至最新版本客户端，以查看内容" },
+        ]],
+      }) },
+    }])).toEqual({
+      text: "[消息类型：卡片]\n[图片 1]",
+      messageType: "interactive",
+      images: [{ messageId: "om_card_image", imageKey: "img_card" }],
+      files: [],
+    });
+  });
 });

@@ -2,6 +2,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { config as loadDotEnv } from "dotenv";
 import type { Logger } from "pino";
 import { AppServerConnection } from "./AppServerConnection.js";
 import type { AppServerClient, AppServerClientProvider } from "./CodexRuntime.js";
@@ -12,6 +13,7 @@ import {
 import type { AgentProcessInfo } from "../runtime/types.js";
 import { spawnStdioCommand } from "../utils/spawnCommand.js";
 import { assertSupportedCodexVersion } from "./CodexVersion.js";
+import { resolveUserPath } from "../config/paths.js";
 
 export class CodexProcessManager implements AppServerClientProvider {
   private static readonly RELEASE_TIMEOUT_MS = 5_000;
@@ -20,6 +22,7 @@ export class CodexProcessManager implements AppServerClientProvider {
   private version?: string;
   private agentFamily?: "codex" | "traex";
   private initializing?: Promise<AppServerClient>;
+  private readonly codexEnvironment: Record<string, string> = {};
   private readonly disconnectListeners = new Set<(error: Error) => void>();
 
   constructor(
@@ -28,7 +31,17 @@ export class CodexProcessManager implements AppServerClientProvider {
     private readonly env: Record<string, string>,
     private readonly logger: Logger,
     private readonly environmentContext: () => AgentEnvironmentContext = () => ({}),
-  ) {}
+  ) {
+    if (this.getAgentFamily() !== "codex") return;
+    const envPath = path.join(this.getCodexHome(), ".env");
+    const result = loadDotEnv({ path: envPath, processEnv: this.codexEnvironment, quiet: true });
+    if (result.error && (result.error as NodeJS.ErrnoException).code !== "ENOENT") {
+      this.logger.warn(
+        { path: envPath, code: (result.error as NodeJS.ErrnoException).code },
+        "Could not load the Codex environment file; using configured and inherited values.",
+      );
+    }
+  }
 
   async getClient(): Promise<AppServerClient> {
     if (this.initializing) return this.initializing;
@@ -45,10 +58,12 @@ export class CodexProcessManager implements AppServerClientProvider {
   private async startClient(): Promise<AppServerClient> {
     this.version = undefined;
     const environmentContext = this.environmentContext();
+    const agentEnvironment = { ...this.env };
+    if (this.getAgentFamily() === "codex") agentEnvironment.CODEX_HOME = this.getCodexHome();
     const child = spawnStdioCommand(
       this.command,
       this.args,
-      agentBotEnvironment(process.env, this.env, environmentContext),
+      agentBotEnvironment({ ...this.codexEnvironment, ...process.env }, agentEnvironment, environmentContext),
       environmentContext.profilePath ?? os.homedir(),
     );
     this.child = child;
@@ -108,11 +123,13 @@ export class CodexProcessManager implements AppServerClientProvider {
   }
 
   getCodexHome(): string {
-    return this.env.CODEX_HOME ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+    const home = this.env.CODEX_HOME?.trim() || process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
+    return resolveUserPath(home, this.environmentContext().profilePath ?? os.homedir());
   }
 
   getEnvironmentVariable(name: string): string | undefined {
-    return this.env[name] ?? process.env[name];
+    if (name === "CODEX_HOME" && this.getAgentFamily() === "codex") return this.getCodexHome();
+    return this.env[name] ?? process.env[name] ?? this.codexEnvironment[name];
   }
 
   close(): void {

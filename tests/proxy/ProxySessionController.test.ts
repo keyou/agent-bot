@@ -637,6 +637,158 @@ function fixture(
 }
 
 describe("ProxySessionController", () => {
+  test.each([undefined, "codex"])("clone selects the conversation default or explicit Agent (%s) without touching active work", async (agentName) => {
+    const { controller, runtime, sessions, store, config } = fixture();
+    await controller.onMessage(message("source work"));
+    const sourceId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const source = store.getSession(sourceId)!;
+    store.setDefaultAgent("chat_id:c1", "acp");
+    config.agents.acp!.defaults = { modelProvider: "target", model: "target-model", reasoningEffort: "low" };
+    config.agents.codex!.defaults = { modelProvider: "saved", model: "saved-model", reasoningEffort: "medium" };
+    store.updateRuntimeSession(sourceId, { permissionMode: "confirm" });
+    runtime.readConversation = vi.fn(async function* () {
+      yield { turnId: "completed", messages: [{ role: "user" as const, text: "old prompt" }, { role: "assistant" as const, text: "old answer" }] };
+    });
+    const localHistory = vi.spyOn(store, "readConversation");
+    vi.mocked(runtime.startTurn).mockImplementationOnce(async (id, prompt) => {
+      expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(sourceId);
+      expect(id).not.toBe(sourceId);
+      expect(prompt).toContain("等待我的新任务");
+      return "import_turn";
+    });
+
+    const result = await controller.controlCloneTask(sourceId, "migrated", agentName);
+
+    const targetAgent = agentName ?? "acp";
+    expect(result.task).toMatchObject({ agentName: targetAgent, permissionMode: "confirm", title: "migrated", status: "running" });
+    expect(runtime.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      agentName: targetAgent, ...config.agents[targetAgent]!.defaults, permissionMode: "confirm",
+    }));
+    expect(store.getUserContext("chat_id:c1")).toMatchObject({ currentSessionId: result.task.localSessionId, previousSessionId: sourceId, defaultAgent: "acp" });
+    expect(runtime.readConversation).toHaveBeenCalledWith(source.remoteSessionId, undefined);
+    expect(localHistory).not.toHaveBeenCalled();
+    expect(fs.readFileSync(result.contextFile, "utf8")).toContain("old answer");
+    expect(store.findIncompleteTurnAttemptForSession(result.task.localSessionId)?.promptText).toContain(JSON.stringify(result.contextFile));
+    expect(sessions.get(sourceId)!.activeTurnId).toBe("turn_1");
+    expect(runtime.cancelTurn).not.toHaveBeenCalled();
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    if (targetAgent === "codex") expect(result.task.cwd).not.toBe(source.cwd);
+  });
+
+  test("clonegroup exports local ACP dialogue and inherits project directory without switching the source", async () => {
+    const { controller, runtime, store, outbound } = fixture();
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    store.createSession({ localSessionId: "acp-source", contextKey: "chat_id:c1", agentName: "acp", cwd: process.cwd(), status: "running" });
+    store.setCurrentSession("chat_id:c1", "acp-source");
+    store.saveTurnSnapshot("completed", "acp-source", { status: "completed", prompt: "local prompt", finalResponse: "local answer", completedAt: 1 });
+    store.saveTurnSnapshot("active", "acp-source", { status: "running", prompt: "not included", startedAt: 2 });
+
+    await controller.onMessage({ ...message("/clonegroup Migration --agent codex"), userId: "ou_user" });
+
+    const clonedId = store.getUserContext("chat_id:oc_new_group")!.currentSessionId!;
+    expect(store.getSession(clonedId)).toMatchObject({ agentName: "codex", cwd: process.cwd(), title: "Migration" });
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe("acp-source");
+    expect(outbound.createGroup).toHaveBeenCalledOnce();
+    expect(runtime.startTurn).toHaveBeenCalledOnce();
+    expect(runtime.startTurn).toHaveBeenCalledWith(clonedId, expect.stringContaining("历史上下文"));
+    expect(runtime.cancelTurn).not.toHaveBeenCalled();
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+  });
+
+  test("clone follows empty native Fork ancestry without resuming intermediate tasks", async () => {
+    const { controller, runtime, store, remoteSessions } = fixture();
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    for (const id of ["source", "fork", "nested"]) {
+      store.createSession({ localSessionId: id, contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "ready" });
+      store.updateRuntimeSession(id, { remoteSessionId: id });
+      remoteSessions.push({ id, cwd: process.cwd(), source: "agent-bot", status: "idle" });
+    }
+    for (const [id, parent] of [["fork", "source"], ["nested", "fork"]]) {
+      store.audit("chat_id:c1", "session_forked", { forkedLocalSessionId: id, sourceLocalSessionId: parent, sourceRemoteSessionId: parent, sourceTurnId: "anchor" });
+    }
+    store.setCurrentSession("chat_id:c1", "nested");
+    runtime.readConversation = vi.fn(async function* () {
+      yield { turnId: "anchor", messages: [{ role: "user" as const, text: "inherited prompt" }] };
+    });
+
+    const result = await controller.controlCloneTask("nested");
+
+    expect(runtime.readConversation).toHaveBeenCalledExactlyOnceWith("source", "anchor");
+    expect(fs.readFileSync(result.contextFile, "utf8")).toContain("inherited prompt");
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+  });
+
+  test.each(["empty", "export", "create", "import"])("clone keeps the source selected on %s failure", async (failure) => {
+    const { controller, runtime, store, config, outbound } = fixture();
+    await controller.onMessage(message("source"));
+    const sourceId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    runtime.readConversation = vi.fn(async function* () {
+      if (failure === "empty") return;
+      yield { turnId: "completed", messages: [{ role: "user" as const, text: "history" }] };
+      if (failure === "export") throw new Error("history unavailable");
+    });
+    vi.mocked(runtime.createSession).mockClear();
+    if (failure === "create") vi.mocked(runtime.createSession).mockRejectedValueOnce(new Error("create unavailable"));
+    if (failure === "import") vi.mocked(runtime.startTurn).mockRejectedValueOnce(new Error("import unavailable"));
+
+    await expect(controller.controlCloneTask(sourceId)).rejects.toThrow();
+
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(sourceId);
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(runtime.cancelTurn).not.toHaveBeenCalled();
+    const files = fs.readdirSync(path.join(path.dirname(config.storage.sqlitePath), "context-transfers"));
+    expect(files).toHaveLength(failure === "empty" || failure === "export" ? 0 : 1);
+    if (failure === "empty" || failure === "export") expect(runtime.createSession).not.toHaveBeenCalled();
+  });
+
+  test("clonegroup validates history and Agent before creating a group and reports a later task failure", async () => {
+    const { controller, runtime, store, outbound } = fixture();
+    await controller.onMessage(message("source"));
+    const sourceId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const history = vi.fn(async function* () {
+      yield { turnId: "completed", messages: [{ role: "user" as const, text: "history" }] };
+    });
+    runtime.readConversation = history;
+    await expect(controller.controlCloneTask(sourceId, undefined, "missing", true, "ou_user")).rejects.toThrow("未知 agent");
+    await expect(controller.controlCloneTask(sourceId, undefined, undefined, true)).rejects.toThrow("open_id");
+    expect(history).not.toHaveBeenCalled();
+    history.mockImplementationOnce(async function* () {});
+    await expect(controller.controlCloneTask(sourceId, undefined, undefined, true, "ou_user")).rejects.toThrow("没有可导出");
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    vi.mocked(runtime.createSession).mockRejectedValueOnce(new Error("creation failed"));
+    await expect(controller.controlCloneTask(sourceId, undefined, undefined, true, "ou_user")).rejects.toThrow("creation failed");
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:oc_new_group", expect.stringContaining("群已创建，但克隆任务创建失败"));
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(sourceId);
+  });
+
+  test.each(["clone", "clonegroup"])("%s in an unbound topic uses the original Turn and keeps replies in the topic", async (command) => {
+    const { controller, runtime, store, listeners, outbound, presenter } = fixture();
+    await controller.onMessage({ ...message("source"), messageId: "clone-root", chatId: "c1", chatType: "p2p" });
+    const sourceId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    for (const listener of listeners) listener({ type: "turn_completed", sessionId: sourceId, turnId: "turn_1", finalResponse: "done" });
+    await vi.waitFor(() => expect(store.findTurnAnchorByMessageId("clone-root")?.turnId).toBe("turn_1"));
+    runtime.readConversation = vi.fn(async function* () {
+      yield { turnId: "turn_1", messages: [{ role: "assistant" as const, text: "done" }] };
+    });
+    vi.mocked(runtime.startTurn).mockResolvedValueOnce("import_turn");
+    vi.mocked(outbound.sendText).mockClear();
+    const incoming = { ...threadMessage("c1", "p2p", "clone-topic", "clone-root", `/${command}`), userId: "ou_user" };
+
+    await controller.onMessage(incoming);
+
+    expect(runtime.readConversation).toHaveBeenCalledWith("thr_1", "turn_1");
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(sourceId);
+    expect(outbound.sendText).not.toHaveBeenCalled();
+    expect(outbound.replyText).toHaveBeenCalled();
+    const topicTask = store.getUserContext(incoming.contextKey)?.currentSessionId;
+    if (command === "clonegroup") expect(topicTask).toBeUndefined();
+    else expect(presenter.startPendingTurn).toHaveBeenLastCalledWith(topicTask, incoming.contextKey,
+      expect.any(String), expect.objectContaining({ replyInThread: true }), "读取历史上下文（1 轮对话）");
+  });
+
   test("recovers an interrupted turn in its original topic with a fresh thinking card", async () => {
     const { controller, runtime, remoteSessions, outbound, presenter, store } = fixture();
     const contextKey = "chat_id:c1:thread_id:t1";
@@ -10000,6 +10152,8 @@ describe("ProxySessionController", () => {
       "/dir",
       "/forkgroup",
       "/fork",
+      "/clone",
+      "/clonegroup",
       "/turns",
       "/sessions",
       "/archive",

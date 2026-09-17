@@ -54,6 +54,10 @@ Configuration path precedence:
 
 The default `.env` is always loaded from the Agent Bot home. YAML values in the form `${NAME}` are expanded from the process environment after `.env` loading.
 
+When the Worker constructs its runtimes at startup, each recognized Codex App Server Agent also reads `.env` from its own Codex home. The home is selected from `agents.<name>.env.CODEX_HOME`, then the Worker environment's `CODEX_HOME`, then `~/.codex`. Home-relative paths are expanded and relative paths resolve against the Profile directory, matching the child working directory. The resolved home is passed to the Codex process; a `CODEX_HOME` assignment inside that `.env` cannot redirect it.
+
+Codex environment values have the lowest priority: explicit Agent `env` values win over the Worker environment (including the Profile `.env`), which wins over Codex `.env`. Empty explicit values remain explicit. The existing main/explicit-Profile environment precedence is unchanged. The same resolved values are available to Agent Bot's Provider `/models` authentication and the Codex child. This does not mutate `process.env`, affect YAML expansion, or load Codex credentials into other Agents. Reserved Agent Bot and Feishu variables are still filtered before spawning the child. Missing files are ignored; unreadable files produce a warning containing only the path and error code. Values are loaded once per Worker startup; safely restart after changes.
+
 Relative `storage.sqlitePath` and `logging.path` values resolve against the directory containing the loaded configuration file. `defaults.cwd` resolves against the process startup directory.
 
 ## Initialization

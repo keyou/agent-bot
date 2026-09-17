@@ -18,6 +18,45 @@ afterEach(() => {
 });
 
 describe("StateStore runtime metadata", () => {
+  test("exports only dialogue from the selected completed branch and inherited ancestry", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    store.getOrCreateUserContext("chat_id:test", "acp");
+    store.createSession({ localSessionId: "branch", contextKey: "chat_id:test", agentName: "acp", cwd: directory, status: "ready" });
+    const answer = "full answer".repeat(2_000);
+    store.saveTurnSnapshot("root", "source", { status: "completed", prompt: "first", finalResponse: answer, startedAt: 1,
+      activities: [{ kind: "reasoning", text: "excluded thinking" }, { kind: "user", text: "followup" }, { kind: "assistant", text: "excluded commentary" }],
+      fullToolOutputs: { command: "excluded output".repeat(10_000) },
+    });
+    store.audit("chat_id:test", "session_forked", { forkedLocalSessionId: "branch", sourceTurnId: "root" });
+    store.saveTurnSnapshot("discarded", "branch", { status: "completed", prompt: "discarded", startedAt: 2 });
+    store.saveTurnParent("discarded", "branch", "root");
+    store.saveTurnSnapshot("selected", "branch", { status: "completed", prompt: "second", finalResponse: "done", startedAt: 3 });
+    store.saveTurnParent("selected", "branch", "root");
+    store.saveTurnSnapshot("active", "branch", { status: "running", prompt: "active prompt", startedAt: 4 });
+    store.updateRuntimeSession("branch", { lastTurnId: "selected", lastTurnStatus: "completed" });
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect([...store.readConversation("branch")]).toEqual([
+        { turnId: "root", messages: [{ role: "user", text: "first" }, { role: "user", text: "followup" }, { role: "assistant", text: answer }] },
+        { turnId: "selected", messages: [{ role: "user", text: "second" }, { role: "assistant", text: "done" }] },
+      ]);
+      expect([...store.readConversation("branch", "root")]).toHaveLength(1);
+      store.updateRuntimeSession("branch", { lastTurnId: "root", lastTurnStatus: "completed" });
+      expect([...store.readConversation("branch")].map((turn) => turn.turnId)).toEqual(["root"]);
+      store.saveTurnParent("active", "branch", "root");
+      store.updateRuntimeSession("branch", { lastTurnId: "active", lastTurnStatus: "running" });
+      expect([...store.readConversation("branch")].map((turn) => turn.turnId)).toEqual(["root"]);
+      expect(() => [...store.readConversation("branch", "active")]).toThrow("不完整");
+      expect([...store.readConversation("empty")]).toEqual([]);
+      expect(parse.mock.calls.some(([text]) => text.includes("excluded output"))).toBe(false);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
   test("reads graph indexes and prompt summaries without parsing complete snapshots", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);

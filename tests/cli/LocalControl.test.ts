@@ -154,6 +154,15 @@ describe("local CLI control", () => {
     });
   });
 
+  test.each(["task_clone", "task_clone_group"] as const)("round-trips %s with the target Agent", async (action) => {
+    const endpoint = controlEndpoint(path.join(os.tmpdir(), `agent-bot-control-${action}-${process.pid}-${Date.now()}.sqlite`));
+    const server = new LocalControlServer(endpoint, async (request) => ({ ok: true, data: request }));
+    servers.push(server);
+    await server.start();
+    const request = { action, localSessionId: "source", title: "Migration", agentName: "traex" };
+    await expect(sendControlRequest(endpoint, request)).resolves.toEqual({ ok: true, data: request });
+  });
+
   test("round-trips a live task status request", async () => {
     const endpoint = controlEndpoint(path.join(os.tmpdir(), `agent-bot-control-status-${process.pid}-${Date.now()}.sqlite`));
     const server = new LocalControlServer(endpoint, async (request) => ({ ok: true, data: request }));
