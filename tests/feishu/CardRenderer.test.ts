@@ -356,6 +356,28 @@ describe("CardRenderer", () => {
     expect(content).not.toMatch(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/);
   });
 
+  test("shows discovery warnings even after a successful settings change", () => {
+    const renderer = new CardRenderer();
+    const common = {
+      sessionId: "s1", contextKey: "chat_id:c1", notice: "Provider 已切换", warning: "无法连接 Provider，服务可用性未确认。",
+    };
+    const cards = [
+      renderer.renderExecutionSettings({
+        ...common, activeTab: "model", currentAgent: "codex", agents: [], runtimeSettingsAvailable: true,
+        currentPermissionMode: "auto", providers: [], providerSupported: true,
+        models: [{ id: "current", supportedReasoningEfforts: [] }], reasoningOptions: [],
+      }),
+      renderer.renderModelSelector({ ...common, models: [{ id: "current", supportedReasoningEfforts: [] }] }),
+      renderer.renderReasoningSelector({ ...common, model: "current", options: [] }),
+    ];
+    for (const card of cards) {
+      expect(card).toMatchObject({ header: { template: "orange" } });
+      expect(JSON.stringify(card)).toContain(common.warning);
+      expect(JSON.stringify(card)).toContain(common.notice);
+      expect(JSON.stringify(card)).toContain("current");
+    }
+  });
+
   test("keeps auto-sized execution-setting tabs on one dot-separated row", () => {
     const card = new CardRenderer().renderExecutionSettings({
       sessionId: "session_1",
@@ -739,7 +761,7 @@ describe("CardRenderer", () => {
       reason: "更新卡片分页",
       phase: "waiting_tasks",
       pendingFinalDeliveries: 1,
-      waitingTasks: [{ id: "thread_1", title: "Long build" }],
+      waitingTasks: [{ id: "thread_1", localSessionId: "session_1", isRunning: true, title: "Long build" }],
     });
     const countdown = renderer.renderSafeRestartStatus({
       scheduleId: 7,
@@ -756,6 +778,10 @@ describe("CardRenderer", () => {
     expect(JSON.stringify(waiting)).toContain("等待阻塞项清空后开始");
     expect(JSON.stringify(waiting)).toContain("<font color='blue'>Cancel</font>");
     expect(JSON.stringify(waiting)).toContain('"action":"safe_restart_cancel","scheduleId":"7"');
+    expect(JSON.stringify(waiting)).toContain("<font color='blue'>ForceRestart</font>");
+    expect(JSON.stringify(waiting)).toContain('"action":"safe_restart_force","scheduleId":"7"');
+    expect(JSON.stringify(waiting)).toContain("<font color='red'>Stop</font>");
+    expect(JSON.stringify(waiting)).toContain('"action":"session_stop","sessionId":"session_1","cardView":"safe_restart"');
     expect(JSON.stringify(countdown)).toContain("13s");
     expect(countdown).toMatchObject({ header: { template: "orange" } });
 
@@ -790,6 +816,38 @@ describe("CardRenderer", () => {
       waitingTasks: [],
     });
     expect(JSON.stringify(restarting)).not.toContain(">Cancel</font>");
+  });
+
+  test.each([
+    "waiting_tasks", "waiting_delivery", "countdown", "restarting", "cancelled", "superseded",
+  ] as const)("renders safe restart actions only while the %s plan is pending", (phase) => {
+    const card = new CardRenderer().renderSafeRestartStatus({
+      scheduleId: 8, reason: "restart", phase, pendingFinalDeliveries: 0,
+      waitingTasks: [
+        { id: "remote_1", localSessionId: "local_1", isRunning: true, title: "First task" },
+        { id: "remote_2", localSessionId: "local_2", isRunning: true, title: "Second task" },
+        { id: "remote_3", localSessionId: "local_3", isRunning: false, title: "Queued task" },
+      ],
+    });
+    const actions = collectObjects(card).filter((item) => item.tag === "interactive_container");
+    if (["restarting", "cancelled", "superseded"].includes(phase)) {
+      expect(actions).toEqual([]);
+      return;
+    }
+    expect(actions).toHaveLength(4);
+    for (const action of actions) expect(action).toMatchObject({ margin: "0px", padding: "0px", has_border: false });
+    const values = collectObjects(card).filter((item) => item.type === "callback").map((item) => item.value);
+    expect(values).toEqual([
+      { action: "session_stop", sessionId: "local_1", cardView: "safe_restart" },
+      { action: "session_stop", sessionId: "local_2", cardView: "safe_restart" },
+      { action: "safe_restart_cancel", scheduleId: "8" },
+      { action: "safe_restart_force", scheduleId: "8" },
+    ]);
+    const rows = collectObjects(card).filter((item) => item.tag === "column_set");
+    expect(JSON.stringify(rows[0])).toContain("First task");
+    expect(JSON.stringify(rows[0])).toContain('"sessionId":"local_1"');
+    expect(JSON.stringify(rows[1])).toContain("Second task");
+    expect(JSON.stringify(rows[1])).toContain('"sessionId":"local_2"');
   });
 
   test("keeps the original timeline layout available with unchanged chronological rendering", () => {
@@ -2035,7 +2093,41 @@ describe("CardRenderer", () => {
     });
   });
 
-  test("renders approval controls with Card 2.0 callback behaviors", () => {
+  test.each(["grouped", "timeline"] as const)("renders mode confirmation labels and callbacks in %s cards", (thinkingCardLayout) => {
+    const waiting = state();
+    waiting.status = "waiting_for_approval";
+    waiting.activities.push({ kind: "assistant", id: "commentary:plan:p1", text: "## Implementation plan\nRun tests before building." });
+    waiting.approval = {
+      id: "mode:thr_1:r1", kind: "mode_change", title: "确认方案并开始执行", reason: "Review the plan\n- PowerShell: run tests",
+      options: [
+        { id: "accept", label: "Approve Plan" }, { id: "decline", label: "Reject" }, { id: "cancel", label: "Cancel Request" },
+      ],
+    };
+    const renderer = new CardRenderer({ thinkingCardLayout });
+    expect(renderer.renderTurn(waiting)).toMatchObject({
+      header: { title: { content: expect.stringContaining("等待确认") } },
+    });
+    for (const card of [renderer.renderTurn(waiting), renderer.renderTurnDetails(waiting)]) {
+      const objects = collectObjects(card);
+      for (const columns of objects.filter((item) => item.tag === "column_set")) {
+        expect(columns).not.toHaveProperty("vertical_spacing");
+      }
+      for (const option of waiting.approval.options) {
+        expect(objects).toContainEqual(expect.objectContaining({
+          tag: "button", text: { tag: "plain_text", content: option.label },
+          behaviors: [{ type: "callback", value: {
+            action: "approval", sessionId: "s1", turnId: "turn_1", requestId: "mode:thr_1:r1", decision: option.id,
+          } }],
+        }));
+      }
+      expect(JSON.stringify(card)).toContain("Run tests before building.");
+      expect(JSON.stringify(card)).toContain("确认方案并开始执行");
+      expect(JSON.stringify(card)).not.toContain("Cancel Task");
+      expect(JSON.stringify(card)).not.toContain("Allow Once");
+    }
+  });
+
+  test.each(["grouped", "timeline"] as const)("renders approval controls with Card 2.0 callback behaviors in %s cards", (thinkingCardLayout) => {
     const waiting = state();
     waiting.status = "waiting_for_approval";
     waiting.approval = {
@@ -2048,7 +2140,7 @@ describe("CardRenderer", () => {
       ],
     };
 
-    const card = new CardRenderer().renderTurn(waiting);
+    const card = new CardRenderer({ thinkingCardLayout }).renderTurn(waiting);
     const objects = collectObjects(card);
 
     expect(card).toMatchObject({
@@ -2061,8 +2153,10 @@ describe("CardRenderer", () => {
       tag: "column_set",
       flex_mode: "flow",
       horizontal_spacing: "8px",
-      vertical_spacing: "8px",
     }));
+    for (const columns of objects.filter((item) => item.tag === "column_set")) {
+      expect(columns).not.toHaveProperty("vertical_spacing");
+    }
     expect(objects).toContainEqual(expect.objectContaining({
       tag: "button",
       text: { tag: "plain_text", content: "Allow Once" },

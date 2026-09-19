@@ -168,6 +168,28 @@ describe("CommandRouter", () => {
     expect(() => router.parse("/new --dir D:\\work --dir D:\\other")).toThrow("只能指定一次");
   });
 
+  test.each(["new", "newgroup"])("parses /%s with an explicit Agent and directory options", (command) => {
+    expect(router.parse(`/${command} --agent traex`)).toMatchObject({ type: command, agentName: "traex", title: undefined });
+    expect(router.parse(`/${command} "Review fixes" --agent traex --dir "D:\\work space\\repo"`)).toMatchObject({
+      type: command, title: "Review fixes", agentName: "traex", cwd: "D:\\work space\\repo",
+    });
+    expect(router.parse(`/${command} --dir ~/repo --agent codex Review fixes`)).toMatchObject({
+      type: command, title: "Review fixes", agentName: "codex", cwd: "~/repo",
+    });
+    expect(router.parse(`/${command} --agent codex --nodir Projectless`)).toMatchObject({
+      type: command, title: "Projectless", agentName: "codex", projectless: true,
+    });
+    expect(router.parse(`/${command} --nodir --agent codex`)).toMatchObject({
+      type: command, agentName: "codex", projectless: true,
+    });
+    for (const suffix of ["--agent", '--agent " "', "--agent --dir repo", "--agent --nodir"]) {
+      expect(() => router.parse(`/${command} ${suffix}`)).toThrow("指定 Agent 名称");
+    }
+    expect(() => router.parse(`/${command} --agent codex --agent traex`)).toThrow("只能指定一次 --agent");
+    expect(() => router.parse(`/${command} --dir --agent codex`)).toThrow("--dir 后指定");
+    expect(() => router.parse(`/${command} --agent codex --nodir --dir repo`)).toThrow("不能同时使用");
+  });
+
   test("parses --nodir for a forced projectless task and rejects directory conflicts", () => {
     expect(router.parse("/new --nodir")).toEqual({
       type: "new",

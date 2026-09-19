@@ -64,6 +64,8 @@ export interface SafeRestartStatusView {
   pendingFinalDeliveries: number;
   waitingTasks: Array<{
     id: string;
+    localSessionId: string;
+    isRunning: boolean;
     title?: string;
   }>;
 }
@@ -88,6 +90,7 @@ export interface ModelSelectorCardView {
   permissionMode?: PermissionMode;
   unifiedSettings?: boolean;
   notice?: string;
+  warning?: string;
 }
 
 export interface ReasoningSelectorCardView {
@@ -100,6 +103,7 @@ export interface ReasoningSelectorCardView {
   permissionMode?: PermissionMode;
   unifiedSettings?: boolean;
   notice?: string;
+  warning?: string;
 }
 
 export interface ProviderSelectorCardView {
@@ -154,6 +158,7 @@ export interface ExecutionSettingsCardView {
   models: ModelOption[];
   reasoningOptions: ReasoningEffortOption[];
   notice?: string;
+  warning?: string;
 }
 
 export interface CardSection {
@@ -545,6 +550,7 @@ export class CardRenderer {
             ]
           : []),
         ...(view.notice ? [view.notice] : []),
+        ...(view.warning ? [`**提示**：${escapeCardHtml(view.warning)}`] : []),
       ].join("\n")),
       ...(tabRow ? [tabRow] : []),
       { tag: "hr" },
@@ -639,7 +645,7 @@ export class CardRenderer {
     }
 
     elements.push(markdown(`> ${EXECUTION_SETTING_EFFECTS[view.activeTab]}`));
-    return sectionCard("运行设置", elements, view.notice ? "green" : "blue");
+    return sectionCard("运行设置", elements, view.warning ? "orange" : view.notice ? "green" : "blue");
   }
 
   renderProviderSelector(view: ProviderSelectorCardView): Record<string, unknown> {
@@ -700,6 +706,7 @@ export class CardRenderer {
         `**模型**：${inlineCode(view.model)}`,
         `**当前思考模式**：${inlineCode(view.currentEffort ?? "默认")}`,
         ...(view.notice ? [view.notice] : []),
+        ...(view.warning ? [`**提示**：${escapeCardHtml(view.warning)}`] : []),
       ].join("\n")),
       { tag: "hr" },
     ];
@@ -757,7 +764,7 @@ export class CardRenderer {
         },
       }]),
     );
-    return sectionCard("思考模式", elements, view.notice ? "green" : "blue");
+    return sectionCard("思考模式", elements, view.warning ? "orange" : view.notice ? "green" : "blue");
   }
 
   renderModelSelector(view: ModelSelectorCardView): Record<string, unknown> {
@@ -767,6 +774,7 @@ export class CardRenderer {
         `**当前模型**：${inlineCode(view.currentModel ?? "默认")}`,
         `**思考强度**：${inlineCode(view.reasoningEffort ?? "默认")}`,
         ...(view.notice ? [view.notice] : []),
+        ...(view.warning ? [`**提示**：${escapeCardHtml(view.warning)}`] : []),
       ].join("\n")),
       { tag: "hr" },
     ];
@@ -825,7 +833,8 @@ export class CardRenderer {
         }]),
       );
     }
-    return sectionCard(view.unifiedSettings ? "Provider 设置 · 模型" : "模型", elements, view.notice ? "green" : "blue");
+    return sectionCard(view.unifiedSettings ? "Provider 设置 · 模型" : "模型", elements,
+      view.warning ? "orange" : view.notice ? "green" : "blue");
   }
 
   renderPermissionSelector(view: PermissionSelectorCardView): Record<string, unknown> {
@@ -982,6 +991,7 @@ export class CardRenderer {
   }
 
   renderSafeRestartStatus(view: SafeRestartStatusView): Record<string, unknown> {
+    const actionable = view.phase !== "restarting" && view.phase !== "cancelled" && view.phase !== "superseded";
     const countdown = view.phase === "countdown"
       ? `${Math.max(0, Math.ceil((view.remainingMs ?? 0) / 1_000))}s`
       : view.phase === "restarting"
@@ -1011,22 +1021,46 @@ export class CardRenderer {
     const elements: Record<string, unknown>[] = [markdown(lines.join("\n"))];
     if (view.waitingTasks.length > 0) {
       const visible = view.waitingTasks.slice(0, 10);
-      const taskLines = visible.map((task, index) =>
-        `${index + 1}. ${task.title ? `${inlineCode(truncateText(task.title, 80))} · ` : ""}${inlineCode(task.id)}`);
-      if (view.waitingTasks.length > visible.length) {
-        taskLines.push(`… 还有 ${view.waitingTasks.length - visible.length} 个任务`);
+      elements.push({ tag: "hr" }, markdown(`**当前等待的任务（${view.waitingTasks.length}）**`));
+      for (const [index, task] of visible.entries()) {
+        const label = `${index + 1}. ${task.title ? `${inlineCode(truncateText(task.title, 80))} · ` : ""}${inlineCode(task.id)}`;
+        elements.push({
+          tag: "column_set",
+          flex_mode: "none",
+          horizontal_spacing: "8px",
+          columns: [
+            { tag: "column", width: "weighted", weight: 1, elements: [markdown(label)] },
+            ...(actionable && task.isRunning ? [{
+              tag: "column",
+              width: "auto",
+              elements: [taskActionElement({
+                text: "Stop",
+                type: "danger",
+                value: { action: "session_stop", sessionId: task.localSessionId, cardView: "safe_restart" },
+              })],
+            }] : []),
+          ],
+        });
       }
-      elements.push({ tag: "hr" }, markdown(`**当前等待的任务（${view.waitingTasks.length}）**\n${taskLines.join("\n")}`));
+      if (view.waitingTasks.length > visible.length) {
+        elements.push(markdown(`… 还有 ${view.waitingTasks.length - visible.length} 个任务`));
+      }
     } else {
       elements.push({ tag: "hr" }, markdown("**当前等待的任务**：无"));
     }
-    if (view.phase !== "restarting" && view.phase !== "cancelled" && view.phase !== "superseded") {
+    if (actionable) {
       elements.push(
         { tag: "hr" },
         taskActionRow([{
           text: "Cancel",
           value: {
             action: "safe_restart_cancel",
+            scheduleId: String(view.scheduleId),
+          },
+        }, {
+          text: "ForceRestart",
+          value: {
+            action: "safe_restart_force",
             scheduleId: String(view.scheduleId),
           },
         }]),
@@ -1665,13 +1699,12 @@ function renderTurnElements(
       tag: "column_set",
       flex_mode: "flow",
       horizontal_spacing: "8px",
-      vertical_spacing: "8px",
       columns: request.options.map((option) => ({
         tag: "column",
         width: "auto",
         elements: [{
           tag: "button",
-          text: { tag: "plain_text", content: approvalDecisionLabel(option.id) },
+          text: { tag: "plain_text", content: request.kind === "mode_change" ? option.label : approvalDecisionLabel(option.id) },
           type: option.id === "accept" || option.id === "acceptForSession" ? "primary" : option.id === "cancel" ? "danger" : "default",
           behaviors: [{
             type: "callback",
@@ -1735,13 +1768,12 @@ function renderGroupedTurnElements(
       tag: "column_set",
       flex_mode: "flow",
       horizontal_spacing: "8px",
-      vertical_spacing: "8px",
       columns: request.options.map((option) => ({
         tag: "column",
         width: "auto",
         elements: [{
           tag: "button",
-          text: { tag: "plain_text", content: approvalDecisionLabel(option.id) },
+          text: { tag: "plain_text", content: request.kind === "mode_change" ? option.label : approvalDecisionLabel(option.id) },
           type: option.id === "accept" || option.id === "acceptForSession" ? "primary" : option.id === "cancel" ? "danger" : "default",
           behaviors: [{
             type: "callback",

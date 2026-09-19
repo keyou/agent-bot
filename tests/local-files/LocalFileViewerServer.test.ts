@@ -600,6 +600,9 @@ describe("LocalFileViewerServer", () => {
       turnId: "turn_1",
       projectCwd: directory,
       prompt: "检查 <preview> & SSE\n![Prompt](auth%20image.png)",
+      totalTokens: 8,
+      totalTokensIncludingCache: 3_563,
+      cachedInputTokens: 3_555,
       status: "running",
       startedAt: Date.now() - 2_000,
       assistantText: "",
@@ -628,6 +631,8 @@ describe("LocalFileViewerServer", () => {
     expect(page).toContain("检查 &lt;preview&gt; &amp; SSE");
     expect(page).toContain("正在检查入口。");
     expect(page).toContain("实时更新");
+    expect(page).toContain('title="总计: 3,563 tokens"');
+    expect(page).toContain('title="缓存命中: 3,555 tokens"');
     expect(page).not.toContain("检查 <preview> & SSE");
     const fileUrl = /class="file-link" href="([^"]+)"/u.exec(page)?.[1]?.replaceAll("&amp;", "&");
     expect(fileUrl).toBe(server.createFileUrl(path.join(directory, changedFile)));
@@ -649,7 +654,8 @@ describe("LocalFileViewerServer", () => {
         signal: controller.signal,
         headers: { "Accept-Language": "zh-CN" },
       }));
-      const initial = JSON.parse(await events.next("update")) as { content: string; terminal: boolean };
+      const initial = JSON.parse(await events.next("update")) as { content: string; metadata: string; terminal: boolean };
+      expect(initial.metadata).toContain('title="缓存命中: 3,555 tokens"');
       expect(initial.content).toContain("正在检查入口。");
       expect(initial.terminal).toBe(false);
       expect(initial.content).toContain(`src="${imageUrl!.replaceAll("&", "&amp;")}"`);
@@ -659,6 +665,9 @@ describe("LocalFileViewerServer", () => {
         status: "completed",
         completedAt: Date.now(),
         durationMs: 2_500,
+        totalTokens: 16,
+        totalTokensIncludingCache: 7_126,
+        cachedInputTokens: 7_110,
         finalResponse: `完成 **Preview**。\n![QR](<${imagePath.replaceAll("\\", "/")}>)`,
         activities: [
           ...snapshot.activities,
@@ -681,7 +690,9 @@ describe("LocalFileViewerServer", () => {
         totalToolCount: 1,
         completedToolCount: 1,
       };
-      const update = JSON.parse(await events.next("update")) as { content: string; terminal: boolean };
+      const update = JSON.parse(await events.next("update")) as { content: string; metadata: string; terminal: boolean };
+      expect(update.metadata).toContain('title="总计: 7,126 tokens"');
+      expect(update.metadata).toContain('title="缓存命中: 7,110 tokens"');
       expect(update.content).toContain("npm test");
       expect(update.content).toContain("all passed");
       expect(update.content).not.toContain("/bin/zsh -lc");

@@ -573,6 +573,7 @@ function fixture(
   const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } as unknown as Logger;
   const restart = vi.fn(async () => undefined);
   const cancelSafeRestart = vi.fn(async () => true);
+  const forceSafeRestart = vi.fn(async () => true);
   const cancelAutomaticUpdate = vi.fn(async () => undefined);
   const rememberFeishuUserOpenId = vi.fn(async () => undefined);
   const persistAgentExecutionDefaults = vi.fn(async () => undefined);
@@ -598,6 +599,7 @@ function fixture(
       restart,
       supervised: true,
       cancelSafeRestart,
+      forceSafeRestart,
       cancelAutomaticUpdate,
       rememberFeishuUserOpenId,
       persistAgentExecutionDefaults,
@@ -625,6 +627,7 @@ function fixture(
     listeners,
     restart,
     cancelSafeRestart,
+    forceSafeRestart,
     cancelAutomaticUpdate,
     rememberFeishuUserOpenId,
     persistAgentExecutionDefaults,
@@ -1446,6 +1449,73 @@ describe("ProxySessionController", () => {
     await controller.onCardAction(action);
     expect(cancelAutomaticUpdate).toHaveBeenCalledExactlyOnceWith(action);
     expect(runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("forces a safe restart once through the existing owner check", async () => {
+    const { controller, forceSafeRestart, restart, cancelSafeRestart, runtime, config } = fixture();
+    config.feishu.userOpenId = "ou_owner";
+    config.feishu.respondToOwnerOnly = true;
+    const action = {
+      actionId: "force-safe-restart", contextKey: "chat_id:c1", messageId: "om_restart", userId: "ou_owner",
+      value: { action: "safe_restart_force", scheduleId: "7" },
+    };
+    await controller.onCardAction({ ...action, actionId: "force-not-owner", userId: "ou_other" });
+    expect(forceSafeRestart).not.toHaveBeenCalled();
+    await controller.onCardAction(action);
+    await controller.onCardAction(action);
+    expect(forceSafeRestart).toHaveBeenCalledExactlyOnceWith(7);
+    expect(restart).not.toHaveBeenCalled();
+    expect(cancelSafeRestart).not.toHaveBeenCalled();
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("reports a stale forced restart without starting a new plan", async () => {
+    const { controller, forceSafeRestart, restart, outbound } = fixture();
+    forceSafeRestart.mockResolvedValueOnce(false);
+    await controller.onCardAction({
+      actionId: "force-stale", contextKey: "chat_id:c1", messageId: "om_restart_old",
+      value: { action: "safe_restart_force", scheduleId: "3" },
+    });
+    expect(forceSafeRestart).toHaveBeenCalledExactlyOnceWith(3);
+    expect(restart).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "该安全重启计划已失效，请查看最新状态卡片。");
+  });
+
+  test.each([undefined, "", "0", "-1", "1.5", "bad", "9007199254740992"])(
+    "rejects an invalid forced restart schedule %s", async (scheduleId) => {
+      const { controller, forceSafeRestart, outbound } = fixture();
+      await controller.onCardAction({
+        actionId: "force-invalid", contextKey: "chat_id:c1", messageId: "om_restart",
+        value: { action: "safe_restart_force", scheduleId },
+      });
+      expect(forceSafeRestart).not.toHaveBeenCalled();
+      expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "安全重启卡片无效，请使用最新的状态卡片。");
+    },
+  );
+
+  test("stops only the selected restart blocker across conversations without replacing the restart card", async () => {
+    const { controller, runtime, store, outbound, forceSafeRestart, cancelSafeRestart } = fixture();
+    await controller.onMessage(message("start local task"));
+    const currentId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    await controller.onMessage({ messageId: "m-blocker", contextKey: "chat_id:other", text: "start another task" });
+    const blockerId = store.getUserContext("chat_id:other")!.currentSessionId!;
+    const blocker = store.getSession(blockerId)!;
+    vi.mocked(outbound.updateInteractiveCard).mockClear();
+    const action = {
+      actionId: "stop-restart-blocker", contextKey: "chat_id:c1", messageId: "om_restart",
+      value: { action: "session_stop", sessionId: blockerId, cardView: "safe_restart" },
+    };
+
+    await controller.onCardAction(action);
+    await controller.onCardAction(action);
+
+    expect(runtime.interruptRemoteTurn).toHaveBeenCalledExactlyOnceWith(blocker.remoteSessionId, "turn_1");
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(currentId);
+    expect(store.getUserContext("chat_id:other")!.currentSessionId).toBe(blockerId);
+    expect(outbound.updateInteractiveCard).not.toHaveBeenCalled();
+    expect(runtime.listRemoteSessions).not.toHaveBeenCalled();
+    expect(forceSafeRestart).not.toHaveBeenCalled();
+    expect(cancelSafeRestart).not.toHaveBeenCalled();
   });
 
   test("cancels a safe restart from its card action once", async () => {
@@ -5058,6 +5128,75 @@ describe("ProxySessionController", () => {
     );
   });
 
+  test.each([
+    ["new", "codex"], ["newgroup", "codex"], ["new", "acp"], ["newgroup", "acp"],
+  ])("/%s --agent %s selects the Agent without changing the conversation default", async (command, agentName) => {
+    const { controller, runtime, store, config, outbound } = fixture();
+    await controller.onMessage(message(`/new Source --dir "${process.cwd()}"`));
+    const sourceId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const sourceSettings = { modelProvider: "source-provider", model: "source-model", reasoningEffort: "high", permissionMode: "confirm" as const };
+    const targetSettings = { modelProvider: "target-provider", model: "target-model", reasoningEffort: "low", permissionMode: "auto" as const };
+    store.updateRuntimeSession(sourceId, sourceSettings);
+    config.agents[agentName!]!.defaults = targetSettings;
+    const defaultAgent = agentName === "codex" ? "acp" : "codex";
+    store.setDefaultAgent("chat_id:c1", defaultAgent);
+
+    await controller.onMessage({ ...message(`/${command} Explicit task --agent ${agentName}`), userId: "ou_user" });
+
+    const targetContext = command === "new" ? "chat_id:c1" : "chat_id:oc_new_group";
+    const targetId = store.getUserContext(targetContext)!.currentSessionId!;
+    expect(targetId).not.toBe(sourceId);
+    expect(runtime.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      localSessionId: targetId, agentName, title: "Explicit task", cwd: process.cwd(),
+      ...(agentName === "codex" ? sourceSettings : targetSettings),
+    }));
+    expect(store.getSession(targetId)?.agentName).toBe(agentName);
+    expect(store.getUserContext("chat_id:c1")!.defaultAgent).toBe(defaultAgent);
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(runtime.cancelTurn).not.toHaveBeenCalled();
+    if (command === "newgroup") {
+      expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(sourceId);
+      expect(store.getUserContext(targetContext)!.defaultAgent).toBe(agentName);
+      expect(outbound.createGroup).toHaveBeenCalledWith(expect.objectContaining({ name: expect.stringContaining(`[${agentName}]`) }));
+    } else {
+      expect(outbound.createGroup).not.toHaveBeenCalled();
+    }
+  });
+
+  test.each(["new", "newgroup"])("/%s --nodir validates the selected Agent rather than the default", async (command) => {
+    const { controller, runtime, store, outbound } = fixture();
+    store.getOrCreateUserContext("chat_id:c1", "acp");
+    await controller.onMessage({ ...message(`/${command} Projectless --nodir --agent codex`), userId: "ou_user" });
+    const contextKey = command === "new" ? "chat_id:c1" : "chat_id:oc_new_group";
+    const taskId = store.getUserContext(contextKey)!.currentSessionId!;
+    expect(store.getSession(taskId)?.agentName).toBe("codex");
+    expect(runtime.createSession).toHaveBeenCalledOnce();
+    store.setDefaultAgent("chat_id:c1", "codex");
+    vi.mocked(runtime.createSession).mockClear();
+    vi.mocked(outbound.createGroup!).mockClear();
+
+    await controller.onMessage({ ...message(`/${command} Invalid --agent acp --nodir`), userId: "ou_user" });
+
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(store.getUserContext(contextKey)!.currentSessionId).toBe(taskId);
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", `/${command} --nodir 仅支持 App Server Agent。`);
+  });
+
+  test.each(["new", "newgroup"])("/%s rejects an unknown Agent before creating a task or group", async (command) => {
+    const { controller, runtime, store, outbound } = fixture();
+    await controller.onMessage(message("/new Source"));
+    const sourceId = store.getUserContext("chat_id:c1")!.currentSessionId;
+    vi.mocked(runtime.createSession).mockClear();
+
+    await controller.onMessage({ ...message(`/${command} Invalid --agent unknown`), userId: "ou_user" });
+
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(sourceId);
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "未知 agent：unknown");
+  });
+
   test("new always uses the current default agent and accepts cwd through --dir", async () => {
     const { controller, runtime, store } = fixture();
     const cwd = path.resolve("test-workspaces", "work space", "repo");
@@ -8134,6 +8273,36 @@ describe("ProxySessionController", () => {
     );
   });
 
+  test("shows plan confirmation in task status without ending the active task", async () => {
+    const { controller, outbound, store, runtime } = fixture();
+    await controller.onMessage(message("prepare a plan"));
+    const task = store.listSessions("chat_id:c1")[0]!;
+    store.saveTurnSnapshot("turn_1", task.localSessionId, {
+      sessionId: task.localSessionId, turnId: "turn_1", status: "waiting_for_approval", startedAt: 1_000,
+      assistantText: "", plan: [], activities: [], completedTools: [], failedTools: [], fileSummary: [],
+      approval: { id: "mode:thr_1:r1", kind: "mode_change", title: "确认方案并开始执行", options: [] },
+    });
+    await controller.onMessage(message("/status"));
+    const card = (outbound.sendInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(card)).toContain("**状态 / 最近结果**：等待确认 / 等待确认");
+    expect(JSON.stringify(card)).toContain("任务正在等待确认，尚无最终结果。");
+    expect(JSON.stringify(card)).not.toContain("任务仍在执行，尚无最终结果。");
+    expect(store.getSession(task.localSessionId)?.status).toBe("running");
+    expect(runtime.getSession(task.localSessionId)?.activeTurnId).toBe("turn_1");
+  });
+
+  test.each(["accept", "decline", "cancel"])("routes plan %s callbacks without stopping the task", async (decision) => {
+    const { controller, runtime, store } = fixture();
+    await controller.onMessage(message("prepare a plan"));
+    const task = store.listSessions("chat_id:c1")[0]!;
+    await controller.onCardAction({
+      actionId: `plan-${decision}`, contextKey: "chat_id:c1",
+      value: { action: "approval", sessionId: task.localSessionId, turnId: "turn_1", requestId: "mode:thr_1:r1", decision },
+    });
+    expect(runtime.respondToApproval).toHaveBeenCalledWith(task.localSessionId, "mode:thr_1:r1", decision);
+    expect(runtime.cancelTurn).not.toHaveBeenCalled();
+  });
+
   test("shows Stop on the current running task status card", async () => {
     const { controller, outbound } = fixture();
     await controller.onMessage(message("keep running"));
@@ -9475,6 +9644,30 @@ describe("ProxySessionController", () => {
     expect(presenter.updateSessionModel).toHaveBeenLastCalledWith(id, "gpt-next");
     expect(vi.mocked(presenter.updateSessionModel).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(presenter.startPendingTurn).mock.invocationCallOrder[0]!);
+  });
+
+  test("shows discovery failures when switching Provider and clears warnings on recovery", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("/new"));
+    const sessionId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const warning = "无法连接 Provider azure 的模型列表，服务可用性未确认。";
+    runtime.listModelsWithStatus = vi.fn(async () => ({ models: await runtime.listModels(), warning }));
+    await controller.onCardAction({
+      actionId: "switch-with-warning", contextKey: "chat_id:c1", messageId: "settings",
+      value: { action: "settings_provider_select", sessionId, provider: "azure" },
+    });
+    const card = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(card).toMatchObject({ header: { template: "orange" } });
+    expect(JSON.stringify(card)).toContain(warning);
+    expect(JSON.stringify(card)).toContain("Provider 已切换");
+    expect(store.getSession(sessionId)?.modelProvider).toBe("azure");
+    await controller.onMessage(message("/model"));
+    expect(JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1])).toContain(warning);
+    runtime.listModelsWithStatus = vi.fn(async () => ({ models: await runtime.listModels() }));
+    await controller.onMessage({ ...message("/model"), messageId: "models-recovered" });
+    const recovered = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(recovered).toMatchObject({ header: { template: "blue" } });
+    expect(JSON.stringify(recovered)).not.toContain(warning);
   });
 
   test("switches Provider, Model, Thinking, and Permission through one tabbed card", async () => {

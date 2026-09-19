@@ -8,6 +8,7 @@ import type {
   ConversationTurn,
   ForkRuntimeSessionInput,
   ModelOption,
+  ModelListResult,
   ModelProviderOption,
   PermissionMode,
   RemoteSessionActivity,
@@ -51,6 +52,7 @@ const FORK_SOURCE_TURN_PAGE_SIZE = 20;
 const FORK_SOURCE_REQUEST_TIMEOUT_MS = 15_000;
 const USER_RESUMABLE_THREAD_SOURCE_KINDS = ["cli", "vscode", "exec", "appServer"] as const;
 const BUILT_IN_CODEX_PROVIDER_ID = "openai";
+const BUILT_IN_TRAEX_PROVIDER_ID = "trae";
 // A timed-out fork keeps running in App Server and can create an orphan thread.
 // Wait for its response; connection closure still rejects the request.
 const FORK_REQUEST_TIMEOUT_MS = 0;
@@ -79,9 +81,12 @@ export interface AppServerClientProvider {
 interface CodexSession extends RuntimeSession {
   activeTurnStartedAt?: number;
   terminalTurnIds: Set<string>;
+  modeChangeRequestIds: Set<string>;
   finalText: string;
   generatedImagePaths: string[];
   messagePhases: Map<string, "commentary" | "final_answer">;
+  unphasedMessages: Map<string, string>;
+  unphasedFinalMessageId?: string;
   needsResume: boolean;
   canReplaceEmptyThread: boolean;
   settingsRecoveryError?: string;
@@ -96,11 +101,20 @@ interface PendingApproval {
   resolve: (value: { decision: ApprovalDecision }) => void;
 }
 
+interface PendingModeChange {
+  sessionId: string;
+  turnId: string;
+  requestId: string;
+  targetMode: "plan" | "default";
+  responding: boolean;
+}
+
 export class CodexRuntime implements AgentRuntime {
   readonly kind = "codex" as const;
   private readonly sessions = new Map<string, CodexSession>();
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   private readonly approvals = new Map<string, PendingApproval>();
+  private readonly modeChanges = new Map<string, PendingModeChange>();
   private attachedClient?: AppServerClient;
   private unsubscribe?: () => void;
   private readonly unsubscribeDisconnect?: () => void;
@@ -832,6 +846,34 @@ export class CodexRuntime implements AgentRuntime {
     requestId: string,
     decision: ApprovalDecision,
   ): Promise<void> {
+    const modeChange = this.modeChanges.get(requestId);
+    if (modeChange) {
+      if (modeChange.sessionId !== sessionId
+        || this.sessions.get(sessionId)?.activeTurnId !== modeChange.turnId) {
+        throw new Error("Approval request is no longer pending.");
+      }
+      if (decision !== "accept" && decision !== "decline" && decision !== "cancel") {
+        throw new Error("Invalid mode change decision.");
+      }
+      if (modeChange.responding) throw new Error("Approval response is already in progress.");
+      modeChange.responding = true;
+      try {
+        const client = await this.client();
+        if (this.modeChanges.get(requestId) !== modeChange) throw new Error("Approval request is no longer pending.");
+        await client.request("mode/change/respond", {
+          threadId: this.requireSession(sessionId).remoteSessionId,
+          requestId: modeChange.requestId,
+          decision: decision === "accept" ? "approved" : decision === "decline" ? "rejected" : "cancelled",
+        }, CONTROL_REQUEST_TIMEOUT_MS);
+        if (this.modeChanges.get(requestId) === modeChange) {
+          this.modeChanges.delete(requestId);
+          this.emit({ type: "approval_resolved", sessionId, turnId: modeChange.turnId, requestId, decision });
+        }
+      } finally {
+        modeChange.responding = false;
+      }
+      return;
+    }
     const pending = this.approvals.get(requestId);
     if (!pending || pending.sessionId !== sessionId) throw new Error("Approval request is no longer pending.");
     this.approvals.delete(requestId);
@@ -840,10 +882,16 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async listModels(modelProvider?: string, fallbackModel?: string): Promise<ModelOption[]> {
+    return (await this.listModelsWithStatus(modelProvider, fallbackModel)).models;
+  }
+
+  async listModelsWithStatus(modelProvider?: string, fallbackModel?: string): Promise<ModelListResult> {
     const requestedProvider = modelProvider?.trim();
+    const agentFamily = this.provider.getAgentFamily?.();
     if (!requestedProvider
-      || (requestedProvider === BUILT_IN_CODEX_PROVIDER_ID && this.provider.getAgentFamily?.() !== "traex")) {
-      return this.listCatalogModels();
+      || (requestedProvider === BUILT_IN_CODEX_PROVIDER_ID && agentFamily !== "traex")
+      || (requestedProvider === BUILT_IN_TRAEX_PROVIDER_ID && agentFamily === "traex")) {
+      return { models: await this.listCatalogModels() };
     }
     const config = await this.readConfig();
     const configuredProviders = isRecord(config.model_providers) ? config.model_providers : {};
@@ -859,19 +907,23 @@ export class CodexRuntime implements AgentRuntime {
       ? stringValue(config.model)?.trim()
       : undefined;
     try {
-      return await fetchProviderModels({
+      const models = await fetchProviderModels({
         providerId: requestedProvider,
         config: (isRecord(providerConfig) ? providerConfig : {}) as ProviderModelConfig,
         catalog,
         configuredDefaultModel,
         environmentValue: (name) => this.provider.getEnvironmentVariable?.(name) ?? process.env[name],
       });
+      return { models };
     } catch (error) {
       const fallback = fallbackProviderModel(catalog, fallbackModel, configuredDefaultModel);
       if (!fallback) throw error;
       this.logger.warn({ error, modelProvider: requestedProvider, fallbackModel: fallback.id },
         "Provider model discovery failed; using the current or configured model as a fallback.");
-      return [fallback];
+      return {
+        models: [fallback],
+        warning: `${error instanceof Error ? error.message : "Provider 模型列表读取失败。"} 暂时仅显示当前或已配置模型，服务可用性未确认。`,
+      };
     }
   }
 
@@ -971,6 +1023,7 @@ export class CodexRuntime implements AgentRuntime {
     this.unsubscribeDisconnect?.();
     for (const pending of this.approvals.values()) pending.resolve({ decision: "cancel" });
     this.approvals.clear();
+    this.modeChanges.clear();
     this.sessionSyncs.clear();
     this.sessions.clear();
     this.provider.close();
@@ -1064,13 +1117,50 @@ export class CodexRuntime implements AgentRuntime {
       return;
     }
     const sessionId = session.localSessionId;
-    if (mapped.kind === "token_usage") {
+    if (mapped.kind === "mode_change_requested") {
+      const requestId = `mode:${mapped.threadId}:${mapped.requestId}`;
+      if (session.modeChangeRequestIds.has(requestId)) return;
+      session.modeChangeRequestIds.add(requestId);
+      this.modeChanges.set(requestId, {
+        sessionId, turnId: mapped.turnId, requestId: mapped.requestId,
+        targetMode: mapped.targetMode, responding: false,
+      });
+      this.emit({
+        type: "approval_requested", sessionId, turnId: mapped.turnId,
+        request: {
+          id: requestId,
+          kind: "mode_change",
+          title: mapped.targetMode === "default" ? "确认方案并开始执行" : "确认进入规划模式",
+          reason: [mapped.reason, ...(mapped.allowedPrompts ?? []).map((entry) => `- ${entry.tool}: ${entry.prompt}`)]
+            .filter(Boolean).join("\n"),
+          options: [
+            { id: "accept", label: mapped.targetMode === "default" ? "Approve Plan" : "Enter Plan Mode" },
+            { id: "decline", label: "Reject" },
+            { id: "cancel", label: "Cancel Request" },
+          ],
+        },
+      });
+    } else if (mapped.kind === "mode_change_resolved") {
+      const requestId = `mode:${mapped.threadId}:${mapped.requestId}`;
+      const pending = this.modeChanges.get(requestId);
+      if (!pending || pending.sessionId !== sessionId || pending.turnId !== mapped.turnId
+        || pending.targetMode !== mapped.targetMode) return;
+      this.modeChanges.delete(requestId);
+      this.emit({
+        type: "approval_resolved", sessionId, turnId: mapped.turnId, requestId,
+        decision: mapped.decision === "approved" ? "accept" : mapped.decision === "rejected" ? "decline" : "cancel",
+      });
+    } else if (mapped.kind === "token_usage") {
       this.emit({
         type: "token_usage_updated",
         sessionId,
         turnId: mapped.turnId,
         lastTokens: mapped.lastTokens,
         cumulativeTokens: mapped.cumulativeTokens,
+        lastTotalTokens: mapped.lastTotalTokens,
+        cumulativeTotalTokens: mapped.cumulativeTotalTokens,
+        lastCachedTokens: mapped.lastCachedTokens,
+        cumulativeCachedTokens: mapped.cumulativeCachedTokens,
         contextTokens: mapped.contextTokens,
       });
     } else if (mapped.kind === "context_compaction") {
@@ -1086,8 +1176,16 @@ export class CodexRuntime implements AgentRuntime {
       });
     } else if (mapped.kind === "agent_message_phase") {
       session.messagePhases.set(mapped.itemId, mapped.phase);
+      if (mapped.phase === "final_answer") this.promoteUnphasedMessage(session, mapped.turnId, mapped.itemId);
+      else if (session.unphasedFinalMessageId === mapped.itemId) session.unphasedFinalMessageId = undefined;
     } else if (mapped.kind === "agent_delta") {
-      if (session.messagePhases.get(mapped.itemId) === "commentary") {
+      const phase = session.messagePhases.get(mapped.itemId);
+      if (phase !== "final_answer") {
+        // Providers may omit phase. Keep their text in sequence until a tool or completion disambiguates it.
+        if (phase === undefined) {
+          session.unphasedMessages.set(mapped.itemId, (session.unphasedMessages.get(mapped.itemId) ?? "") + mapped.text);
+          session.unphasedFinalMessageId = mapped.itemId;
+        }
         this.emit({
           type: "progress",
           sessionId,
@@ -1100,6 +1198,19 @@ export class CodexRuntime implements AgentRuntime {
         session.finalText += mapped.text;
         this.emit({ type: "agent_text_delta", sessionId, turnId: mapped.turnId, text: mapped.text });
       }
+    } else if (mapped.kind === "runtime_error") {
+      this.logger.warn({ sessionId, turnId: mapped.turnId, willRetry: mapped.willRetry, error: mapped.message },
+        "App Server reported a turn error.");
+      // Only turn/completed terminates the turn; native retries keep the same progress card.
+      this.emit({
+        type: "progress",
+        sessionId,
+        turnId: mapped.turnId,
+        activityId: `commentary:runtime-error:${mapped.turnId}`,
+        text: `${mapped.willRetry ? "运行请求出错，Agent 正在重试" : "运行请求失败，等待 Agent 返回最终状态"}：${mapped.message}`,
+        append: false,
+        severity: "warning",
+      });
     } else if (mapped.kind === "progress") {
       this.emit({
         type: "progress",
@@ -1112,6 +1223,7 @@ export class CodexRuntime implements AgentRuntime {
     } else if (mapped.kind === "plan") {
       this.emit({ type: "plan_updated", sessionId, turnId: mapped.turnId, steps: mapped.steps });
     } else if (mapped.kind === "tool") {
+      if (mapped.phase === "started") session.unphasedFinalMessageId = undefined;
       if (
         mapped.phase === "updated"
         && mapped.tool.kind === "image_generation"
@@ -1135,6 +1247,11 @@ export class CodexRuntime implements AgentRuntime {
         delta: mapped.delta,
       });
     } else if (mapped.kind === "terminal") {
+      if (mapped.status === "completed" && !session.finalText && session.unphasedFinalMessageId) {
+        this.promoteUnphasedMessage(session, mapped.turnId, session.unphasedFinalMessageId);
+      }
+      session.unphasedMessages.clear();
+      session.unphasedFinalMessageId = undefined;
       session.activeTurnId = undefined;
       session.activeTurnStartedAt = undefined;
       session.terminalTurnIds.add(mapped.turnId);
@@ -1189,6 +1306,18 @@ export class CodexRuntime implements AgentRuntime {
       },
     });
     return response;
+  }
+
+  private promoteUnphasedMessage(session: CodexSession, turnId: string, itemId: string): void {
+    const text = session.unphasedMessages.get(itemId);
+    if (text === undefined) return;
+    session.unphasedMessages.delete(itemId);
+    if (session.unphasedFinalMessageId === itemId) session.unphasedFinalMessageId = undefined;
+    session.finalText += text;
+    this.emit({
+      type: "agent_text_delta", sessionId: session.localSessionId, turnId, text,
+      replacesActivityId: `commentary:${itemId}`,
+    });
   }
 
   private async resolveReasoningEffort(
@@ -1290,6 +1419,9 @@ export class CodexRuntime implements AgentRuntime {
     }
     session.activeTurnId = turnId;
     session.activeTurnStartedAt = startedAt;
+    session.modeChangeRequestIds.clear();
+    session.unphasedMessages.clear();
+    session.unphasedFinalMessageId = undefined;
     session.finalText = "";
     session.generatedImagePaths = [];
     session.messagePhases.clear();
@@ -1308,6 +1440,13 @@ export class CodexRuntime implements AgentRuntime {
 
   private finishSnapshotTurn(session: CodexSession, turn: CodexTurnSnapshot): void {
     if (session.activeTurnId !== turn.id) return;
+    if (turn.status === "completed") {
+      for (const item of finalResponseMessages(turn)) {
+        if (item.id) this.promoteUnphasedMessage(session, turn.id, item.id);
+      }
+    }
+    session.unphasedMessages.clear();
+    session.unphasedFinalMessageId = undefined;
     session.activeTurnId = undefined;
     session.activeTurnStartedAt = undefined;
     session.terminalTurnIds.add(turn.id);
@@ -1375,9 +1514,11 @@ export class CodexRuntime implements AgentRuntime {
           ? [input.lastTurnId]
           : [],
       ),
+      modeChangeRequestIds: new Set(),
       finalText: "",
       generatedImagePaths: [],
       messagePhases: new Map(),
+      unphasedMessages: new Map(),
       needsResume: false,
       canReplaceEmptyThread: !("remoteSessionId" in input),
       rolloutPath: stringValue(response.thread.path)?.trim() || undefined,
@@ -1410,6 +1551,11 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   private emit(event: RuntimeEvent): void {
+    if (event.type === "turn_completed" || event.type === "turn_cancelled" || event.type === "turn_failed") {
+      for (const [requestId, pending] of this.modeChanges) {
+        if (pending.sessionId === event.sessionId && pending.turnId === event.turnId) this.modeChanges.delete(requestId);
+      }
+    }
     for (const listener of this.listeners) listener(event);
   }
 
@@ -1417,6 +1563,7 @@ export class CodexRuntime implements AgentRuntime {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     this.attachedClient = undefined;
+    this.modeChanges.clear();
     for (const session of this.sessions.values()) {
       session.needsResume = true;
       const turnId = session.activeTurnId;
@@ -1481,6 +1628,7 @@ interface CodexTurnSnapshot {
   id: string;
   status: "completed" | "interrupted" | "failed" | "inProgress";
   items?: Array<{
+    id?: string;
     type?: string;
     text?: string;
     content?: Array<{
@@ -1575,13 +1723,15 @@ function turnStartedAt(turn: CodexTurnSnapshot): number {
 }
 
 function extractFinalResponse(turn: CodexTurnSnapshot): string {
+  return finalResponseMessages(turn).map((item) => item.text!.trim()).join("\n\n");
+}
+
+function finalResponseMessages(turn: CodexTurnSnapshot) {
   const messages = (turn.items ?? []).filter(
     (item) => item.type === "agentMessage" && typeof item.text === "string" && item.text.trim(),
   );
   const finalMessages = messages.filter((item) => item.phase === "final_answer");
-  return (finalMessages.length ? finalMessages : messages.slice(-1))
-    .map((item) => item.text!.trim())
-    .join("\n\n");
+  return finalMessages.length ? finalMessages : messages.filter((item) => item.phase !== "commentary").slice(-1);
 }
 
 function extractGeneratedImagePaths(turn: CodexTurnSnapshot): string[] {

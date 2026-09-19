@@ -6,6 +6,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Show per-Turn total and cache-hit tokens in live Preview alongside the existing non-cached count, with exact values on hover and deduplicated usage updates; keep historical snapshots without usage details unchanged.
+- Show the full built-in TraeX model catalog, surface Provider model-discovery fallback warnings on settings cards, and display App Server errors and native retries on the existing progress card.
+- Preserve unphased assistant updates in the progress timeline and promote only the final eligible message, avoiding duplicate or premature answers in thinking cards and Preview.
+- Handle TraeX planning and execution confirmations with explicit approval actions, retain the waiting state during tool updates, and expose pending confirmations in read-only Preview and task status.
+- Add ForceRestart and per-running-task Stop actions to safe-restart cards, with stale-plan checks and normal task interruption semantics.
+- Allow an explicit configured Agent through /new and /newgroup --agent while preserving conversation defaults, project inheritance, and per-Agent execution settings.
+- Include available file paths and search targets in generic Read and Grep tool titles without altering complete commands.
+
 ## [0.1.24-alpha.0] - 2026-09-17
 
 - Load each Codex Agent's `CODEX_HOME/.env` at Worker startup for Provider model discovery and the Codex process, without overriding existing environment or explicit Agent settings or sharing those values with other Agents.

@@ -110,6 +110,10 @@ agentbot server restart
 
 It waits for currently running Agent tasks to finish before restarting, allowing every task to complete normally. When an Agent invokes the CLI, the status card returns to its source task; from an ordinary terminal it goes to the configured user's private chat. Add `--task <task>` to override either destination. When triggered from a Feishu topic, both restart status and the post-restart startup card return to that topic.
 
+The safe-restart card offers `Cancel` and `ForceRestart`. Clicking `ForceRestart` immediately starts the pending restart without waiting for tasks, final deliveries, or the quiet window, and may interrupt running tasks. If a prepared update is waiting, it applies that update and restarts immediately. Cancelled, superseded, or already-triggered plans cannot be forced again.
+
+Each displayed running task also has a `Stop` action that interrupts only that task, including tasks in other conversations. The card refreshes automatically as tasks stop; the safe restart continues waiting for the remaining blockers.
+
 To start Agent Bot automatically at user login:
 
 ```bash
@@ -235,7 +239,7 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 
 | Command                                       | Purpose                              |
 | --------------------------------------------- | ------------------------------------ |
-| `/new [title] [--dir <path> \| --nodir]`      | Start a new task                     |
+| `/new [title] [--agent <name>] [--dir <path> \| --nodir]`      | Start a new task                     |
 | `/dir [path]`                                 | Browse files or start work in a directory |
 | `/file <file-path>`                           | Send a file to the current Feishu conversation |
 | `/sessions [keyword]`                         | Find and manage tasks                |
@@ -256,7 +260,7 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 | `/thinking`                                   | Set reasoning effort                 |
 | `/permissions`                                | Set execution permissions            |
 | `/agent [name]`                               | Choose the Agent for new tasks       |
-| `/newgroup [title] [--dir <path> \| --nodir]` | Start a task in a new private group  |
+| `/newgroup [title] [--agent <name>] [--dir <path> \| --nodir]` | Start a task in a new private group  |
 | `/forkgroup [title]`                          | Branch a task into a new private group |
 | `/clonegroup [title] [--agent <name>]`         | Transfer dialogue into a new private group |
 | `/restart [--force]`                          | Restart safely, or interrupt with `--force` |
@@ -272,7 +276,7 @@ Topic replies check whether the root message is already in the task's history us
 
 In a group, `/mute` and `/mute on` make the bot process only messages that mention it. Mention the bot and send `/mute off` to restore automatic responses. The setting applies to every topic in that group.
 
-`/new` and `/newgroup` inherit the current Agent, project, and execution settings. Use `--dir` to choose another directory or `--nodir` to start without a project directory; `~` represents your home directory.
+`/new` and `/newgroup` use the conversation's default Agent unless `--agent <name>` selects another configured Agent for this task only; the source conversation's default is unchanged. For example, `/new Fix tests --agent codex` or `/newgroup Review --agent traex --dir ~/dev/project`. They inherit the current project; execution settings are inherited only when the selected Agent matches the current task's Agent, otherwise Provider, model, reasoning, and permission mode use the target Agent's saved defaults. Use `--dir` to choose another directory or `--nodir` to start without a project directory; `--nodir` requires the selected Agent to be App Server, and `~` represents your home directory.
 
 `/file` accepts relative paths, absolute paths, and paths beginning with `~`; relative paths resolve from the current task directory.
 
@@ -314,11 +318,17 @@ The compact Turn Preview header uses dot-separated values, keeps the duration la
 
 Tool blocks have a subtle outline. Horizontal separators appear after the Prompt, before the file-change summary, and before the answer, with no separator after the final answer. The file-change summary starts collapsed, shows the file count, and preserves your expanded state during live updates. Both file lists show project files as relative paths and files outside the project as absolute paths.
 
+When an App Server reports only `Read` or `Grep` as the command, available action metadata supplies the file path or search query and scope in both the summary and expanded command. Complete commands remain unchanged, and missing targets are not guessed; previously saved previews are not backfilled.
+
 Tool titles start with the same status icons as the thinking card: an hourglass while running, a check mark on success, or a cross on failure. Running blocks have an accent border. Header summaries omit shell line-continuation markers while preserving file paths and the full expanded command. Durations remain hidden at zero seconds. The expanded footer shows the execution status, start time, duration, and result character count outside the scroll area; running durations update live in both the header and footer.
+
+TraeX plan-mode confirmations appear on the existing progress card as **Waiting for approval**, with the plan text and `Approve Plan` (or `Enter Plan Mode`), `Reject`, and `Cancel Request` actions. They require an explicit decision even with automatic permissions; cancelling the request is not the same as stopping the task. Turn Preview shows the plan and pending confirmation but remains read-only: respond in Feishu. Waiting turns remain active and continue to block safe restart until they finish or are explicitly stopped. Notifications missed by an older running version cannot be recovered automatically by this adaptation.
 
 Local images in Turn Preview Prompts, Commentary, and results load through signed file URLs, including live updates. Relative image paths resolve from the task's project directory.
 
 Changing the model or Provider updates the model shown for subsequent Turns in Preview. A change during execution does not relabel the running Turn or earlier Turns.
+
+When reported by the Agent, Turn Preview also shows this Turn's total tokens (input plus output, including cached input) and cache-hit input tokens alongside the existing non-cached count. Values update live, use compact units, and show exact counts on hover. Duplicate usage notifications are not counted twice. Missing breakdowns and older snapshots are not estimated or backfilled from task history; Feishu card token counts keep their existing calculation.
 
 Markdown previews keep table cells at their content width. Wide tables scroll horizontally within the preview instead of squeezing columns on narrow screens, and live updates preserve each table's horizontal scroll position.
 
@@ -331,6 +341,12 @@ Provider, model, reasoning effort, and permission choices apply to the current t
 The execution settings card ends with a one-sentence Markdown blockquote for the selected tab's scope and timing. Agent selection changes only the default for new tasks in that conversation, without migrating the current task. Model, reasoning, and permission changes apply from the next turn. Agent and Provider options show their identifiers without duplicate display names, while retaining current/default indicators.
 
 Provider changes require an idle task. Wait for an active turn to finish, or stop it before switching. For a custom Provider, Agent Bot uses its OpenAI-compatible `/models` endpoint when available and shows only that Provider's models. A switch keeps the previous model when the target supports it, otherwise selects the target's default model or its first returned model. Providers without a model-list endpoint remain usable: Agent Bot keeps the current or configured model as the single fallback candidate and lets Codex apply it. Agent Bot unloads only the selected idle thread, resumes it with the resolved Provider and model, and verifies both before saving settings or reporting success. A known fresh, empty thread may be replaced while keeping its task identity, title, and directory; forked or resumed tasks are not treated as empty merely because they have no new messages. If a switch fails, the previous settings are retained and remote recovery is attempted. If recovery also fails, further turns are blocked until a Provider switch succeeds.
+
+For TraeX's built-in `trae` Provider, Agent Bot uses the complete native `model/list` catalog, including model names and reasoning options, without requiring a custom Provider `base_url`. Other custom Providers keep their own model discovery and fallback behavior.
+
+If Provider model discovery fails, settings cards retain the fallback model but show the failure and warn that service availability is unconfirmed. A successful settings change verifies configuration, not a live inference request. App Server runtime errors and native retry notices update the existing progress card with the reason; retrying does not create another card or end the turn. The final turn notification still determines success, failure, or cancellation.
+
+Some Responses-compatible Providers omit assistant message phases. Their text stays in the progress timeline instead of being concatenated into a premature final answer. On successful completion, only the last unphased message not followed by a tool start becomes the final answer; explicit `commentary` and `final_answer` phases take precedence. Cards and Preview share this classification. Previously saved snapshots are not automatically rewritten.
 
 `feishu.groupNameFormat` defines separate name templates for new Project and Projectless groups, with variables for the operating system, Agent, project, task name, and date. See the [technical reference](docs/technical-reference.md#configuration-model) for the complete format.
 

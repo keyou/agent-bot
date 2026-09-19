@@ -19,6 +19,68 @@ function event(type: AgentEvent["type"], fields: Record<string, unknown>): Agent
 }
 
 describe("TurnStateReducer", () => {
+  test("moves repeated warnings to the latest activity without accumulating duplicates", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    state = reduceTurnEvent(state, event("turn_started", { startedAt: 1_000 }));
+    const activityId = "commentary:runtime-error:turn_1";
+    state = reduceTurnEvent(state, event("progress", { activityId, text: "Retry 1", severity: "warning" }));
+    state = reduceTurnEvent(state, event("progress", { activityId: "commentary:work", text: "Working again" }));
+    state = reduceTurnEvent(state, event("progress", { activityId, text: "Retry 2", severity: "warning", append: true }));
+    expect(state.status).toBe("running");
+    expect(state.activities).toEqual([
+      { kind: "assistant", id: "commentary:work", text: "Working again" },
+      { kind: "assistant", id: activityId, text: "Retry 2" },
+    ]);
+    state = reduceTurnEvent(state, event("progress", { activityId, text: "x".repeat(20_000), severity: "warning" }));
+    expect(state.activities?.at(-1)).toMatchObject({ text: expect.any(String) });
+    expect(JSON.stringify(state.activities?.at(-1)).length).toBeLessThan(7_000);
+    expect(state.activities).toHaveLength(2);
+  });
+
+  test("replaces streamed plan text without duplicating it or exposing a final answer", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    for (const text of ["## Plan\n", "Run tests"]) {
+      state = reduceTurnEvent(state, event("progress", { activityId: "commentary:plan:p1", text, append: true }));
+    }
+    state = reduceTurnEvent(state, event("progress", {
+      activityId: "commentary:plan:p1", text: "## Plan\nRun tests", append: false,
+    }));
+    expect(state.activities).toEqual([{ kind: "assistant", id: "commentary:plan:p1", text: "## Plan\nRun tests" }]);
+    expect(state.assistantText).toBe("");
+    expect(state.finalResponse).toBeUndefined();
+  });
+
+  test.each(["completed", "failed"] as const)("keeps approval pending through tool start, output, and %s updates", (status) => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    state = reduceTurnEvent(state, event("approval_requested", {
+      request: { id: "mode:thr_1:r1", kind: "mode_change", title: "Review plan", options: [] },
+    }));
+    for (const update of [
+      event("tool_started", { tool: tool("t1", "test", "running") }),
+      event("tool_updated", { tool: tool("t1", "test", "running") }),
+      event("tool_output_delta", { toolId: "t1", delta: "result" }),
+      event("tool_updated", { tool: tool("t1", "test", status) }),
+    ]) {
+      state = reduceTurnEvent(state, update);
+      expect(state.status).toBe("waiting_for_approval");
+      expect(state.approval?.id).toBe("mode:thr_1:r1");
+    }
+    expect(reduceTurnEvent(state, event("approval_resolved", { requestId: "other", decision: "accept" }))).toBe(state);
+    state = reduceTurnEvent(state, event("approval_resolved", { requestId: "mode:thr_1:r1", decision: "decline" }));
+    expect(state.status).toBe("running");
+    expect(state.approval).toBeUndefined();
+  });
+
+  test("restores running tool status after confirmation and ignores late responses after completion", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    state = reduceTurnEvent(state, event("tool_started", { tool: tool("t1", "test", "running") }));
+    state = reduceTurnEvent(state, event("approval_requested", { request: { id: "r1", title: "Review plan", options: [] } }));
+    state = reduceTurnEvent(state, event("approval_resolved", { requestId: "r1", decision: "accept" }));
+    expect(state.status).toBe("tool_running");
+    state = reduceTurnEvent(state, event("turn_completed", { finalResponse: "done", durationMs: 1_000 }));
+    expect(reduceTurnEvent(state, event("approval_resolved", { requestId: "r1", decision: "accept" }))).toBe(state);
+  });
+
   test("keeps the active tool visible and moves successful tools to bounded history", () => {
     let state = createTurnViewState("s1", "turn_1", 1_000);
     state = reduceTurnEvent(state, event("tool_started", { tool: tool("t1", "npm test", "running") }));
@@ -192,6 +254,65 @@ describe("TurnStateReducer", () => {
     expect(state.totalTokens).toBe(579);
     expect(state.tokenUsageCumulative).toBe(1_456);
     expect(state.latestContextTokens).toBe(121_000);
+  });
+
+  test("accumulates total and cached tokens for this turn, including after snapshot restore", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    const first = event("token_usage_updated", {
+      lastTokens: 2_445, cumulativeTokens: 9_265,
+      lastTotalTokens: 12_445, cumulativeTotalTokens: 99_265,
+      lastCachedTokens: 10_000, cumulativeCachedTokens: 90_000,
+    });
+    state = reduceTurnEvent(state, first);
+    state = reduceTurnEvent(state, first);
+    expect(state.totalTokensIncludingCache).toBe(12_445);
+    expect(state.cachedInputTokens).toBe(10_000);
+    state = JSON.parse(JSON.stringify(state)) as typeof state;
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 1_000, cumulativeTokens: 10_265,
+      lastTotalTokens: 5_000, cumulativeTotalTokens: 104_265,
+      lastCachedTokens: 4_000, cumulativeCachedTokens: 94_000,
+    }));
+    state = reduceTurnEvent(state, first);
+    state = reduceTurnEvent(state, event("token_usage_updated", {
+      lastTokens: 0, cumulativeTokens: 10_265, contextTokens: 2_000,
+      lastTotalTokens: 0, cumulativeTotalTokens: 104_265,
+      lastCachedTokens: 0, cumulativeCachedTokens: 94_000,
+    }));
+    expect(state).toMatchObject({
+      totalTokens: 3_445, totalTokensIncludingCache: 17_445, cachedInputTokens: 14_000,
+      tokenUsageTotalCumulative: 104_265, tokenUsageCachedCumulative: 94_000, latestContextTokens: 2_000,
+    });
+    expect(reduceTurnEvent(state, { ...first, turnId: "other" })).toBe(state);
+    const nextTurn = reduceTurnEvent(createTurnViewState("s1", "turn_2", 2_000), { ...first, turnId: "turn_2" });
+    expect(nextTurn.totalTokensIncludingCache).toBe(12_445);
+    expect(nextTurn.cachedInputTokens).toBe(10_000);
+  });
+
+  test("distinguishes zero cache hits from missing or incomplete turn breakdowns", () => {
+    const initial = createTurnViewState("s1", "turn_1", 1_000);
+    const legacy = event("token_usage_updated", { lastTokens: 25, cumulativeTokens: 100 });
+    const detailed = event("token_usage_updated", {
+      lastTokens: 25, cumulativeTokens: 125,
+      lastTotalTokens: 25, cumulativeTotalTokens: 225,
+      lastCachedTokens: 0, cumulativeCachedTokens: 100,
+    });
+    const known = reduceTurnEvent(initial, detailed);
+    expect(known).toMatchObject({ totalTokens: 25, totalTokensIncludingCache: 25, cachedInputTokens: 0 });
+    for (const missing of [reduceTurnEvent(initial, legacy), reduceTurnEvent(known, legacy)]) {
+      expect(missing.totalTokensIncludingCache).toBeUndefined();
+      expect(missing.cachedInputTokens).toBeUndefined();
+      const later = reduceTurnEvent(missing, detailed);
+      expect(later.totalTokensIncludingCache).toBeUndefined();
+      expect(later.cachedInputTokens).toBeUndefined();
+    }
+    for (const invalid of [NaN, Infinity, -1]) {
+      const result = reduceTurnEvent(initial, event("token_usage_updated", {
+        ...detailed, lastTotalTokens: invalid, lastCachedTokens: invalid,
+      }));
+      expect(result.totalTokensIncludingCache).toBeUndefined();
+      expect(result.cachedInputTokens).toBeUndefined();
+    }
   });
 
   test("tracks context compaction lifecycle and ignores duplicate completion notifications", () => {

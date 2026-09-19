@@ -2,6 +2,24 @@ import { describe, expect, test } from "vitest";
 import { mapCodexNotification } from "../../src/codex/CodexEventMapper.js";
 
 describe("mapCodexNotification", () => {
+  test.each([true, false])("maps runtime errors without losing willRetry=%s", (willRetry) => {
+    expect(mapCodexNotification("error", {
+      threadId: "thr_1", turnId: "turn_1", willRetry,
+      error: { message: "Connection refused", codexErrorInfo: "streamDisconnected", additionalDetails: null },
+    })).toEqual({
+      kind: "runtime_error", threadId: "thr_1", turnId: "turn_1", willRetry, message: "Connection refused",
+    });
+  });
+
+  test.each([
+    { error: null, willRetry: true },
+    { error: { message: " " }, willRetry: true },
+    { error: { message: "failed" }, willRetry: "true" },
+    { error: { message: "failed" } },
+  ])("ignores malformed runtime error notifications", (params) => {
+    expect(mapCodexNotification("error", { threadId: "thr_1", turnId: "turn_1", ...params })).toBeUndefined();
+  });
+
   test("preserves assistant message item ids and commentary phases", () => {
     expect(
       mapCodexNotification("item/started", {
@@ -30,6 +48,49 @@ describe("mapCodexNotification", () => {
       itemId: "message_1",
       text: "先检查官方文档",
     });
+  });
+
+  test.each(["plan", "default"])("maps %s mode confirmation notifications", (targetMode) => {
+    expect(mapCodexNotification("mode/changeRequested", {
+      threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode,
+      sourceToolCallId: null, reason: "Review the plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
+    })).toEqual({
+      kind: "mode_change_requested", threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode,
+      reason: "Review the plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
+    });
+    for (const decision of ["approved", "rejected", "cancelled"]) {
+      expect(mapCodexNotification("mode/changeResolved", {
+        threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode, decision,
+      })).toEqual({
+        kind: "mode_change_resolved", threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode, decision,
+      });
+    }
+  });
+
+  test("validates mode confirmation payloads without requiring allowed prompts", () => {
+    const params = { threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode: "default", reason: "" };
+    expect(mapCodexNotification("mode/changeRequested", params)?.kind).toBe("mode_change_requested");
+    for (const invalid of [
+      { requestId: "" }, { targetMode: "unknown" }, { reason: null }, { allowedPrompts: [{}] },
+      { threadId: undefined }, { turnId: undefined },
+    ]) {
+      expect(mapCodexNotification("mode/changeRequested", { ...params, ...invalid })).toBeUndefined();
+    }
+    expect(mapCodexNotification("mode/changeResolved", { ...params, decision: "accept" })).toBeUndefined();
+    expect(mapCodexNotification("mode/change/requested", params)).toBeUndefined();
+  });
+
+  test("streams plan text and replaces it on completion using the same activity", () => {
+    const params = { threadId: "thr_1", turnId: "turn_1" };
+    expect(mapCodexNotification("item/plan/delta", { ...params, itemId: "plan_1", delta: "## Plan\n" })).toEqual({
+      kind: "progress", ...params, activityId: "commentary:plan:plan_1", text: "## Plan\n", append: true,
+    });
+    expect(mapCodexNotification("item/completed", { ...params, item: { type: "plan", id: "plan_1", text: "## Plan\nRun tests" } })).toEqual({
+      kind: "progress", ...params, activityId: "commentary:plan:plan_1", text: "## Plan\nRun tests", append: false,
+    });
+    expect(mapCodexNotification("item/started", { ...params, item: { type: "plan", id: "plan_1", text: "" } })).toBeUndefined();
+    expect(mapCodexNotification("item/plan/delta", { ...params, delta: "missing id" })).toBeUndefined();
+    expect(mapCodexNotification("item/completed", { ...params, item: { type: "plan", id: "plan_1" } })).toBeUndefined();
   });
 
   test("maps plan updates", () => {
@@ -70,7 +131,28 @@ describe("mapCodexNotification", () => {
       turnId: "turn_1",
       lastTokens: 2_445,
       cumulativeTokens: 9_265,
+      lastTotalTokens: 12_445,
+      cumulativeTotalTokens: 99_265,
+      lastCachedTokens: 10_000,
+      cumulativeCachedTokens: 90_000,
       contextTokens: 12_445,
+    });
+  });
+
+  test.each([
+    [{ inputTokens: 20, outputTokens: 5, cachedInputTokens: 0 }, 25, 0],
+    [{ totalTokens: 30 }, 30, undefined],
+    [{ inputTokens: 20, outputTokens: 5 }, 25, undefined],
+    [{ inputTokens: 20 }, undefined, undefined],
+    [{ totalTokens: 25, cachedInputTokens: -1 }, 25, undefined],
+    [{ totalTokens: 25, cachedInputTokens: NaN }, 25, undefined],
+    [{ totalTokens: Infinity }, undefined, undefined],
+  ])("preserves reported totals without inventing missing cache data: %j", (usage, total, cached) => {
+    expect(mapCodexNotification("thread/tokenUsage/updated", {
+      threadId: "thr_1", turnId: "turn_1", tokenUsage: { last: usage, total: usage },
+    })).toMatchObject({
+      kind: "token_usage", lastTotalTokens: total, cumulativeTotalTokens: total,
+      lastCachedTokens: cached, cumulativeCachedTokens: cached,
     });
   });
 
@@ -148,6 +230,43 @@ describe("mapCodexNotification", () => {
         output: "11 passed",
       }),
     });
+  });
+
+  test.each(["item/started", "item/completed"])("includes Read and Grep targets in %s", (method) => {
+    for (const [command, commandActions, expected] of [
+      ["Read", [{ type: "read", path: "D:\\dev\\agent bot\\src\\file.ts", name: "file.ts" }], "Read D:\\dev\\agent bot\\src\\file.ts"],
+      ["Grep", [{ type: "search", query: "tool\\.command|title", path: "src/codex" }], 'Grep "tool\\\\.command|title" · src/codex'],
+      ["Read", [{ type: "read", name: "README.md" }], "Read README.md"],
+      ["Grep", [{ type: "search", query: "" }], 'Grep ""'],
+      ["Grep", [{ type: "search", path: "src" }], "Grep src"],
+      ["Read", [{ type: "read", path: "a.ts" }, { type: "read", path: "b.ts" }], "Read a.ts\nRead b.ts"],
+    ] as const) {
+      expect(mapCodexNotification(method, {
+        threadId: "thr_1", turnId: "turn_1",
+        item: { id: "item_1", type: "commandExecution", command, commandActions },
+      })).toMatchObject({
+        kind: "tool", phase: method === "item/started" ? "started" : "updated",
+        tool: { title: expected, command: expected, status: method === "item/started" ? "running" : "completed" },
+      });
+    }
+  });
+
+  test.each([
+    ["Read", undefined],
+    ["Read", []],
+    ["Read", { type: "read", path: "file.ts" }],
+    ["Read", [null, { type: "read", path: 42 }, { type: "search", path: "src" }]],
+    ["Grep", [{ type: "search", query: null, path: " " }]],
+    ["OtherTool", [{ type: "read", path: "file.ts" }]],
+    ["Get-Content src/file.ts", [{ type: "read", path: "D:\\dev\\src\\file.ts" }]],
+    ['rg "pattern" src', [{ type: "search", query: "pattern", path: "src" }]],
+    ['pwsh -Command "Get-Content src/file.ts"', [{ type: "read", path: "src/file.ts" }]],
+    ["Read src/file.ts", [{ type: "read", path: "src/file.ts" }]],
+  ])("preserves %s when the command is complete or targets are unavailable", (command, commandActions) => {
+    expect(mapCodexNotification("item/completed", {
+      threadId: "thr_1", turnId: "turn_1",
+      item: { id: "item_1", type: "commandExecution", command, commandActions },
+    })).toMatchObject({ kind: "tool", tool: { title: command, command } });
   });
 
   test("maps command output deltas without marking the tool complete", () => {

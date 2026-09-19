@@ -93,6 +93,13 @@ export class SafeRestartScheduler {
     return this.cancelScheduled(this.scheduleId);
   }
 
+  async forceScheduled(expectedScheduleId: number): Promise<boolean> {
+    const reason = this.reason;
+    if (!reason || this.scheduleId !== expectedScheduleId) return false;
+    await this.restart(reason, expectedScheduleId, this.options.readActivity());
+    return true;
+  }
+
   async cancelScheduled(expectedScheduleId: number): Promise<boolean> {
     const reason = this.reason;
     if (!reason || this.scheduleId !== expectedScheduleId) return false;

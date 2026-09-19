@@ -37,6 +37,10 @@ export interface TurnViewState {
   durationMs?: number;
   totalTokens?: number;
   tokenUsageCumulative?: number;
+  totalTokensIncludingCache?: number;
+  cachedInputTokens?: number;
+  tokenUsageTotalCumulative?: number;
+  tokenUsageCachedCumulative?: number;
   contextCompactionStatus?: "running" | "completed";
   contextCompactionCount?: number;
   contextCompactionId?: string;

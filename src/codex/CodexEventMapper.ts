@@ -1,13 +1,31 @@
+import { z } from "zod";
 import type { PlanStep, ToolState } from "../runtime/types.js";
+
+const modeChangeRequest = z.object({
+  requestId: z.string().min(1),
+  targetMode: z.enum(["plan", "default"]),
+  reason: z.string(),
+  allowedPrompts: z.array(z.object({ tool: z.string(), prompt: z.string() })).optional(),
+});
+const modeChangeResolution = z.object({
+  requestId: z.string().min(1),
+  targetMode: z.enum(["plan", "default"]),
+  decision: z.enum(["approved", "rejected", "cancelled"]),
+});
 
 export type MappedCodexNotification =
   | { kind: "turn_started"; threadId: string; turnId: string; startedAt?: number }
+  | { kind: "runtime_error"; threadId: string; turnId: string; message: string; willRetry: boolean }
   | {
       kind: "token_usage";
       threadId: string;
       turnId: string;
       lastTokens: number;
       cumulativeTokens: number;
+      lastTotalTokens?: number;
+      cumulativeTotalTokens?: number;
+      lastCachedTokens?: number;
+      cumulativeCachedTokens?: number;
       contextTokens?: number;
     }
   | {
@@ -32,8 +50,10 @@ export type MappedCodexNotification =
       turnId: string;
       activityId: string;
       text: string;
-      append: true;
+      append: boolean;
     }
+  | ({ kind: "mode_change_requested"; threadId: string; turnId: string } & z.infer<typeof modeChangeRequest>)
+  | ({ kind: "mode_change_resolved"; threadId: string; turnId: string } & z.infer<typeof modeChangeResolution>)
   | { kind: "plan"; threadId: string; turnId: string; steps: PlanStep[] }
   | { kind: "tool"; phase: "started" | "updated"; threadId: string; turnId: string; tool: ToolState }
   | { kind: "tool_output_delta"; threadId: string; turnId: string; toolId: string; delta: string }
@@ -51,6 +71,28 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
   const threadId = stringValue(params.threadId);
   const turnId = stringValue(params.turnId) ?? (isRecord(params.turn) ? stringValue(params.turn.id) : undefined);
   if (!threadId || !turnId) return undefined;
+
+  if (method === "error" && isRecord(params.error)) {
+    const message = stringValue(params.error.message)?.trim();
+    if (!message || typeof params.willRetry !== "boolean") return undefined;
+    return { kind: "runtime_error", threadId, turnId, message, willRetry: params.willRetry };
+  }
+
+  if (method === "mode/changeRequested") {
+    const parsed = modeChangeRequest.safeParse(params);
+    return parsed.success ? { kind: "mode_change_requested", threadId, turnId, ...parsed.data } : undefined;
+  }
+  if (method === "mode/changeResolved") {
+    const parsed = modeChangeResolution.safeParse(params);
+    return parsed.success ? { kind: "mode_change_resolved", threadId, turnId, ...parsed.data } : undefined;
+  }
+  if (method === "item/plan/delta") {
+    const text = stringValue(params.delta);
+    const itemId = stringValue(params.itemId);
+    return text === undefined || !itemId ? undefined : {
+      kind: "progress", threadId, turnId, activityId: `commentary:plan:${itemId}`, text, append: true,
+    };
+  }
 
   if (method === "turn/started") {
     return {
@@ -76,6 +118,10 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
       turnId,
       lastTokens,
       cumulativeTokens,
+      lastTotalTokens: totalTokenCount(params.tokenUsage.last),
+      cumulativeTotalTokens: totalTokenCount(params.tokenUsage.total),
+      lastCachedTokens: reportedTokenCount(params.tokenUsage.last.cachedInputTokens),
+      cumulativeCachedTokens: reportedTokenCount(params.tokenUsage.total.cachedInputTokens),
       contextTokens: numberValue(params.tokenUsage.last.totalTokens),
     };
   }
@@ -118,6 +164,12 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
     return { kind: "plan", threadId, turnId, steps };
   }
   if ((method === "item/started" || method === "item/completed") && isRecord(params.item)) {
+    if (params.item.type === "plan") {
+      const itemId = stringValue(params.item.id);
+      const text = stringValue(params.item.text);
+      if (method !== "item/completed" || !itemId || text === undefined) return undefined;
+      return { kind: "progress", threadId, turnId, activityId: `commentary:plan:${itemId}`, text, append: false };
+    }
     if (params.item.type === "contextCompaction") {
       return {
         kind: "context_compaction",
@@ -172,7 +224,7 @@ function mapTool(
   if (!id || !type) return undefined;
   const status = mapToolStatus(item.status, phase);
   if (type === "commandExecution") {
-    const command = stringValue(item.command) ?? "Command";
+    const command = commandWithTargets(item);
     return {
       id,
       title: command,
@@ -245,6 +297,27 @@ function mapTool(
     };
   }
   return undefined;
+}
+
+function commandWithTargets(item: Record<string, unknown>): string {
+  const command = stringValue(item.command) ?? "Command";
+  if ((command !== "Read" && command !== "Grep") || !Array.isArray(item.commandActions)) return command;
+  const commands = item.commandActions.flatMap((action: unknown) => {
+    if (!isRecord(action)) return [];
+    if (command === "Read" && action.type === "read") {
+      const target = nonEmptyString(action.path) ?? nonEmptyString(action.name);
+      return target ? [`${command} ${target}`] : [];
+    }
+    if (command === "Grep" && action.type === "search") {
+      const query = stringValue(action.query);
+      const target = nonEmptyString(action.path);
+      const parts = [query === undefined ? undefined : JSON.stringify(query), target]
+        .filter((part): part is string => part !== undefined);
+      return parts.length ? [`${command} ${parts.join(" · ")}`] : [];
+    }
+    return [];
+  });
+  return commands.length ? commands.join("\n") : command;
 }
 
 function mapWebSearchTool(
@@ -377,6 +450,18 @@ function effectiveTokenCount(usage: Record<string, unknown>): number | undefined
     return Math.max(0, (inputTokens ?? 0) - cachedInputTokens) + Math.max(0, outputTokens ?? 0);
   }
   return numberValue(usage.totalTokens);
+}
+
+function reportedTokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function totalTokenCount(usage: Record<string, unknown>): number | undefined {
+  const reported = reportedTokenCount(usage.totalTokens);
+  if (reported !== undefined) return reported;
+  const input = reportedTokenCount(usage.inputTokens);
+  const output = reportedTokenCount(usage.outputTokens);
+  return input === undefined || output === undefined ? undefined : input + output;
 }
 
 function secondsToMilliseconds(value: number | undefined): number | undefined {

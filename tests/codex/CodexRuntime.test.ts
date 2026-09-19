@@ -8,6 +8,137 @@ import { CodexRuntime, type AppServerClientProvider } from "../../src/codex/Code
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
 
 describe("CodexRuntime", () => {
+  test.each(["notification", "snapshot"])("separates unphased progress from the final answer through %s", async (completion) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    const turnId = await runtime.startTurn("s1", "continue");
+    const delta = (itemId: string, text: string) => client.emit("item/agentMessage/delta", {
+      threadId: "thr_1", turnId, itemId, delta: text,
+    });
+    client.emit("item/started", { threadId: "thr_1", turnId, item: { type: "agentMessage", id: "progress", phase: null } });
+    delta("progress", "I will inspect ");
+    delta("progress", "the code.");
+    client.emit("item/started", { threadId: "thr_1", turnId,
+      item: { type: "commandExecution", id: "tool", command: "git status", status: "inProgress" } });
+    delta("update", "Checking the result.");
+    delta("answer", "Final ");
+    delta("answer", "answer.");
+    expect(events.filter((event) => event.type === "agent_text_delta")).toHaveLength(0);
+    expect(events.filter((event) => event.type === "progress").map((event) => event.activityId))
+      .toEqual(["commentary:progress", "commentary:progress", "commentary:update", "commentary:answer", "commentary:answer"]);
+    if (completion === "snapshot") {
+      client.readResult = { thread: { id: "thr_1", status: { type: "idle" }, turns: [{ id: turnId, status: "completed", items: [
+        { type: "agentMessage", id: "progress", phase: null, text: "I will inspect the code." },
+        { type: "commandExecution", id: "tool" },
+        { type: "agentMessage", id: "answer", phase: null, text: "Final answer." },
+      ] }] } };
+      await runtime.synchronizeSession("s1");
+    } else {
+      client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status: "completed" } });
+    }
+    expect(events.filter((event) => event.type === "agent_text_delta")).toEqual([{
+      type: "agent_text_delta", sessionId: "s1", turnId, text: "Final answer.", replacesActivityId: "commentary:answer",
+    }]);
+    expect(events.at(-1)).toMatchObject({ type: "turn_completed", finalResponse: "Final answer." });
+  });
+
+  test.each(["commentary", "final_answer"])("honors a late %s phase without duplicating streamed text", async (phase) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    const turnId = await runtime.startTurn("s1", "hello");
+    client.emit("item/agentMessage/delta", { threadId: "thr_1", turnId, itemId: "message", delta: "hello" });
+    for (let i = 0; i < 2; i++) client.emit("item/completed", {
+      threadId: "thr_1", turnId, item: { type: "agentMessage", id: "message", phase, text: "hello" },
+    });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status: "completed" } });
+    expect(events.at(-1)).toMatchObject({ type: "turn_completed", finalResponse: phase === "final_answer" ? "hello" : "" });
+    expect(events.filter((event) => event.type === "agent_text_delta")).toHaveLength(phase === "final_answer" ? 1 : 0);
+  });
+
+  test.each(["completed", "failed", "interrupted"])("does not deliver pre-tool commentary as a %s turn's answer", async (status) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    const turnId = await runtime.startTurn("s1", "hello");
+    client.emit("item/agentMessage/delta", { threadId: "thr_1", turnId, itemId: "message", delta: "Inspecting" });
+    client.emit("item/started", { threadId: "thr_1", turnId,
+      item: { type: "commandExecution", id: "tool", command: "git status", status: "inProgress" } });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status } });
+    expect(events.filter((event) => event.type === "agent_text_delta")).toHaveLength(0);
+    if (status === "completed") expect(events.at(-1)).toMatchObject({ type: "turn_completed", finalResponse: "" });
+  });
+
+  test.each(["completed", "failed"])("shows retry errors without terminating before %s", async (status) => {
+    const client = new FakeAppServerClient();
+    const log = logger();
+    const runtime = new CodexRuntime(provider(client), log);
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    const turnId = await runtime.startTurn("s1", "hello");
+    const error = { message: "Connection refused" };
+    client.emit("error", { threadId: "unrelated", turnId, error, willRetry: true });
+    expect(events.filter((event) => event.type === "progress")).toHaveLength(0);
+    for (const willRetry of [true, true, false]) {
+      client.emit("error", { threadId: "thr_1", turnId, error, willRetry });
+      expect(runtime.getSession("s1")?.activeTurnId).toBe(turnId);
+      expect(events.at(-1)).toMatchObject({
+        type: "progress", sessionId: "s1", turnId, severity: "warning", append: false,
+        activityId: `commentary:runtime-error:${turnId}`,
+        text: expect.stringContaining(willRetry ? "正在重试" : "等待 Agent 返回最终状态"),
+      });
+    }
+    expect(events.some((event) => event.type === "turn_failed" || event.type === "turn_completed")).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ turnId, willRetry: true, error: error.message }),
+      "App Server reported a turn error.");
+    client.emit("item/agentMessage/delta", { threadId: "thr_1", turnId, itemId: "answer", delta: "Recovered" });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status, error: status === "failed" ? error : null } });
+    expect(runtime.getSession("s1")?.activeTurnId).toBeUndefined();
+    expect(events.at(-1)).toMatchObject(status === "failed"
+      ? { type: "turn_failed", message: error.message }
+      : { type: "turn_completed", finalResponse: "Recovered" });
+    const count = events.length;
+    client.emit("error", { threadId: "thr_1", turnId, error, willRetry: true });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status, error } });
+    expect(events).toHaveLength(count);
+  });
+
+  test.each(["network", "401", "404", "503"])("keeps model fallback warnings visible for %s failures", async (failure) => {
+    const client = new FakeAppServerClient();
+    client.configResult = { config: { model_providers: { custom: { base_url: "https://provider.example/v1" } } } };
+    const fetchMock = vi.fn(async () => {
+      if (failure === "network") throw new TypeError("fetch failed");
+      return new Response("failed", { status: Number(failure) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const runtime = new CodexRuntime(provider(client), logger());
+      const result = await runtime.listModelsWithStatus("custom", "current");
+      expect(result.models.map((model) => model.id)).toEqual(["current"]);
+      expect(result.warning).toContain("服务可用性未确认");
+      expect(result.warning).toContain(failure === "network" ? "无法连接" : failure);
+      const catalog = client.modelListResult;
+      client.modelListResult = { data: [] };
+      await expect(runtime.listModelsWithStatus("custom")).rejects.toThrow();
+      client.modelListResult = catalog;
+      fetchMock.mockImplementation(async () => new Response(JSON.stringify({ data: [{ id: "online" }] })));
+      expect(await runtime.listModelsWithStatus("custom", "current")).toEqual({
+        models: [expect.objectContaining({ id: "online" })],
+      });
+      expect((await runtime.listModelsWithStatus("openai")).warning).toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   test("treats a new unmaterialized task as empty without masking pagination failures", async () => {
     const client = new FakeAppServerClient();
     const runtime = new CodexRuntime(provider(client), logger());
@@ -548,6 +679,10 @@ describe("CodexRuntime", () => {
     expect(client.requests.find((request) => request.method === "turn/start")?.params).toEqual(
       expect.objectContaining({ effort: "medium", summary: "auto" }),
     );
+    client.emit("item/started", {
+      threadId: "thr_1", turnId,
+      item: { type: "agentMessage", id: "item_1", phase: "final_answer" },
+    });
     client.emit("item/agentMessage/delta", {
       threadId: "thr_1",
       turnId,
@@ -600,6 +735,10 @@ describe("CodexRuntime", () => {
       turnId,
       lastTokens: 2_445,
       cumulativeTokens: 9_265,
+      lastTotalTokens: 12_445,
+      cumulativeTotalTokens: 99_265,
+      lastCachedTokens: 10_000,
+      cumulativeCachedTokens: 90_000,
       contextTokens: 12_445,
     });
     expect(events).toContainEqual({
@@ -994,12 +1133,49 @@ describe("CodexRuntime", () => {
     ]);
   });
 
-  test("lists only models returned by the selected custom Provider", async () => {
+  test.each([
+    ["traex", "trae"], ["traex", " trae "], ["traex", undefined], ["codex", "openai"],
+  ] as const)("uses the complete native catalog for %s Provider %s", async (family, modelProvider) => {
+    const client = new FakeAppServerClient();
+    client.configResult = { config: { model_provider: null, model_providers: {} } };
+    client.modelListResult = { data: [
+      { id: "first-model", displayName: "First Model", isDefault: true },
+      {
+        id: "current-model", displayName: "Current Model", isDefault: false,
+        supportedReasoningEfforts: [{ reasoningEffort: "high", description: "Thorough" }],
+        defaultReasoningEffort: "high",
+      },
+      { id: "other-model", displayName: "Other Model", isDefault: false },
+    ] };
+    const log = logger();
+    const runtime = new CodexRuntime({ ...provider(client), getAgentFamily: () => family }, log);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const models = await runtime.listModels(modelProvider, "current-model");
+      expect(models.map((model) => model.id)).toEqual(["first-model", "current-model", "other-model"]);
+      expect(models[0]).toMatchObject({ displayName: "First Model", isDefault: true });
+      expect(models[1]).toMatchObject({
+        displayName: "Current Model", isDefault: false, defaultReasoningEffort: "high",
+        supportedReasoningEfforts: [{ value: "high", description: "Thorough" }],
+      });
+      expect(client.requests).toEqual([{ method: "model/list", params: {} }]);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(log.warn).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      runtime.close();
+    }
+  });
+
+  test.each([
+    ["codex", "azure"], ["traex", "azure"], ["traex", "openai"], ["codex", "trae"],
+  ] as const)("lists only models returned by %s custom Provider %s", async (family, providerId) => {
     const client = new FakeAppServerClient();
     client.configResult = {
       config: {
         model_providers: {
-          azure: { name: "Azure OpenAI", base_url: "https://azure.example/v1", env_key: "AZURE_TOKEN" },
+          [providerId]: { name: "Azure OpenAI", base_url: "https://azure.example/v1", env_key: "AZURE_TOKEN" },
         },
       },
     };
@@ -1010,11 +1186,11 @@ describe("CodexRuntime", () => {
     try {
       const runtime = new CodexRuntime({
         ...provider(client),
-        getAgentFamily: () => "codex",
+        getAgentFamily: () => family,
         getEnvironmentVariable: (name) => name === "AZURE_TOKEN" ? "azure-secret" : undefined,
       }, logger());
 
-      await expect(runtime.listModels("azure")).resolves.toEqual([{
+      await expect(runtime.listModels(providerId)).resolves.toEqual([{
         id: "azure-only",
         isDefault: true,
         supportedReasoningEfforts: [],
@@ -1028,7 +1204,7 @@ describe("CodexRuntime", () => {
     }
   });
 
-  test("keeps a custom Provider usable when it does not expose a model list", async () => {
+  test.each(["codex", "traex"] as const)("keeps a custom Provider on %s usable without a model list", async (family) => {
     const client = new FakeAppServerClient();
     client.configResult = {
       config: {
@@ -1041,7 +1217,7 @@ describe("CodexRuntime", () => {
     try {
       const runtime = new CodexRuntime({
         ...provider(client),
-        getAgentFamily: () => "codex",
+        getAgentFamily: () => family,
       }, logger());
 
       await expect(runtime.listModels("single", "single-default")).resolves.toEqual([{
@@ -2165,6 +2341,146 @@ describe("Provider switching", () => {
   });
 });
 
+describe("CodexRuntime mode confirmations", () => {
+  const requestId = "mode:thr_1:request_1";
+  const notification = {
+    threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode: "default",
+    reason: "Review the implementation plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
+  };
+
+  async function setup() {
+    const client = new FakeAppServerClient();
+    let disconnect: ((error: Error) => void) | undefined;
+    const runtime = new CodexRuntime({
+      ...provider(client),
+      onDisconnect: (listener) => { disconnect = listener; return () => { disconnect = undefined; }; },
+    }, logger());
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await runtime.createSession({ localSessionId: "s1", agentName: "traex", cwd: process.cwd(), permissionMode: "auto" });
+    await runtime.startTurn("s1", "create a plan");
+    events.length = 0;
+    return { client, runtime, events, disconnect: () => disconnect?.(new Error("process exited")) };
+  }
+
+  test.each(["plan", "default"])("requires explicit confirmation for %s even with automatic permissions", async (targetMode) => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", { ...notification, targetMode });
+    client.emit("mode/changeRequested", { ...notification, targetMode });
+    expect(events).toEqual([{
+      type: "approval_requested", sessionId: "s1", turnId: "turn_1",
+      request: {
+        id: requestId, kind: "mode_change",
+        title: targetMode === "default" ? "确认方案并开始执行" : "确认进入规划模式",
+        reason: "Review the implementation plan\n- PowerShell: run tests",
+        options: [
+          { id: "accept", label: targetMode === "default" ? "Approve Plan" : "Enter Plan Mode" },
+          { id: "decline", label: "Reject" }, { id: "cancel", label: "Cancel Request" },
+        ],
+      },
+    }]);
+    expect(client.requests.some((entry) => entry.method === "mode/change/respond")).toBe(false);
+    expect(runtime.getSession("s1")?.activeTurnId).toBe("turn_1");
+    runtime.close();
+  });
+
+  test.each([
+    ["accept", "approved"], ["decline", "rejected"], ["cancel", "cancelled"],
+  ] as const)("sends %s as %s without completing the turn", async (decision, remoteDecision) => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", notification);
+    await runtime.respondToApproval("s1", requestId, decision);
+    expect(client.requests.at(-1)).toEqual({
+      method: "mode/change/respond", params: { threadId: "thr_1", requestId: "request_1", decision: remoteDecision },
+    });
+    expect(events.at(-1)).toEqual({ type: "approval_resolved", sessionId: "s1", turnId: "turn_1", requestId, decision });
+    expect(runtime.getSession("s1")?.activeTurnId).toBe("turn_1");
+    client.emit("mode/changeRequested", notification);
+    expect(events.filter((event) => event.type === "approval_requested")).toHaveLength(1);
+    await expect(runtime.respondToApproval("s1", requestId, decision)).rejects.toThrow("no longer pending");
+    runtime.close();
+  });
+
+  test("rejects incorrect sessions and unsupported decisions while retaining the request", async () => {
+    const { client, runtime } = await setup();
+    client.emit("mode/changeRequested", notification);
+    await expect(runtime.respondToApproval("s2", requestId, "accept")).rejects.toThrow("no longer pending");
+    await expect(runtime.respondToApproval("s1", requestId, "acceptForSession")).rejects.toThrow("Invalid mode change decision");
+    expect(client.requests.some((entry) => entry.method === "mode/change/respond")).toBe(false);
+    await runtime.respondToApproval("s1", requestId, "decline");
+    runtime.close();
+  });
+
+  test("retains failed confirmations for retry and blocks concurrent responses", async () => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", notification);
+    let fail: ((error: Error) => void) | undefined;
+    client.modeChangeResponse = () => new Promise<void>((_resolve, reject) => { fail = reject; });
+    const response = runtime.respondToApproval("s1", requestId, "accept");
+    const rejected = expect(response).rejects.toThrow("transport failed");
+    await vi.waitFor(() => expect(fail).toBeDefined());
+    await expect(runtime.respondToApproval("s1", requestId, "accept")).rejects.toThrow("already in progress");
+    fail?.(new Error("transport failed"));
+    await rejected;
+    expect(events.filter((event) => event.type === "approval_resolved")).toHaveLength(0);
+    client.modeChangeResponse = undefined;
+    await runtime.respondToApproval("s1", requestId, "accept");
+    expect(events.filter((event) => event.type === "approval_resolved")).toHaveLength(1);
+    runtime.close();
+  });
+
+  test.each([
+    ["approved", "accept"], ["rejected", "decline"], ["cancelled", "cancel"],
+  ] as const)("handles a remote %s resolution once", async (decision, localDecision) => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", notification);
+    client.emit("mode/changeResolved", { ...notification, targetMode: "plan", decision });
+    client.emit("mode/changeResolved", { ...notification, requestId: "unrelated", decision });
+    expect(events.filter((event) => event.type === "approval_resolved")).toHaveLength(0);
+    client.emit("mode/changeResolved", { ...notification, decision });
+    client.emit("mode/changeResolved", { ...notification, decision });
+    expect(events.filter((event) => event.type === "approval_resolved")).toEqual([{
+      type: "approval_resolved", sessionId: "s1", turnId: "turn_1", requestId, decision: localDecision,
+    }]);
+    await expect(runtime.respondToApproval("s1", requestId, "accept")).rejects.toThrow("no longer pending");
+    runtime.close();
+  });
+
+  test("does not resolve twice when the remote notification precedes the response", async () => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", notification);
+    client.modeChangeResponse = async () => { client.emit("mode/changeResolved", { ...notification, decision: "approved" }); };
+    await runtime.respondToApproval("s1", requestId, "accept");
+    expect(events.filter((event) => event.type === "approval_resolved")).toHaveLength(1);
+    runtime.close();
+  });
+
+  test.each(["completed", "interrupted", "failed", "disconnect", "close"])("clears pending confirmations on %s", async (status) => {
+    const { client, runtime, disconnect } = await setup();
+    client.emit("mode/changeRequested", notification);
+    if (status === "disconnect") disconnect();
+    else if (status === "close") runtime.close();
+    else client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status } });
+    client.emit("mode/changeRequested", notification);
+    await expect(runtime.respondToApproval("s1", requestId, "accept")).rejects.toThrow("no longer pending");
+    expect(client.requests.some((entry) => entry.method === "mode/change/respond")).toBe(false);
+    runtime.close();
+  });
+
+  test("keeps plan text in progress rather than the final answer", async () => {
+    const { client, runtime, events } = await setup();
+    client.emit("item/plan/delta", { threadId: "thr_1", turnId: "turn_1", itemId: "plan_1", delta: "Review" });
+    client.emit("item/completed", { threadId: "thr_1", turnId: "turn_1", item: { id: "plan_1", type: "plan", text: "Review and test" } });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+    expect(events.filter((event) => event.type === "progress")).toEqual([
+      { type: "progress", sessionId: "s1", turnId: "turn_1", activityId: "commentary:plan:plan_1", text: "Review", append: true },
+      { type: "progress", sessionId: "s1", turnId: "turn_1", activityId: "commentary:plan:plan_1", text: "Review and test", append: false },
+    ]);
+    expect(events).toContainEqual(expect.objectContaining({ type: "turn_completed", finalResponse: "" }));
+    runtime.close();
+  });
+});
+
 class FakeAppServerClient {
   requests: Array<{ method: string; params: unknown }> = [];
   timeouts: Array<{ method: string; timeoutMs: number | undefined }> = [];
@@ -2182,7 +2498,18 @@ class FakeAppServerClient {
   listResult: unknown = { data: [], nextCursor: null };
   listErrors: Error[] = [];
   turnStartErrors: Error[] = [];
+  modeChangeResponse?: () => Promise<void>;
   configResult: unknown = { config: { model_provider: "openai", model_providers: {} } };
+  modelListResult: unknown = { data: [{
+    id: "gpt-test",
+    displayName: "GPT Test",
+    isDefault: true,
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "Fast" },
+      { reasoningEffort: "medium", description: "Balanced" },
+    ],
+    defaultReasoningEffort: "medium",
+  }] };
   goalResult: RuntimeGoal | null = null;
   private notificationListener?: (method: string, params: unknown) => void;
   private readonly requestHandlers = new Map<
@@ -2193,6 +2520,10 @@ class FakeAppServerClient {
   async request<T>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
     this.requests.push({ method, params });
     this.timeouts.push({ method, timeoutMs });
+    if (method === "mode/change/respond") {
+      await this.modeChangeResponse?.();
+      return {} as T;
+    }
     if (method === "thread/start") return this.startResult as T;
     if (method === "thread/resume") {
       const result = this.resumeResults.shift() ?? this.resumeResult;
@@ -2250,16 +2581,7 @@ class FakeAppServerClient {
       if (error) throw error;
       return { turn: { id: "turn_1", status: "inProgress" } } as T;
     }
-    if (method === "model/list") return { data: [{
-      id: "gpt-test",
-      displayName: "GPT Test",
-      isDefault: true,
-      supportedReasoningEfforts: [
-        { reasoningEffort: "low", description: "Fast" },
-        { reasoningEffort: "medium", description: "Balanced" },
-      ],
-      defaultReasoningEffort: "medium",
-    }] } as T;
+    if (method === "model/list") return this.modelListResult as T;
     return {} as T;
   }
 

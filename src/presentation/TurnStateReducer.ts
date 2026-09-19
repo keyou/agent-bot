@@ -53,7 +53,14 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
     case "turn_started":
       return { ...state, status: "running", startedAt: event.startedAt };
     case "agent_text_delta":
-      return { ...state, assistantText: bound(`${state.assistantText}${event.text}`) };
+      return {
+        ...state,
+        assistantText: bound(`${state.assistantText}${event.text}`),
+        ...(event.replacesActivityId ? {
+          activities: (state.activities ?? []).filter((activity) => activity.id !== event.replacesActivityId),
+          progressText: undefined,
+        } : {}),
+      };
     case "token_usage_updated": {
       const lastTokens = normalizeTokenCount(event.lastTokens);
       const cumulativeTokens = normalizeTokenCount(event.cumulativeTokens);
@@ -61,10 +68,22 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
       const delta = previousCumulative === undefined
         ? lastTokens
         : Math.max(0, cumulativeTokens - previousCumulative);
+      const total = accumulateReportedTokens(
+        event.lastTotalTokens, event.cumulativeTotalTokens,
+        state.totalTokensIncludingCache, state.tokenUsageTotalCumulative, previousCumulative !== undefined,
+      );
+      const cached = accumulateReportedTokens(
+        event.lastCachedTokens, event.cumulativeCachedTokens,
+        state.cachedInputTokens, state.tokenUsageCachedCumulative, previousCumulative !== undefined,
+      );
       return {
         ...state,
         totalTokens: (state.totalTokens ?? 0) + delta,
         tokenUsageCumulative: Math.max(previousCumulative ?? 0, cumulativeTokens),
+        totalTokensIncludingCache: total.value,
+        tokenUsageTotalCumulative: total.cumulative,
+        cachedInputTokens: cached.value,
+        tokenUsageCachedCumulative: cached.cumulative,
         latestContextTokens: event.contextTokens === undefined
           ? state.latestContextTokens
           : normalizeTokenCount(event.contextTokens),
@@ -155,11 +174,13 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
       };
     }
     case "progress": {
+      const activities = state.activities ?? [];
+      const warning = event.severity === "warning";
       const activityUpdate = upsertReasoningActivity(
-        state.activities ?? [],
+        warning ? activities.filter((activity) => activity.id !== (event.activityId ?? "progress")) : activities,
         event.activityId ?? "progress",
-        event.text,
-        event.append === true,
+        warning ? bound(event.text) : event.text,
+        !warning && event.append === true,
         event.activityId?.startsWith("commentary:") ? "assistant" : "reasoning",
       );
       return {
@@ -179,7 +200,7 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
       return {
         ...state,
         ...tracking,
-        status: "tool_running",
+        status: state.approval ? "waiting_for_approval" : "tool_running",
         activeTool: bounded,
         activities: activityUpdate.activities,
         activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
@@ -193,6 +214,7 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
     case "approval_requested":
       return { ...state, status: "waiting_for_approval", approval: event.request };
     case "approval_resolved":
+      if (state.approval?.id !== event.requestId) return state;
       return { ...state, status: state.activeTool ? "tool_running" : "running", approval: undefined };
     case "turn_completed": {
       const durationMs = Math.max(0, event.durationMs ?? Date.now() - state.startedAt);
@@ -312,7 +334,7 @@ function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: st
       ...tracking,
       fullToolOutputs,
       fullToolErrors,
-      status: "tool_running",
+      status: state.approval ? "waiting_for_approval" : "tool_running",
       activeTool: bounded,
       activities: activityUpdate.activities,
       activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
@@ -328,7 +350,7 @@ function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: st
       ...tracking,
       fullToolOutputs,
       fullToolErrors,
-      status: activeTool ? "tool_running" : "running",
+      status: state.approval ? "waiting_for_approval" : activeTool ? "tool_running" : "running",
       activeTool,
       activities: activityUpdate.activities,
       activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
@@ -343,7 +365,7 @@ function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: st
     ...tracking,
     fullToolOutputs,
     fullToolErrors,
-    status: activeTool ? "tool_running" : "running",
+    status: state.approval ? "waiting_for_approval" : activeTool ? "tool_running" : "running",
     activeTool,
     activities: activityUpdate.activities,
     activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
@@ -461,6 +483,24 @@ function addOptional(left: number | undefined, right: number | undefined): numbe
 function bound(value: string): string {
   if (value.length <= MAX_TEXT) return value;
   return `${value.slice(0, MAX_TEXT - 1)}…`;
+}
+
+function accumulateReportedTokens(
+  last: number | undefined,
+  cumulative: number | undefined,
+  value: number | undefined,
+  previous: number | undefined,
+  hasPriorUsage: boolean,
+): { value?: number; cumulative?: number } {
+  if (last === undefined || cumulative === undefined || !Number.isFinite(last) || !Number.isFinite(cumulative)
+    || last < 0 || cumulative < 0) return {};
+  // A saved or partial turn without a baseline cannot acquire a complete breakdown later.
+  if (hasPriorUsage && (previous === undefined || value === undefined)) return {};
+  const normalizedCumulative = normalizeTokenCount(cumulative);
+  return {
+    value: (value ?? 0) + (previous === undefined ? normalizeTokenCount(last) : Math.max(0, normalizedCumulative - previous)),
+    cumulative: Math.max(previous ?? 0, normalizedCumulative),
+  };
 }
 
 function normalizeTokenCount(value: number): number {

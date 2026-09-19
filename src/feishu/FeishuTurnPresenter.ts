@@ -684,6 +684,7 @@ function eventPriority(event: AgentEvent): "normal" | "critical" {
     || event.type === "approval_resolved"
     || event.type === "tool_started"
     || event.type === "context_compaction"
+    || (event.type === "progress" && event.severity === "warning")
   ) {
     return "critical";
   }

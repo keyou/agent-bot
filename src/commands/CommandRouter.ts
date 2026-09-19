@@ -196,6 +196,7 @@ function parseNewCommand(args: string[]): Extract<Command, { type: "new" }> {
     title: options.title,
     cwd: options.cwd,
     ...(options.projectless ? { projectless: true } : {}),
+    ...(options.agentName ? { agentName: options.agentName } : {}),
   };
 }
 
@@ -206,6 +207,7 @@ function parseNewGroupCommand(args: string[]): Extract<Command, { type: "newgrou
     title: options.title,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.projectless ? { projectless: true } : {}),
+    ...(options.agentName ? { agentName: options.agentName } : {}),
   };
 }
 
@@ -214,9 +216,10 @@ function parseNewTaskOptions(
   args: string[],
   directoryLabel: string,
   exampleDirectory: string,
-): { title?: string; cwd?: string; projectless: boolean } {
+): { title?: string; cwd?: string; projectless: boolean; agentName?: string } {
   const titleParts: string[] = [];
   let cwd: string | undefined;
+  let agentName: string | undefined;
   let projectless = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]!;
@@ -226,6 +229,13 @@ function parseNewTaskOptions(
       projectless = true;
       continue;
     }
+    if (argument === "--agent") {
+      if (agentName !== undefined) throw new Error(`${commandName} 只能指定一次 --agent。`);
+      const name = args[++index];
+      if (!name?.trim() || name.startsWith("--")) throw new Error("请在 --agent 后指定 Agent 名称。");
+      agentName = name.trim();
+      continue;
+    }
     if (argument !== "--dir") {
       titleParts.push(argument);
       continue;
@@ -233,7 +243,7 @@ function parseNewTaskOptions(
     if (projectless) throw new Error(`${commandName} 的 --dir 和 --nodir 不能同时使用。`);
     if (cwd !== undefined) throw new Error(`${commandName} 只能指定一次 --dir。`);
     const directory = args[index + 1];
-    if (!directory || directory === "--dir" || directory === "--nodir") {
+    if (!directory || directory.startsWith("--")) {
       throw new Error(
         `请在 --dir 后指定${directoryLabel}，例如：${commandName} 修复会话列表 --dir ${exampleDirectory}。`,
       );
@@ -245,6 +255,7 @@ function parseNewTaskOptions(
     title: titleParts.join(" ").trim() || undefined,
     cwd,
     projectless,
+    agentName,
   };
 }
 

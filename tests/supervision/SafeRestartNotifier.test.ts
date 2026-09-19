@@ -294,6 +294,9 @@ describe("SafeRestartNotifier", () => {
     expect(sendInteractiveCard).toHaveBeenCalledWith("chat_id:private", expect.any(Object));
     expect(JSON.stringify(sendInteractiveCard.mock.calls[0]?.[1])).toContain("Running build");
     expect(JSON.stringify(sendInteractiveCard.mock.calls[0]?.[1])).toContain("thread_1");
+    expect(JSON.stringify(sendInteractiveCard.mock.calls[0]?.[1])).toContain(
+      '"action":"session_stop","sessionId":"session_1","cardView":"safe_restart"',
+    );
 
     store.updateSession("session_1", { status: "ready" });
     notifier.update({
@@ -309,6 +312,7 @@ describe("SafeRestartNotifier", () => {
     expect(sendInteractiveCard).toHaveBeenCalledOnce();
     expect(updateInteractiveCard).toHaveBeenCalledWith("om_restart", expect.any(Object));
     expect(JSON.stringify(updateInteractiveCard.mock.calls.at(-1)?.[1])).toContain("10s");
+    expect(JSON.stringify(updateInteractiveCard.mock.calls.at(-1)?.[1])).not.toContain('"action":"session_stop"');
 
     await notifier.update({
       scheduleId: 1,

@@ -61,6 +61,7 @@ import type {
   ApprovalDecision,
   ConversationTurn,
   ModelOption,
+  ModelListResult,
   PermissionMode,
   RemoteCompletedTurnSummary,
   RemoteSessionActivity,
@@ -234,13 +235,13 @@ const HELP_COMMAND_SECTIONS: Array<{
     commands: [
       {
         command: "/new",
-        usage: "[title] [--dir &#60;cwd&#62; | --nodir]",
-        description: "使用默认 Agent 创建任务；--nodir 创建 Projectless 任务",
+        usage: "[title] [--agent &#60;name&#62;] [--dir &#60;cwd&#62; | --nodir]",
+        description: "使用默认或指定 Agent 创建任务；--nodir 创建 Projectless 任务",
       },
       {
         command: "/newgroup",
-        usage: "[title] [--dir &#60;cwd&#62; | --nodir]",
-        description: "创建飞书群和新任务",
+        usage: "[title] [--agent &#60;name&#62;] [--dir &#60;cwd&#62; | --nodir]",
+        description: "使用默认或指定 Agent 创建飞书群和新任务",
       },
       {
         command: "/dir",
@@ -500,6 +501,7 @@ export interface ProxyLifecycle {
   supervised?: boolean;
   restart(contextKey: string, force: boolean, replyTarget?: MessageReplyTarget): Promise<void>;
   cancelSafeRestart?(scheduleId: number): Promise<boolean>;
+  forceSafeRestart?(scheduleId: number): Promise<boolean>;
   cancelAutomaticUpdate?(action: CardAction): Promise<void>;
   rememberFeishuUserOpenId?(userOpenId: string): Promise<void> | void;
   persistAgentExecutionDefaults?(
@@ -1049,6 +1051,18 @@ export class ProxySessionController {
           });
         } else if (kind === "queued_prompt_cancel") {
           await this.cancelQueuedPrompt(scopedAction);
+        } else if (kind === "safe_restart_force") {
+          const scheduleId = Number(scopedAction.value.scheduleId);
+          if (!Number.isSafeInteger(scheduleId) || scheduleId <= 0) {
+            throw new Error("安全重启卡片无效，请使用最新的状态卡片。");
+          }
+          if (!this.lifecycle?.forceSafeRestart) {
+            throw new Error("当前运行方式不支持立即重启。");
+          }
+          const restarted = await this.lifecycle.forceSafeRestart(scheduleId);
+          if (!restarted) {
+            await this.outbound.sendText(contextKey, "该安全重启计划已失效，请查看最新状态卡片。");
+          }
         } else if (kind === "safe_restart_cancel") {
           const scheduleId = Number(scopedAction.value.scheduleId);
           if (!Number.isSafeInteger(scheduleId) || scheduleId <= 0) {
@@ -1164,7 +1178,9 @@ export class ProxySessionController {
           await this.outbound.sendText(contextKey, STOP_TASK_STARTED_MESSAGE);
           await this.stopSessionReference(contextKey, sessionId);
           if (scopedAction.value.cardView === "status") await this.refreshStatusCardFromAction(scopedAction, sessionId);
-          else await this.refreshSessionsCardFromAction(scopedAction, { forceSwitchTaskId: sessionId });
+          else if (scopedAction.value.cardView !== "safe_restart") {
+            await this.refreshSessionsCardFromAction(scopedAction, { forceSwitchTaskId: sessionId });
+          }
         } else if (kind === "session_status") {
           await this.outbound.sendText(contextKey, STATUS_STARTED_MESSAGE);
           await this.status(contextKey, String(scopedAction.value.sessionId ?? ""));
@@ -2006,14 +2022,16 @@ export class ProxySessionController {
       case "file":
         await this.sendCurrentTaskFile(contextKey, command.filePath);
         return;
-      case "new":
-        if (command.projectless && this.ensureAgent(context.defaultAgent).kind !== "app-server") {
+      case "new": {
+        const agentName = command.agentName ?? context.defaultAgent;
+        const agent = this.ensureAgent(agentName);
+        if (command.projectless && agent.kind !== "app-server") {
           throw new Error("/new --nodir 仅支持 App Server Agent。");
         }
         await this.outbound.sendText(contextKey, CREATE_TASK_STARTED_MESSAGE);
         await this.createSession(
           contextKey,
-          context.defaultAgent,
+          agentName,
           command.projectless
             ? undefined
             : command.cwd === undefined
@@ -2024,11 +2042,14 @@ export class ProxySessionController {
           undefined,
           undefined,
           command.title,
-          this.inheritedExecutionSettings(contextKey, context.defaultAgent),
+          this.inheritedExecutionSettings(contextKey, agentName),
         );
         return;
-      case "newgroup":
-        if (command.projectless && this.ensureAgent(context.defaultAgent).kind !== "app-server") {
+      }
+      case "newgroup": {
+        const agentName = command.agentName ?? context.defaultAgent;
+        const agent = this.ensureAgent(agentName);
+        if (command.projectless && agent.kind !== "app-server") {
           throw new Error("/newgroup --nodir 仅支持 App Server Agent。");
         }
         if (!userId?.startsWith("ou_")) {
@@ -2037,13 +2058,14 @@ export class ProxySessionController {
         await this.outbound.sendText(contextKey, CREATE_GROUP_STARTED_MESSAGE);
         await this.createFeishuGroup(
           contextKey,
-          context.defaultAgent,
+          agentName,
           command.title,
           userId,
           command.cwd === undefined ? undefined : resolveUserPath(command.cwd),
           command.projectless === true,
         );
         return;
+      }
       case "clone":
       case "clonegroup": {
         let source = this.currentSession(contextKey);
@@ -5110,7 +5132,7 @@ export class ProxySessionController {
       const providerSupported = loaded.runtime.kind === "codex" && Boolean(loaded.runtime.listModelProviders);
       const providers = providerSupported ? await this.modelProviderOptions(loaded) : [];
       const currentProvider = loaded.session.modelProvider ?? providers.find((provider) => provider.isDefault)?.id;
-      const models = await loaded.runtime.listModels(currentProvider, loaded.session.model);
+      const { models, warning } = await this.modelOptions(loaded.runtime, currentProvider, loaded.session.model);
       const currentModel = models.find((model) => model.id === loaded.session.model)
         ?? models.find((model) => model.isDefault)
         ?? models[0];
@@ -5127,6 +5149,7 @@ export class ProxySessionController {
         providers,
         providerSupported,
         models,
+        warning,
         reasoningOptions: currentModel?.supportedReasoningEfforts ?? [],
       };
     }
@@ -5210,13 +5233,14 @@ export class ProxySessionController {
   ): Promise<void> {
     const loaded = await this.loadSession(this.requireSession(contextKey, sessionId));
     await this.assertModelProvider(loaded, modelProvider);
-    const models = await loaded.runtime.listModels(modelProvider, loaded.session.model);
+    const { models, warning } = await this.modelOptions(loaded.runtime, modelProvider, loaded.session.model);
     const card = this.cardRenderer.renderModelSelector({
       sessionId,
       contextKey,
       currentModel: selectProviderModel(models, loaded.session.model)?.id,
       reasoningEffort: loaded.session.reasoningEffort,
       models,
+      warning,
       modelProvider,
       permissionMode,
       unifiedSettings: true,
@@ -5234,7 +5258,7 @@ export class ProxySessionController {
   ): Promise<void> {
     const loaded = await this.loadSession(this.requireSession(contextKey, sessionId));
     await this.assertModelProvider(loaded, modelProvider);
-    const models = await loaded.runtime.listModels(modelProvider, model);
+    const { models, warning } = await this.modelOptions(loaded.runtime, modelProvider, model);
     const selected = models.find((candidate) => candidate.id === model);
     if (!selected) throw new Error(`未知模型：${model}`);
     const options = selected.supportedReasoningEfforts.length > 0
@@ -5252,6 +5276,7 @@ export class ProxySessionController {
       model,
       currentEffort,
       options,
+      warning,
       permissionMode,
       unifiedSettings: true,
     });
@@ -5296,7 +5321,7 @@ export class ProxySessionController {
       await this.outbound.sendText(contextKey, `正在切换到 Provider ${settings.provider}，请稍后。`);
     }
     const loaded = await this.loadSession(record);
-    await this.assertProviderModelSettings(loaded, settings.provider, settings.model, settings.effort);
+    const warning = await this.assertProviderModelSettings(loaded, settings.provider, settings.model, settings.effort);
     const session = await this.changeProviderSettings(loaded, {
       modelProvider: settings.provider,
       model: settings.model,
@@ -5317,7 +5342,7 @@ export class ProxySessionController {
         notice,
       });
     } else {
-      await this.outbound.sendText(contextKey, notice.replaceAll("`", ""));
+      await this.outbound.sendText(contextKey, [notice.replaceAll("`", ""), warning].filter(Boolean).join("\n"));
     }
   }
 
@@ -5352,15 +5377,23 @@ export class ProxySessionController {
     modelProvider: string,
     model: string,
     effort: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     await this.assertModelProvider(loaded, modelProvider);
-    const selected = (await loaded.runtime.listModels(modelProvider, model)).find((candidate) => candidate.id === model);
+    const { models, warning } = await this.modelOptions(loaded.runtime, modelProvider, model);
+    const selected = models.find((candidate) => candidate.id === model);
     if (!selected) throw new Error(`未知模型：${model}`);
     if (selected.supportedReasoningEfforts.length > 0
       && !selected.supportedReasoningEfforts.some((option) => option.value === effort)) {
       const supported = selected.supportedReasoningEfforts.map((option) => option.value).join("、") || "无";
       throw new Error(`模型 ${model} 不支持思考强度 ${effort}。支持的强度：${supported}`);
     }
+    return warning;
+  }
+
+  private async modelOptions(runtime: AgentRuntime, provider?: string, fallbackModel?: string): Promise<ModelListResult> {
+    return runtime.listModelsWithStatus
+      ? runtime.listModelsWithStatus(provider, fallbackModel)
+      : { models: await runtime.listModels(provider, fallbackModel) };
   }
 
   private async assertModelProvider(loaded: LoadedSession, modelProvider: string): Promise<void> {
@@ -7027,10 +7060,12 @@ export class ProxySessionController {
       activeTurnId = remoteActive ? remote?.lastTurnId ?? activeTurnId : activeTurnId;
       queued = this.store.countQueuedPrompts(current.localSessionId);
       snapshot = turnViewSnapshot(current.lastTurnId ? this.store.getTurnSnapshot(current.lastTurnId) : undefined);
-      const statusLabel = remoteActive && remote && localCurrent && !isBotOwnedActiveTurn(localCurrent, remote)
-        ? "外部执行中"
-        : sessionStatusLabel(current.status, activeTurnId);
-      const resultLabel = remoteActive
+      const waitingForApproval = snapshot?.turnId === current.lastTurnId && snapshot?.status === "waiting_for_approval";
+      const statusLabel = waitingForApproval ? "等待确认"
+        : remoteActive && remote && localCurrent && !isBotOwnedActiveTurn(localCurrent, remote)
+          ? "外部执行中"
+          : sessionStatusLabel(current.status, activeTurnId);
+      const resultLabel = waitingForApproval ? "等待确认" : remoteActive
         ? "执行中"
         : remoteTurnStatusLabel(remote?.lastTurnStatus ?? current.lastTurnStatus);
       taskLines.push(
@@ -8259,7 +8294,8 @@ function executionDetailLines(
 
 function finalResultLines(snapshot?: TurnViewState, remote?: RemoteSessionSummary): string[] {
   const relevantSnapshot = !remote?.lastTurnId || snapshot?.turnId === remote.lastTurnId ? snapshot : undefined;
-  if (relevantSnapshot?.status === "running" || relevantSnapshot?.status === "tool_running" || relevantSnapshot?.status === "waiting_for_approval"
+  if (relevantSnapshot?.status === "waiting_for_approval") return ["任务正在等待确认，尚无最终结果。"];
+  if (relevantSnapshot?.status === "running" || relevantSnapshot?.status === "tool_running"
     || isRemoteSessionActive(remote)) {
     return ["任务仍在执行，尚无最终结果。"];
   }

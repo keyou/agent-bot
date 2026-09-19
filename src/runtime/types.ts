@@ -58,6 +58,7 @@ export interface ToolState {
 
 export interface ApprovalRequest {
   id: string;
+  kind?: "mode_change";
   title: string;
   command?: string;
   reason?: string;
@@ -66,13 +67,17 @@ export interface ApprovalRequest {
 
 export type AgentEvent =
   | { type: "turn_started"; sessionId: string; turnId: string; startedAt: number }
-  | { type: "agent_text_delta"; sessionId: string; turnId: string; text: string }
+  | { type: "agent_text_delta"; sessionId: string; turnId: string; text: string; replacesActivityId?: string }
   | {
       type: "token_usage_updated";
       sessionId: string;
       turnId: string;
       lastTokens: number;
       cumulativeTokens: number;
+      lastTotalTokens?: number;
+      cumulativeTotalTokens?: number;
+      lastCachedTokens?: number;
+      cumulativeCachedTokens?: number;
       contextTokens?: number;
     }
   | {
@@ -92,6 +97,7 @@ export type AgentEvent =
       text: string;
       activityId?: string;
       append?: boolean;
+      severity?: "warning";
     }
   | { type: "plan_updated"; sessionId: string; turnId: string; steps: PlanStep[] }
   | { type: "tool_started"; sessionId: string; turnId: string; tool: ToolState }
@@ -224,6 +230,11 @@ export interface ModelOption {
   defaultReasoningEffort?: string;
 }
 
+export interface ModelListResult {
+  models: ModelOption[];
+  warning?: string;
+}
+
 export interface ModelProviderOption {
   id: string;
   displayName?: string;
@@ -285,6 +296,7 @@ export interface AgentRuntime {
   ): Promise<RuntimeSession>;
   respondToApproval(sessionId: string, requestId: string, decision: ApprovalDecision): Promise<void>;
   listModels(modelProvider?: string, fallbackModel?: string): Promise<ModelOption[]>;
+  listModelsWithStatus?(modelProvider?: string, fallbackModel?: string): Promise<ModelListResult>;
   listModelProviders?(): Promise<ModelProviderOption[]>;
   release?(options?: { force?: boolean }): Promise<RuntimeReleaseResult>;
   onEvent(listener: (event: RuntimeEvent) => void): () => void;

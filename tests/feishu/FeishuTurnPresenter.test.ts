@@ -41,6 +41,34 @@ function createFixture(delivered = false, renderer?: CardRenderer) {
 }
 
 describe("FeishuTurnPresenter", () => {
+  test("refreshes runtime warnings promptly on the same card without ending the turn", async () => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, {
+      normalIntervalMs: 60_000, criticalGapMs: 0,
+    });
+    presenter.registerSession("s1", "chat_id:c1");
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.flushAll();
+    vi.mocked(outbound.updateInteractiveCard).mockClear();
+    for (const text of ["运行请求出错，Agent 正在重试：Connection refused", "运行请求出错，Agent 正在重试：HTTP 503"]) {
+      await presenter.onEvent({
+        type: "progress", sessionId: "s1", turnId: "turn_1", severity: "warning",
+        activityId: "commentary:runtime-error:turn_1", append: false, text,
+      });
+      await vi.waitFor(() => expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]))
+        .toContain(text));
+      expect(store.getTurnSnapshot("turn_1")).toMatchObject({
+        status: "running", activities: [{ kind: "assistant", id: "commentary:runtime-error:turn_1", text }],
+      });
+    }
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    expect(outbound.sendMarkdown).not.toHaveBeenCalled();
+    await presenter.onEvent(completed("Recovered"));
+    expect(outbound.sendMarkdown).toHaveBeenCalledExactlyOnceWith("chat_id:c1", "Recovered", expect.any(String));
+    await presenter.flushAll();
+  });
+
   test("shows requested details without claiming the live card or redelivering the answer", async () => {
     const { outbound } = createFixture();
     const store = new MemoryStore();

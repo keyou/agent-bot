@@ -46,6 +46,9 @@ const PREVIEW_LABELS = {
     model: "模型",
     tools: "个工具",
     turnTokens: "本轮",
+    totalTokens: "总计",
+    cachedTokens: "缓存命中",
+    nonCachedTokens: "非缓存",
     compactionTokens: "压缩",
     compactionAfterTokens: "压缩后",
     characters: "字符",
@@ -84,6 +87,9 @@ const PREVIEW_LABELS = {
     model: "Model",
     tools: "tools",
     turnTokens: "Turn",
+    totalTokens: "Total",
+    cachedTokens: "Cache hit",
+    nonCachedTokens: "Non-cached",
     compactionTokens: "Compaction",
     compactionAfterTokens: "After compaction",
     characters: "characters",
@@ -302,6 +308,7 @@ export function renderTurnPreviewSnapshot(
       : "",
     timeline ? `<section class="timeline">${timeline}</section>` : `<div class="empty">${escapeHtml(language === "zh" ? "正在等待 Agent 返回进度…" : "Waiting for Agent progress…")}</div>`,
     state.fileSummary.length > 0 ? renderFileSummary(state, language, resolveFileUrl) : "",
+    state.approval ? `<section class="notice"><h2>${escapeHtml(state.approval.title)}</h2><div class="markdown">${renderText(state.approval.reason ?? "")}</div><p>${escapeHtml(language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu.")}</p></section>` : "",
     state.error ? `<section class="result error-result"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(state.error)}</pre></section>` : "",
     state.finalResponse
       ? `<section class="result final-result"><h2>${escapeHtml(labels.finalAnswer)}</h2><div class="markdown">${renderText(state.finalResponse)}</div></section>`
@@ -619,7 +626,11 @@ function renderMetadata(state: TurnViewState, language: TurnPreviewLanguage): st
   return [
     elapsed,
     state.model?.trim() ? `<span title="${escapeAttribute(labels.model)}">${escapeHtml(state.model.trim())}</span>` : "",
-    state.totalTokens === undefined ? "" : `<span title="${escapeAttribute(labels.turnTokens)}">${formatTokenCount(state.totalTokens)} tokens</span>`,
+    state.totalTokens === undefined ? "" : state.cachedInputTokens === undefined
+      ? `<span title="${escapeAttribute(labels.turnTokens)}">${formatTokenCount(state.totalTokens)} tokens</span>`
+      : `<span title="${escapeAttribute(labels.nonCachedTokens)}: ${formatNumber(state.totalTokens)} tokens">${escapeHtml(labels.nonCachedTokens)} ${formatTokenCount(state.totalTokens)} tokens</span>`,
+    state.totalTokensIncludingCache === undefined ? "" : `<span title="${escapeAttribute(labels.totalTokens)}: ${formatNumber(state.totalTokensIncludingCache)} tokens">${escapeHtml(labels.totalTokens)} ${formatTokenCount(state.totalTokensIncludingCache)} tokens</span>`,
+    state.cachedInputTokens === undefined ? "" : `<span title="${escapeAttribute(labels.cachedTokens)}: ${formatNumber(state.cachedInputTokens)} tokens">${escapeHtml(labels.cachedTokens)} ${formatTokenCount(state.cachedInputTokens)} tokens</span>`,
     state.contextCompactionAfterTokens === undefined ? "" : state.contextCompactionBeforeTokens === undefined
       ? `<span title="${escapeAttribute(labels.compactionAfterTokens)}">${formatTokenCount(state.contextCompactionAfterTokens)} tokens</span>`
       : `<span title="${escapeAttribute(labels.compactionTokens)}">${formatTokenCount(state.contextCompactionBeforeTokens)} → ${formatTokenCount(state.contextCompactionAfterTokens)} tokens</span>`,

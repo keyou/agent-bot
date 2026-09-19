@@ -216,6 +216,74 @@ describe("SafeRestartScheduler", () => {
     await vi.advanceTimersByTimeAsync(0);
   });
 
+  test.each([
+    { runningSessions: 2, pendingFinalDeliveries: 1 },
+    { runningSessions: 0, pendingFinalDeliveries: 1 },
+    { runningSessions: 0, pendingFinalDeliveries: 0 },
+  ])("forces a matching restart immediately regardless of activity %j", async (activity) => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    const onStatus = vi.fn(async () => { events.push("status"); });
+    const onReady = vi.fn(async () => { events.push("ready"); });
+    const scheduler = new SafeRestartScheduler({ readActivity: () => activity, onStatus, onReady });
+    const target = { contextKey: "chat_id:first:thread_id:topic", replyMessageId: "om_anchor" };
+    scheduler.schedule("pending restart or update", target);
+    await vi.advanceTimersByTimeAsync(0);
+    events.length = 0;
+
+    expect(await scheduler.forceScheduled(1)).toBe(true);
+
+    expect(scheduler.scheduled).toBe(false);
+    expect(onStatus).toHaveBeenLastCalledWith({
+      scheduleId: 1, reason: "pending restart or update", phase: "restarting", activity, remainingMs: 0,
+      notificationTargets: [{ ...target, reason: "pending restart or update" }],
+    });
+    expect(events).toEqual(["status", "ready"]);
+    expect(onReady).toHaveBeenCalledExactlyOnceWith("pending restart or update", [
+      { ...target, reason: "pending restart or update" },
+    ]);
+    expect(await scheduler.forceScheduled(1)).toBe(false);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(onReady).toHaveBeenCalledOnce();
+  });
+
+  test("rejects force actions for missing, superseded, and cancelled schedules", async () => {
+    vi.useFakeTimers();
+    const onReady = vi.fn();
+    const scheduler = new SafeRestartScheduler({
+      readActivity: () => ({ runningSessions: 1, pendingFinalDeliveries: 0 }), onReady,
+    });
+    expect(await scheduler.forceScheduled(1)).toBe(false);
+    scheduler.schedule("first");
+    scheduler.schedule("newer");
+    expect(await scheduler.forceScheduled(1)).toBe(false);
+    expect(scheduler.pendingReason).toBe("newer");
+    await scheduler.cancelCurrent();
+    expect(await scheduler.forceScheduled(2)).toBe(false);
+    expect(onReady).not.toHaveBeenCalled();
+  });
+
+  test("claims a forced restart before awaiting card delivery", async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const delivery = new Promise<void>((resolve) => { release = resolve; });
+    const onReady = vi.fn();
+    const scheduler = new SafeRestartScheduler({
+      readActivity: () => ({ runningSessions: 1, pendingFinalDeliveries: 0 }),
+      onReady,
+      onStatus: (status) => status.phase === "restarting" ? delivery : undefined,
+    });
+    scheduler.schedule("force once");
+    await vi.advanceTimersByTimeAsync(0);
+    const forced = scheduler.forceScheduled(1);
+    expect(await scheduler.forceScheduled(1)).toBe(false);
+    expect(await scheduler.cancelScheduled(1)).toBe(false);
+    expect(onReady).not.toHaveBeenCalled();
+    release();
+    expect(await forced).toBe(true);
+    expect(onReady).toHaveBeenCalledOnce();
+  });
+
   test("cancels only the matching scheduled restart and publishes its terminal state", async () => {
     vi.useFakeTimers();
     const onReady = vi.fn();

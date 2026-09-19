@@ -1,7 +1,7 @@
 export type Command =
   | { type: "shell"; command: string }
-  | { type: "new"; title?: string; cwd?: string; projectless?: boolean }
-  | { type: "newgroup"; title?: string; cwd?: string; projectless?: boolean }
+  | { type: "new"; title?: string; cwd?: string; projectless?: boolean; agentName?: string }
+  | { type: "newgroup"; title?: string; cwd?: string; projectless?: boolean; agentName?: string }
   | { type: "dir"; directory?: string }
   | { type: "file"; filePath: string }
   | { type: "clone" | "clonegroup"; title?: string; agentName?: string }

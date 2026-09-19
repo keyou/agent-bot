@@ -94,6 +94,8 @@ agentbot task newgroup [title] [--agent <name>] [--dir <cwd> | --nodir]
 agentbot task forkgroup [title]
 ```
 
+Feishu `/new [title] [--agent <name>] [--dir <cwd> | --nodir]` and `/newgroup` also accept an explicit configured Agent name. Omitting `--agent` uses the conversation's default Agent; specifying it does not change that default. The same Agent inherits the current task's execution settings; a different Agent uses its saved Provider, model, reasoning, and permission defaults. Project inheritance is unchanged, and `--nodir` requires the selected Agent to be App Server.
+
 Choose `new` or `newgroup` for fresh context. Choose `fork` or `forkgroup` when the new task must retain conversation history through the latest completed Turn. Forking must not interrupt an active source turn.
 
 For lightweight context transfer, including between different Agents:
@@ -109,6 +111,8 @@ Feishu `/sessions [keyword]` lists and searches tasks across projects and all Pr
 
 Fork creation stores source-task and branch-Turn references without synchronizing the full local Turn list. The Feishu Turn card reuses local records and loads only the summary pages needed for the requested page, not the entire history. `task turns` loads the first page if necessary and returns available local records. This does not change the Agent's inherited context. Retry listing Turns after a temporary history-read failure; unsupported summary pagination never falls back to downloading full history.
 
+If a TraeX task stops producing output, check its progress card for a pending plan-mode confirmation. `Approve Plan` / `Enter Plan Mode`, `Reject`, and `Cancel Request` require the user's explicit choice, even with automatic permissions. Preview displays the plan but cannot approve it. Cancelling a request does not itself stop the task; waiting turns still block safe restart. Never approve, stop, or force-restart merely to clear that wait. Notifications dropped by an older running version are not automatically replayed after upgrading.
+
 ## Change Settings
 
 ```powershell
@@ -120,6 +124,10 @@ agentbot task permissions [auto|confirm]
 ```
 
 Omit the value to inspect the current setting and available choices. `agent` changes the default Agent for future tasks in that conversation. The other settings affect the specified task from its next request and become the saved defaults for that Agent.
+
+A successful Provider switch confirms settings, not inference connectivity. Model-list fallback warnings appear on settings cards; inspect the Provider service when availability is unconfirmed. App Server errors and native retry notices appear on the current progress card without terminating the turn. Do not stop or restart a retrying task unless the user requests it.
+
+Providers such as a Responses bridge may omit assistant message phases. Unphased text stays in the progress timeline; successful completion promotes only the last message not followed by a tool start. Do not diagnose progress text in the answer area as a CSS issue without checking message phases. Old snapshots are not automatically backfilled.
 
 Provider changes require an idle task and verify the actual Provider and model before saving. Custom Providers discover models through their OpenAI-compatible `/models` endpoint when available. Switching keeps the previous model when supported, otherwise uses the Provider default or its first model. A missing model-list endpoint falls back to the current or configured model and does not by itself block switching. Wait for active work to finish; do not stop it without the user's request. Switching unloads only the selected thread, not the shared App Server. On failure, previous settings are retained and recovery is attempted. If recovery fails, resolve the reported configuration or ownership issue and retry the Provider switch before sending another prompt. Never replace a forked task with an empty task to work around a switch failure.
 
@@ -172,6 +180,10 @@ The Feishu service also checks stable npm `latest` once daily at a persisted ran
 Autostart is Profile-specific. Use `server autostart enable` for login startup, `server autostart enable --linger` on Linux only when the user explicitly requests startup before login, and `server autostart disable` to remove registration without stopping the current Server. Disabling Agent Bot autostart must not disable Linux user lingering because other services may use it.
 
 Use safe restart by default. Prefer `agentbot task restart` when hosted so the current task is resolved automatically. Use `--immediate` or `task restart --force` only when the user explicitly accepts interruption.
+
+The safe-restart card has matching `Cancel` and `ForceRestart` actions. Clicking `ForceRestart` explicitly accepts interruption and immediately executes the pending restart (including an already-prepared update), bypassing task, final-delivery, and quiet-window waits. Do not click it without the user's explicit request. Stale or already-triggered plans are rejected.
+
+Each displayed running task on that card has a `Stop` action targeting its exact task, even across conversations. It uses normal Agent interruption and leaves the restart scheduled; the card updates as tasks stop. Only stop a task when the user requests it.
 
 A bare `agentbot server restart` invoked inside an Agent Bot-started Agent returns restart status to the source task conversation. The same command from an ordinary terminal uses the configured user's private chat. Add `--task <task>` only to override either default.
 

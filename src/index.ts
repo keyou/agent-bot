@@ -192,6 +192,10 @@ if (feishuOutbound && config.updates?.enabled !== false) {
 const controller = new ProxySessionController(config, store, runtimes, outbound, logger, {
   supervised,
   restart: requestRestart,
+  forceSafeRestart: async (scheduleId) => {
+    if (shuttingDown || restartRequested) return false;
+    return safeRestart.forceScheduled(scheduleId);
+  },
   cancelAutomaticUpdate: async (action) => {
     if (!dailyUpdateMonitor) throw new Error("自动更新功能未启用。");
     await dailyUpdateMonitor.cancel(action);

@@ -1,6 +1,9 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, test, vi } from "vitest";
+import { mapCodexNotification } from "../../src/codex/CodexEventMapper.js";
+import { CardRenderer } from "../../src/feishu/CardRenderer.js";
+import { reduceTurnEvent } from "../../src/presentation/TurnStateReducer.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import type { ToolState } from "../../src/runtime/types.js";
 import { detectTurnPreviewLanguage, renderTurnPreviewPage, renderTurnPreviewSnapshot } from "../../src/local-files/TurnPreviewPage.js";
@@ -19,6 +22,70 @@ function state(tool?: Partial<ToolState>): TurnViewState {
 }
 
 describe("Turn Preview", () => {
+  test("does not restore a promoted answer through the legacy progress fallback", () => {
+    let input = reduceTurnEvent(state(), {
+      type: "progress", sessionId: "session", turnId: "turn", activityId: "commentary:answer", text: "Only the final answer.",
+    });
+    input = reduceTurnEvent(input, {
+      type: "agent_text_delta", sessionId: "session", turnId: "turn", text: "Only the final answer.", replacesActivityId: "commentary:answer",
+    });
+    input = reduceTurnEvent(input, { type: "turn_completed", sessionId: "session", turnId: "turn", finalResponse: "Only the final answer." });
+    expect(input.activities).toEqual([]);
+    expect(input.progressText).toBeUndefined();
+    expect(renderTurnPreviewSnapshot(input).content.match(/Only the final answer\./g)).toHaveLength(1);
+    expect(JSON.stringify(new CardRenderer().renderTurnDetails(input)).match(/Only the final answer\./g)).toHaveLength(1);
+  });
+
+  test("keeps unphased updates in the timeline and promotes only the actual final answer", () => {
+    let input = state();
+    input = reduceTurnEvent(input, {
+      type: "progress", sessionId: "session", turnId: "turn", activityId: "commentary:progress", text: "Inspecting the code.",
+    });
+    input = reduceTurnEvent(input, { type: "tool_started", sessionId: "session", turnId: "turn",
+      tool: { id: "tool", kind: "command", title: "git status", status: "running" } });
+    const preview = renderTurnPreviewSnapshot(input);
+    expect(preview.content.indexOf("Inspecting the code.")).toBeLessThan(preview.content.indexOf("git status"));
+    expect(preview.content).not.toContain("回答生成中");
+    expect(JSON.stringify(new CardRenderer().renderTurn(input))).toContain("Inspecting the code.");
+    input = reduceTurnEvent(input, {
+      type: "progress", sessionId: "session", turnId: "turn", activityId: "commentary:answer", text: "Final answer.",
+    });
+    input = reduceTurnEvent(input, {
+      type: "agent_text_delta", sessionId: "session", turnId: "turn", text: "Final answer.", replacesActivityId: "commentary:answer",
+    });
+    input = reduceTurnEvent(input, { type: "turn_completed", sessionId: "session", turnId: "turn", finalResponse: "Final answer." });
+    const completed = renderTurnPreviewSnapshot(input);
+    expect(completed.content.match(/Final answer\./g)).toHaveLength(1);
+    expect(completed.content).toContain("Inspecting the code.");
+    expect(completed.content).not.toContain("回答生成中");
+    expect(input.activities.map((activity) => activity.id)).toEqual(["commentary:progress", "tool"]);
+  });
+
+  test.each(["zh", "en"] as const)("shows pending plan confirmation safely in the %s read-only preview", (language) => {
+    const input = state();
+    input.status = "waiting_for_approval";
+    input.activities = [{ kind: "assistant", id: "commentary:plan:p1", text: "## Implementation plan\nRun tests before building." }];
+    input.approval = {
+      id: "mode:thr_1:r1", kind: "mode_change", title: '<img src=x onerror="alert(1)">',
+      reason: "**Review plan**\n<script>alert(1)</script>", options: [{ id: "accept", label: "Approve Plan" }],
+    };
+    const pending = renderTurnPreviewSnapshot(input, undefined, language);
+    expect(pending.statusLabel).toBe(language === "zh" ? "等待确认" : "Waiting for approval");
+    expect(pending.content).toContain("Run tests before building.");
+    expect(pending.content).toContain("<strong>Review plan</strong>");
+    expect(pending.content).toContain("&lt;img");
+    expect(pending.content).toContain("&lt;script&gt;");
+    expect(pending.content).not.toContain("<script>");
+    expect(pending.content).not.toContain("<img src=x");
+    expect(pending.content).toContain(language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu.");
+    expect(pending.content).not.toContain("Approve Plan</button>");
+    input.approval = undefined;
+    input.status = "running";
+    const resolved = renderTurnPreviewSnapshot(input, undefined, language);
+    expect(resolved.content).not.toContain("<strong>Review plan</strong>");
+    expect(resolved.content).toContain("Run tests before building.");
+  });
+
   test.each(["prompt", "commentary", "user", "assistantText", "finalResponse"] as const)("serves local Markdown images in %s through signed raw URLs", (area) => {
     const input = state();
     input.projectCwd = path.resolve("preview project");
@@ -153,6 +220,30 @@ describe("Turn Preview", () => {
     expect(page).toContain("Live updates");
   });
 
+  test.each(["zh", "en"] as const)("renders current-turn total and cache tokens with exact values in %s", (language) => {
+    const mapped = mapCodexNotification("thread/tokenUsage/updated", {
+      threadId: "thread", turnId: "turn", tokenUsage: {
+        last: { inputTokens: 3_558, outputTokens: 5, totalTokens: 3_563, cachedInputTokens: 3_555 },
+        total: { inputTokens: 13_558, outputTokens: 105, totalTokens: 13_663, cachedInputTokens: 13_555 },
+      },
+    });
+    if (mapped?.kind !== "token_usage") throw new Error("Expected token usage");
+    const input = reduceTurnEvent(state(), { ...mapped, type: "token_usage_updated", sessionId: "session" });
+    const labels = language === "zh" ? ["非缓存", "总计", "缓存命中"] : ["Non-cached", "Total", "Cache hit"];
+    for (const status of ["running", "completed"] as const) {
+      const snapshot = renderTurnPreviewSnapshot({ ...input, status }, undefined, language);
+      expect(snapshot.metadata).toContain(`title="${labels[0]}: 8 tokens">${labels[0]} 8 tokens</span>`);
+      expect(snapshot.metadata).toContain(`title="${labels[1]}: 3,563 tokens">${labels[1]} 3.6K tokens</span>`);
+      expect(snapshot.metadata).toContain(`title="${labels[2]}: 3,555 tokens">${labels[2]} 3.6K tokens</span>`);
+      expect(snapshot.metadata).not.toContain("13,663");
+    }
+    expect(renderTurnPreviewSnapshot({ ...input, cachedInputTokens: 0 }, undefined, language).metadata)
+      .toContain(`${labels[2]} 0 tokens</span>`);
+    const legacy = renderTurnPreviewSnapshot({ ...state(), totalTokens: 8 }, undefined, language).metadata;
+    expect(legacy).not.toContain(labels[1]);
+    expect(legacy).not.toContain(labels[2]);
+  });
+
   test("detects the preferred browser language from Accept-Language", () => {
     expect(detectTurnPreviewLanguage(undefined)).toBe("zh");
     expect(detectTurnPreviewLanguage("en-US,en;q=0.9,zh;q=0.8")).toBe("en");
@@ -223,6 +314,35 @@ describe("Turn Preview", () => {
     const body = page.slice(page.indexOf("<body"));
     expect(body.split(input.prompt)).toHaveLength(2);
     expect(body).toMatch(/<h1[^>]*>Turn Preview<\/h1>/u);
+  });
+
+  test.each([
+    ["Read", [{ type: "read", path: "D:\\dev\\agent bot\\src\\file.ts" }], "Read D:\\dev\\agent bot\\src\\file.ts"],
+    ["Grep", [{ type: "search", query: "tool\\.command|title", path: "src/codex" }], 'Grep &quot;tool\\\\.command|title&quot; · src/codex'],
+    ["Read", [{ type: "read", path: "src/a&b.ts" }], "Read src/a&amp;b.ts"],
+    ["Grep", [{ type: "search", query: "<script>alert(1)</script>", path: "src" }], 'Grep &quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot; · src'],
+    ["Get-Content src/file.ts", [{ type: "read", path: "src/file.ts" }], "Get-Content src/file.ts"],
+    ['rg "pattern" src', [{ type: "search", query: "pattern", path: "src" }], 'rg &quot;pattern&quot; src'],
+    ["Read", undefined, "Read"],
+  ])("renders mapped %s targets safely in the title and expanded command", (command, commandActions, expected) => {
+    for (const method of ["item/started", "item/completed"]) {
+      const mapped = mapCodexNotification(method, {
+        threadId: "thread", turnId: "turn",
+        item: { id: "tool:1", type: "commandExecution", command, commandActions, aggregatedOutput: "file contents" },
+      });
+      expect(mapped?.kind).toBe("tool");
+      if (mapped?.kind !== "tool") throw new Error("Expected a mapped tool");
+      expect(mapped.tool.files).toBeUndefined();
+      for (const language of ["zh", "en"] as const) {
+        const { content } = renderTurnPreviewSnapshot(state(mapped.tool), undefined, language);
+        expect(content).toContain(`<code class="tool-command-title">${expected}</code>`);
+        expect(content).toContain(`<pre class="command-block">${expected}</pre>`);
+        expect(content).toContain("file contents");
+        expect(content).not.toContain("<script>");
+        expect(content.match(/<details /gu)).toHaveLength(1);
+        expect(content.match(/data-scroll-id=/gu)).toHaveLength(1);
+      }
+    }
   });
 
   test("collapses the cleaned command to a summary and keeps the full command in the body", () => {

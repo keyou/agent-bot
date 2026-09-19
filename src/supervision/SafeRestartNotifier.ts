@@ -121,6 +121,8 @@ export class SafeRestartNotifier {
         .filter((session) => session.status === "running" || this.store.countQueuedPrompts(session.localSessionId) > 0)
         .map((session) => ({
           id: session.remoteSessionId ?? session.localSessionId,
+          localSessionId: session.localSessionId,
+          isRunning: session.status === "running",
           title: session.title,
         }));
     await Promise.all(targets.map(async ({ contextKey, replyMessageId, reason }) => {
