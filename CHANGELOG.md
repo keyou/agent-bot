@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.1] - 2026-09-19
+
 - Show per-Turn total and cache-hit tokens in live Preview alongside the existing non-cached count, with exact values on hover and deduplicated usage updates; keep historical snapshots without usage details unchanged.
 - Show the full built-in TraeX model catalog, surface Provider model-discovery fallback warnings on settings cards, and display App Server errors and native retries on the existing progress card.
 - Preserve unphased assistant updates in the progress timeline and promote only the final eligible message, avoiding duplicate or premature answers in thinking cards and Preview.
