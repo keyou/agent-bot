@@ -2158,7 +2158,7 @@ export class ProxySessionController {
         await this.openExecutionSettings(contextKey, "model");
         return;
       case "provider":
-        await this.openProviderSettings(contextKey);
+        await this.openExecutionSettings(contextKey, "provider");
         return;
       case "thinking":
         await this.openExecutionSettings(contextKey, "thinking");
@@ -5177,21 +5177,6 @@ export class ProxySessionController {
       return;
     }
     await this.openExecutionSettings(contextKey, "agent");
-  }
-
-  private async openProviderSettings(contextKey: string): Promise<void> {
-    const loaded = await this.loadSession(this.requireCurrentSession(contextKey));
-    const providers = loaded.runtime.kind === "codex" && loaded.runtime.listModelProviders
-      ? await this.modelProviderOptions(loaded)
-      : [];
-    const current = loaded.session.modelProvider?.trim()
-      || providers.find((provider) => provider.isDefault)?.id
-      || "运行时默认";
-    if (providers.length <= 1) {
-      await this.outbound.sendText(contextKey, `当前 Provider：${current}\n当前没有其他 Provider 可以切换。`);
-      return;
-    }
-    await this.openExecutionSettings(contextKey, "provider", { sessionId: loaded.record.localSessionId });
   }
 
   private async selectProvider(

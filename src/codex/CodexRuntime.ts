@@ -29,7 +29,7 @@ import type {
 import { appendGeneratedImageMarkdown } from "../utils/generatedImageMarkdown.js";
 import { normalizeTaskTitle } from "../utils/taskTitle.js";
 import { AppServerRequestError } from "./AppServerConnection.js";
-import { mapCodexNotification } from "./CodexEventMapper.js";
+import { formatCodexError, mapCodexNotification } from "./CodexEventMapper.js";
 import { CodexLocalActivityDetector } from "./CodexLocalActivityDetector.js";
 import { detectProjectlessWorkspace } from "./ProjectlessWorkspace.js";
 import { threadWriterLockPath } from "./ThreadWriterProcess.js";
@@ -1460,7 +1460,7 @@ export class CodexRuntime implements AgentRuntime {
         type: "turn_failed",
         sessionId: session.localSessionId,
         turnId: turn.id,
-        message: turn.error?.message ?? "App Server turn failed.",
+        message: formatCodexError(turn.error) ?? "App Server turn failed.",
       });
       return;
     }
@@ -1639,7 +1639,7 @@ interface CodexTurnSnapshot {
     status?: string;
     savedPath?: string;
   }>;
-  error?: { message?: string } | null;
+  error?: { message?: string; additionalDetails?: string | null } | null;
   startedAt?: number | null;
   durationMs?: number | null;
 }
@@ -1798,7 +1798,7 @@ function remoteSessionSummary(thread: CodexThreadSnapshot): RemoteSessionSummary
     finalResponse: lastTurn && lastTurn.status !== "inProgress"
       ? appendGeneratedImageMarkdown(extractFinalResponse(lastTurn), extractGeneratedImagePaths(lastTurn)) || undefined
       : undefined,
-    lastError: lastTurn?.error?.message,
+    lastError: formatCodexError(lastTurn?.error),
     lastTurnToolCount: toolCounts?.total,
     lastTurnCompletedToolCount: toolCounts?.completed,
     lastTurnFailedToolCount: toolCounts?.failed,

@@ -84,7 +84,8 @@ describe("CodexRuntime", () => {
     runtime.onEvent((event) => events.push(event));
     await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
     const turnId = await runtime.startTurn("s1", "hello");
-    const error = { message: "Connection refused" };
+    const error = { message: "Reconnecting... 2/5", additionalDetails: "rate_limit_reached (code=3003). Please try again in 60 seconds." };
+    const fullError = `${error.message}\n\n${error.additionalDetails}`;
     client.emit("error", { threadId: "unrelated", turnId, error, willRetry: true });
     expect(events.filter((event) => event.type === "progress")).toHaveLength(0);
     for (const willRetry of [true, true, false]) {
@@ -93,22 +94,40 @@ describe("CodexRuntime", () => {
       expect(events.at(-1)).toMatchObject({
         type: "progress", sessionId: "s1", turnId, severity: "warning", append: false,
         activityId: `commentary:runtime-error:${turnId}`,
-        text: expect.stringContaining(willRetry ? "正在重试" : "等待 Agent 返回最终状态"),
+        text: `${willRetry ? "运行请求出错，Agent 正在重试" : "运行请求失败，等待 Agent 返回最终状态"}：${fullError}`,
       });
     }
     expect(events.some((event) => event.type === "turn_failed" || event.type === "turn_completed")).toBe(false);
-    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ turnId, willRetry: true, error: error.message }),
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ turnId, willRetry: true, error: fullError }),
       "App Server reported a turn error.");
     client.emit("item/agentMessage/delta", { threadId: "thr_1", turnId, itemId: "answer", delta: "Recovered" });
     client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status, error: status === "failed" ? error : null } });
     expect(runtime.getSession("s1")?.activeTurnId).toBeUndefined();
     expect(events.at(-1)).toMatchObject(status === "failed"
-      ? { type: "turn_failed", message: error.message }
+      ? { type: "turn_failed", message: fullError }
       : { type: "turn_completed", finalResponse: "Recovered" });
     const count = events.length;
     client.emit("error", { threadId: "thr_1", turnId, error, willRetry: true });
     client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status, error } });
     expect(events).toHaveLength(count);
+  });
+
+  test("preserves failure details when synchronizing and inspecting a remote turn", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    const turnId = await runtime.startTurn("s1", "hello");
+    client.readResult = { thread: { id: "thr_1", status: { type: "idle" }, turns: [{
+      id: turnId, status: "failed", items: [],
+      error: { message: "Request failed", additionalDetails: "HTTP 429: rate_limit_reached" },
+    }] } };
+    await runtime.synchronizeSession("s1");
+    expect(events.at(-1)).toMatchObject({ type: "turn_failed", message: "Request failed\n\nHTTP 429: rate_limit_reached" });
+    await expect(runtime.readRemoteSession("thr_1")).resolves.toMatchObject({
+      lastError: "Request failed\n\nHTTP 429: rate_limit_reached", lastTurnStatus: "failed",
+    });
   });
 
   test.each(["network", "401", "404", "503"])("keeps model fallback warnings visible for %s failures", async (failure) => {

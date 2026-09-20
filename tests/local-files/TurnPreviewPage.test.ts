@@ -22,6 +22,54 @@ function state(tool?: Partial<ToolState>): TurnViewState {
 }
 
 describe("Turn Preview", () => {
+  test.each(["zh", "en"] as const)("shows the latest runtime error reason literally in the %s preview", (language) => {
+    let input = state();
+    const additionalDetails = 'rate_limit_reached (code=3003). Please try again in 60 seconds.\n<script>alert(1)</script> ![remote](https://example.test/error.png)';
+    for (const attempt of [1, 2]) {
+      const mapped = mapCodexNotification("error", {
+        threadId: "thread", turnId: "turn", willRetry: true,
+        error: { message: `Reconnecting... ${attempt}/5`, additionalDetails },
+      });
+      if (mapped?.kind !== "runtime_error") throw new Error("Expected a runtime error");
+      input = reduceTurnEvent(input, {
+        type: "progress", sessionId: "session", turnId: "turn", activityId: "commentary:runtime-error:turn",
+        severity: "warning", append: false, text: `运行请求出错，Agent 正在重试：${mapped.message}`,
+      });
+      const preview = renderTurnPreviewSnapshot(input, undefined, language);
+      expect(preview.terminal).toBe(false);
+      expect(preview.content).toContain(`Reconnecting... ${attempt}/5`);
+      expect(preview.content.match(/rate_limit_reached/g)).toHaveLength(1);
+      expect(preview.content).toContain("Please try again in 60 seconds.");
+      expect(preview.content).toContain("&lt;script&gt;");
+      expect(preview.content).not.toContain("<script>");
+      expect(preview.content).not.toContain("<img");
+    }
+    expect(input.activities).toHaveLength(1);
+    expect(renderTurnPreviewSnapshot(input).content).not.toContain("Reconnecting... 1/5");
+    input = reduceTurnEvent(input, { type: "turn_completed", sessionId: "session", turnId: "turn", finalResponse: "Recovered" });
+    const completed = renderTurnPreviewSnapshot(input, undefined, language);
+    expect(completed.terminal).toBe(true);
+    expect(completed.content).toContain("rate_limit_reached");
+    expect(completed.content).toContain("Recovered");
+  });
+
+  test("keeps long error reasons complete in Preview and activity history while bounding the live card", () => {
+    const text = `Reconnecting... 2/5\n\n${"upstream detail ".repeat(500)}\nRATE_LIMIT_END`;
+    const input = reduceTurnEvent(state(), {
+      type: "progress", sessionId: "session", turnId: "turn", activityId: "commentary:runtime-error:turn",
+      severity: "warning", append: false, text,
+    });
+    expect(renderTurnPreviewSnapshot(input).content).toContain(text);
+    const renderer = new CardRenderer();
+    expect(JSON.stringify(renderer.renderTurn(input))).not.toContain("RATE_LIMIT_END");
+    expect(JSON.stringify(renderer.renderActivityHistory(input, 0))).toContain("RATE_LIMIT_END");
+    input.status = "failed";
+    input.error = "Request failed\n\nHTTP 429: rate_limit_reached";
+    const failed = renderTurnPreviewSnapshot(input);
+    expect(failed.terminal).toBe(true);
+    expect(failed.content).toContain(input.error);
+  });
+
   test("does not restore a promoted answer through the legacy progress fallback", () => {
     let input = reduceTurnEvent(state(), {
       type: "progress", sessionId: "session", turnId: "turn", activityId: "commentary:answer", text: "Only the final answer.",

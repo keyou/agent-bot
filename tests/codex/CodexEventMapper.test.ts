@@ -12,6 +12,25 @@ describe("mapCodexNotification", () => {
   });
 
   test.each([
+    { message: "Reconnecting... 2/5", additionalDetails: "rate_limit_reached (code=3003). Please try again in 60 seconds.", expected: "Reconnecting... 2/5\n\nrate_limit_reached (code=3003). Please try again in 60 seconds." },
+    { message: " Connection refused ", additionalDetails: " Connection refused ", expected: "Connection refused" },
+    { message: "HTTP 503: Service unavailable", additionalDetails: "Service unavailable", expected: "HTTP 503: Service unavailable" },
+    { message: "Service unavailable", additionalDetails: "HTTP 503: Service unavailable", expected: "HTTP 503: Service unavailable" },
+    { message: "Reconnecting... 1/5", additionalDetails: " \n ", expected: "Reconnecting... 1/5" },
+    { message: "Reconnecting... 1/5", additionalDetails: { reason: "invalid" }, expected: "Reconnecting... 1/5" },
+    { message: " ", additionalDetails: "Request timed out", expected: "Request timed out" },
+  ])("preserves error details without duplicating text: $expected", ({ message, additionalDetails, expected }) => {
+    const error = { message, additionalDetails };
+    for (const willRetry of [true, false]) {
+      expect(mapCodexNotification("error", { threadId: "thr_1", turnId: "turn_1", willRetry, error }))
+        .toMatchObject({ kind: "runtime_error", willRetry, message: expected });
+    }
+    expect(mapCodexNotification("turn/completed", {
+      threadId: "thr_1", turn: { id: "turn_1", status: "failed", error },
+    })).toMatchObject({ kind: "terminal", status: "failed", error: expected });
+  });
+
+  test.each([
     { error: null, willRetry: true },
     { error: { message: " " }, willRetry: true },
     { error: { message: "failed" }, willRetry: "true" },

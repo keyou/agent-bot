@@ -9405,19 +9405,53 @@ describe("ProxySessionController", () => {
     expect(serialized).toContain('"tag":"markdown","content":"Model"');
   });
 
-  test("reports the current Provider without a card when no alternative is configured", async () => {
-    const { controller, runtime, outbound } = fixture();
-    (runtime.listModelProviders as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  test.each([
+    { command: "/provider", provider: "openai", listed: true },
+    { command: "/provi", provider: "trae", listed: true },
+    { command: "/provider", provider: "openai", listed: false },
+    { command: "/provi", provider: "trae", listed: false },
+  ])("opens $command settings with only $provider (listed: $listed)", async ({ command, provider, listed }) => {
+    const { controller, runtime, outbound, config } = fixture();
+    config.agents.codex!.defaults = { modelProvider: provider };
+    vi.mocked(runtime.listModelProviders!).mockResolvedValue(listed ? [{ id: provider, isDefault: true }] : []);
     await controller.onMessage(message("/new"));
-    (outbound.sendInteractiveCard as ReturnType<typeof vi.fn>).mockClear();
+    vi.mocked(outbound.sendInteractiveCard).mockClear();
+    vi.mocked(runtime.listModelProviders!).mockClear();
+
+    await controller.onMessage(message(command));
+
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1];
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain("运行设置");
+    expect(serialized).toContain('"tag":"markdown","content":"Provider"');
+    expect(serialized).toContain(`\`${provider}\``);
+    expect(serialized).toContain("✅ 当前");
+    for (const tab of ["model", "thinking", "permission"]) {
+      expect(serialized).toContain(`"tab":"${tab}"`);
+    }
+    expect(outbound.sendText).not.toHaveBeenCalledWith(
+      "chat_id:c1",
+      expect.stringContaining("当前没有其他 Provider 可以切换"),
+    );
+    expect(runtime.listModelProviders).toHaveBeenCalledOnce();
+    expect(runtime.setExecutionSettings).not.toHaveBeenCalled();
+  });
+
+  test("keeps the settings card available when the runtime cannot switch Providers", async () => {
+    const { controller, outbound } = fixture();
+    await controller.onMessage(message("/new --agent acp"));
+    vi.mocked(outbound.sendInteractiveCard).mockClear();
 
     await controller.onMessage(message("/provider"));
 
-    expect(outbound.sendText).toHaveBeenLastCalledWith(
-      "chat_id:c1",
-      "当前 Provider：openai\n当前没有其他 Provider 可以切换。",
-    );
-    expect(outbound.sendInteractiveCard).not.toHaveBeenCalled();
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    const serialized = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1]);
+    expect(serialized).toContain("运行设置");
+    expect(serialized).toContain("当前运行时不支持 Provider 切换");
+    expect(serialized).toContain('"tab":"model"');
+    expect(serialized).toContain('"tab":"thinking"');
+    expect(serialized).toContain('"tab":"permission"');
   });
 
   test("includes the current Provider in CLI settings when the runtime omits it", async () => {

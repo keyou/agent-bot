@@ -125,7 +125,7 @@ agentbot task permissions [auto|confirm]
 
 Omit the value to inspect the current setting and available choices. `agent` changes the default Agent for future tasks in that conversation. The other settings affect the specified task from its next request and become the saved defaults for that Agent.
 
-A successful Provider switch confirms settings, not inference connectivity. Model-list fallback warnings appear on settings cards; inspect the Provider service when availability is unconfirmed. App Server errors and native retry notices appear on the current progress card without terminating the turn. Do not stop or restart a retrying task unless the user requests it.
+A successful Provider switch confirms settings, not inference connectivity. Model-list fallback warnings appear on settings cards; inspect the Provider service when availability is unconfirmed. App Server errors and native retry notices show the message and supplied `additionalDetails` as literal text on the current progress card and Preview without terminating the turn. Use Preview for long reasons; `Reconnecting` alone does not identify the cause when the Agent supplies no details, and old snapshots are not backfilled. Do not stop or restart a retrying task unless the user requests it.
 
 Providers such as a Responses bridge may omit assistant message phases. Unphased text stays in the progress timeline; successful completion promotes only the last message not followed by a tool start. Do not diagnose progress text in the answer area as a CSS issue without checking message phases. Old snapshots are not automatically backfilled.
 

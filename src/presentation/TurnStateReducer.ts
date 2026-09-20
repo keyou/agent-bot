@@ -179,7 +179,7 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
       const activityUpdate = upsertReasoningActivity(
         warning ? activities.filter((activity) => activity.id !== (event.activityId ?? "progress")) : activities,
         event.activityId ?? "progress",
-        warning ? bound(event.text) : event.text,
+        warning && !event.activityId?.startsWith("commentary:runtime-error:") ? bound(event.text) : event.text,
         !warning && event.append === true,
         event.activityId?.startsWith("commentary:") ? "assistant" : "reasoning",
       );
@@ -252,7 +252,7 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
         approval: undefined,
         completedAt,
         durationMs: Math.max(0, completedAt - state.startedAt),
-        error: bound(event.message),
+        error: event.message,
       };
     }
   }

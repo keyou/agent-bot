@@ -51,13 +51,16 @@ describe("FeishuTurnPresenter", () => {
     await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
     await presenter.flushAll();
     vi.mocked(outbound.updateInteractiveCard).mockClear();
-    for (const text of ["运行请求出错，Agent 正在重试：Connection refused", "运行请求出错，Agent 正在重试：HTTP 503"]) {
+    for (const text of [
+      "运行请求出错，Agent 正在重试：Reconnecting... 1/5\n\nrate_limit_reached (code=3003). Please try again in 60 seconds.",
+      "运行请求出错，Agent 正在重试：Reconnecting... 2/5\n\nHTTP 503: Service unavailable",
+    ]) {
       await presenter.onEvent({
         type: "progress", sessionId: "s1", turnId: "turn_1", severity: "warning",
         activityId: "commentary:runtime-error:turn_1", append: false, text,
       });
       await vi.waitFor(() => expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]))
-        .toContain(text));
+        .toContain(JSON.stringify(text).slice(1, -1)));
       expect(store.getTurnSnapshot("turn_1")).toMatchObject({
         status: "running", activities: [{ kind: "assistant", id: "commentary:runtime-error:turn_1", text }],
       });
@@ -228,6 +231,43 @@ describe("FeishuTurnPresenter", () => {
       (outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1],
     );
     expect(historyCard).toContain("http://127.0.0.1:3210/view/log?sig=signed");
+  });
+
+  test.each([false, true])("resolves relative report links in cards and final replies (topic: %s)", async (topic) => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const viewerUrl = "http://127.0.0.1:3210/preview/report?path=report.md";
+    const localFileUrl = vi.fn(() => viewerUrl);
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, {
+      criticalGapMs: 0, localFileUrl,
+    });
+    const projectCwd = "C:\\Users\\Admin\\Documents\\Codex\\2026-09-20\\jev";
+    presenter.registerSession("s1", "chat_id:c1", undefined, projectCwd);
+    const replyTarget = { messageId: "topic_root", replyInThread: true } as const;
+    if (topic) await presenter.startPendingTurn("s1", "chat_id:c1", undefined, replyTarget);
+    const markdown = "[查看研究报告](outputs/jev-ultrafast-vs-aha-bua.md)";
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.onEvent({
+      type: "progress", sessionId: "s1", turnId: "turn_1", activityId: "commentary:report", text: markdown,
+    });
+    await presenter.flushAll();
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1])).toContain(viewerUrl);
+    await presenter.onEvent(completed(markdown));
+    const normalized = `[查看研究报告](${viewerUrl})`;
+    if (topic) {
+      expect(outbound.replyMarkdown).toHaveBeenCalledExactlyOnceWith("chat_id:c1", replyTarget, normalized, expect.any(String));
+      expect(outbound.sendMarkdown).not.toHaveBeenCalled();
+    } else {
+      expect(outbound.sendMarkdown).toHaveBeenCalledExactlyOnceWith("chat_id:c1", normalized, expect.any(String));
+    }
+    expect(localFileUrl).toHaveBeenCalledWith(`${projectCwd}\\outputs\\jev-ultrafast-vs-aha-bua.md`, undefined);
+    expect(store.getTurnSnapshot("turn_1")).toMatchObject({ finalResponse: markdown, projectCwd });
+    expect(JSON.stringify(store.getTurnSnapshot("turn_1"))).not.toContain(viewerUrl);
+    await presenter.showDetails("chat_id:c1", "turn_1");
+    expect(JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1])).toContain(viewerUrl);
+    await presenter.showActivityPage("chat_id:c1", "turn_1", 0, "history_card");
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1])).toContain(viewerUrl);
+    await presenter.flushAll();
   });
 
   test("adds Agent Bot branding only to the last chunk of a long final answer", async () => {

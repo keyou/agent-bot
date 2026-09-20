@@ -362,6 +362,9 @@ function renderActivity(
 ): string {
   switch (activity.kind) {
     case "assistant":
+      if (activity.id.startsWith("commentary:runtime-error:")) {
+        return `<article class="activity message runtime-error" data-activity="${escapeAttribute(activity.id)}"><pre>${escapeHtml(activity.text)}</pre></article>`;
+      }
       return renderMessageActivity(activity.id, activity.text, "commentary", renderText);
     case "user":
       return renderMessageActivity(activity.id, activity.text, "user", renderText);
@@ -813,6 +816,7 @@ summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; 
 .tool-meta span { white-space: nowrap; }
 .tool-header-timing { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tool-header-timing:empty, .tool-footer-timing:empty { display: none; }
+.runtime-error pre { white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--danger); }
 .error-output, .error-result h2 { color: var(--danger); }
 .muted, .empty { color: var(--muted); }
 .notice, .empty { padding: 10px 0; }

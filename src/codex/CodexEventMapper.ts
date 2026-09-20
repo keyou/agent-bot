@@ -73,7 +73,7 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
   if (!threadId || !turnId) return undefined;
 
   if (method === "error" && isRecord(params.error)) {
-    const message = stringValue(params.error.message)?.trim();
+    const message = formatCodexError(params.error);
     if (!message || typeof params.willRetry !== "boolean") return undefined;
     return { kind: "runtime_error", threadId, turnId, message, willRetry: params.willRetry };
   }
@@ -200,7 +200,7 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
   if (method === "turn/completed" && isRecord(params.turn)) {
     const status = params.turn.status;
     const mappedStatus = status === "interrupted" ? "cancelled" : status === "failed" ? "failed" : "completed";
-    const error = isRecord(params.turn.error) ? stringValue(params.turn.error.message) : undefined;
+    const error = formatCodexError(params.turn.error);
     return {
       kind: "terminal",
       threadId,
@@ -211,6 +211,15 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
     };
   }
   return undefined;
+}
+
+export function formatCodexError(error: unknown): string | undefined {
+  if (!isRecord(error)) return undefined;
+  const message = stringValue(error.message)?.trim();
+  const details = stringValue(error.additionalDetails)?.trim();
+  if (!message) return details || undefined;
+  if (!details || message.includes(details)) return message;
+  return details.includes(message) ? details : `${message}\n\n${details}`;
 }
 
 function mapTool(

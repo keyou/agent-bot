@@ -54,6 +54,20 @@ function state(): TurnViewState {
 }
 
 describe("CardRenderer", () => {
+  test.each(["grouped", "timeline"] as const)("renders runtime error reasons as literal text in %s cards", (thinkingCardLayout) => {
+    const input = state();
+    const text = '运行请求出错，Agent 正在重试：Reconnecting... 2/5\n\nrate_limit_reached (code=3003). Please try again in 60 seconds.\n<img src=x onerror="alert(1)"> ![remote](https://example.test/error.png)';
+    input.activities = [{ kind: "assistant", id: "commentary:runtime-error:turn_1", text }];
+    const renderer = new CardRenderer({ thinkingCardLayout });
+    for (const card of [renderer.renderTurn(input), renderer.renderTurnDetails(input)]) {
+      const error = collectObjects(card).find((item) => item.tag === "markdown" && String(item.content).includes("rate_limit_reached"));
+      expect(error?.content).toBe(`\`\`\`\n${text}\n\`\`\``);
+      const html = new MarkdownIt({ html: true }).render(String(error?.content));
+      expect(html).not.toContain("<img");
+      expect(html).toContain("&lt;img");
+    }
+  });
+
   test("identifies a requested Turn and links its saved runtime details to Preview", () => {
     const serialized = JSON.stringify(new CardRenderer().renderTurnDetails({
       ...state(), status: "completed", assistantText: "Completed result",

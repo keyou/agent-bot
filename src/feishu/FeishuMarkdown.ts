@@ -54,11 +54,25 @@ function includeLocalFileLineReferences(
   projectCwd?: string,
   localFileUrl?: LocalFileUrlResolver,
 ): string {
-  return markdown.replace(MARKDOWN_LINK, (link, imageMarker: string, label: string, rawTarget: string) => {
-    if (imageMarker) return link;
+  const codeSpans = inlineCodeSpans(markdown);
+  return markdown.replace(MARKDOWN_LINK, (link, imageMarker: string, label: string, rawTarget: string, offset: number) => {
+    if (imageMarker || codeSpans.some(([start, end]) => offset >= start && offset < end)) return link;
 
     const target = unwrapMarkdownTarget(rawTarget.trim());
-    if (!isLocalFileTarget(target)) return link;
+    if (!isLocalFileTarget(target)) {
+      const relative = resolveRelativeFileTarget(target, projectCwd);
+      if (!relative || isLocalImageTarget(relative.filePath)) return link;
+      const viewerUrl = localFileUrl?.(relative.filePath, relative.reference);
+      if (!viewerUrl) {
+        const displayPath = displayAbsolutePath(relative.filePath) + (relative.reference ?? "");
+        return label ? `${label}(${inlineCode(displayPath)})` : inlineCode(displayPath);
+      }
+      const url = new URL(viewerUrl);
+      if (relative.hash) url.hash = relative.hash;
+      const normalizedLabel = relative.reference && !label.endsWith(relative.reference)
+        ? `${label}${relative.reference}` : label;
+      return `[${normalizedLabel}](${url.toString()})`;
+    }
     if (isLocalImageTarget(target)) return link;
 
     const reference = LOCAL_FILE_LINE_REFERENCE.exec(target)?.[1];
@@ -82,6 +96,58 @@ function includeLocalFileLineReferences(
       ? `[${label}](${viewerUrl})(${inlineCode(projectPathLabel)})`
       : `${label}(${inlineCode(projectPathLabel)})`;
   });
+}
+
+interface RelativeFileTarget {
+  filePath: string;
+  reference?: string;
+  hash?: string;
+}
+
+function resolveRelativeFileTarget(target: string, projectCwd?: string): RelativeFileTarget | undefined {
+  if (!projectCwd || !target || /^(?:#|\?|\/\/)/u.test(target)) return undefined;
+  const pathApi = usesWindowsPaths(projectCwd) ? path.win32 : path.posix;
+  if (!pathApi.isAbsolute(projectCwd)) return undefined;
+  const suffixStart = target.search(/[?#]/u);
+  const pathTarget = suffixStart < 0 ? target : target.slice(0, suffixStart);
+  const lineSuffix = LOCAL_FILE_LINE_REFERENCE.exec(pathTarget)?.[1];
+  // A basename with a line suffix (report.md:12) is a file, not a URI scheme.
+  const fileWithLine = /^[^:/\\]+\.[^:/\\]+:\d+(?::\d+)?$/u.test(pathTarget);
+  if (!fileWithLine && /^[a-z][a-z\d+.-]*:/iu.test(target)) return undefined;
+  const encodedPath = lineSuffix ? pathTarget.slice(0, -lineSuffix.length) : pathTarget;
+  try {
+    const decodedPath = decodeURIComponent(encodedPath);
+    if (!decodedPath || /[\x00-\x1f\x7f]/u.test(decodedPath)
+      || pathApi.isAbsolute(decodedPath) || /^[a-z]:/iu.test(decodedPath)) return undefined;
+    const filePath = pathApi.resolve(projectCwd, decodedPath);
+    const hashStart = target.indexOf("#");
+    const hash = hashStart < 0 ? undefined : new URL(target.slice(hashStart), "http://localhost/").hash;
+    const hashLine = /^#L(\d+)(?:C\d+)?(?:-L?\d+(?:C\d+)?)?$/u.exec(hash ?? "")?.[1];
+    const validHashLine = hashLine && Number.isSafeInteger(Number(hashLine)) && Number(hashLine) > 0;
+    return {
+      filePath,
+      reference: validHashLine ? `:${Number(hashLine)}` : hash ? undefined : lineSuffix,
+      hash: validHashLine ? `#L${Number(hashLine)}` : hash,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function inlineCodeSpans(markdown: string): Array<[number, number]> {
+  const runs = [...markdown.matchAll(/`+/gu)];
+  const spans: Array<[number, number]> = [];
+  for (let index = 0; index < runs.length; index += 1) {
+    const opener = runs[index]!;
+    const backslashes = /\\*$/u.exec(markdown.slice(0, opener.index))?.[0].length ?? 0;
+    if (backslashes % 2 !== 0) continue;
+    const closing = runs.findIndex((run, candidate) => candidate > index && run[0].length === opener[0].length);
+    if (closing < 0) continue;
+    const closer = runs[closing]!;
+    spans.push([opener.index, closer.index + closer[0].length]);
+    index = closing;
+  }
+  return spans;
 }
 
 function projectFilePathLabel(

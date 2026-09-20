@@ -571,6 +571,7 @@ export function runNpmCommand(args: string[], cwd: string): CommandResult {
     {
       cwd,
       env: process.env,
+      windowsHide: true,
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
       shell: process.platform === "win32",
@@ -610,6 +611,7 @@ function runNode(args: string[], cwd: string): CommandResult {
     spawnSync(process.execPath, args, {
       cwd,
       env: process.env,
+      windowsHide: true,
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
     }),

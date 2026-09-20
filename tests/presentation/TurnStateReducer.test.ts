@@ -31,10 +31,13 @@ describe("TurnStateReducer", () => {
       { kind: "assistant", id: "commentary:work", text: "Working again" },
       { kind: "assistant", id: activityId, text: "Retry 2" },
     ]);
-    state = reduceTurnEvent(state, event("progress", { activityId, text: "x".repeat(20_000), severity: "warning" }));
-    expect(state.activities?.at(-1)).toMatchObject({ text: expect.any(String) });
-    expect(JSON.stringify(state.activities?.at(-1)).length).toBeLessThan(7_000);
+    const text = `Reconnecting... 2/5\n${"x".repeat(20_000)}\nrate_limit_reached`;
+    state = reduceTurnEvent(state, event("progress", { activityId, text, severity: "warning" }));
+    expect(state.activities?.at(-1)).toMatchObject({ text });
+    expect(state.progressText?.length).toBeLessThanOrEqual(6_000);
     expect(state.activities).toHaveLength(2);
+    state = reduceTurnEvent(state, event("turn_failed", { message: text }));
+    expect(state.error).toBe(text);
   });
 
   test("replaces streamed plan text without duplicating it or exposing a final answer", () => {

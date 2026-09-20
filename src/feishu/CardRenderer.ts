@@ -1847,6 +1847,10 @@ function renderActivity(
   if (activity.kind === "assistant" || (activity.kind === "reasoning" && activity.id.startsWith("commentary:"))) {
     const text = activity.text.trim();
     if (!text) return [];
+    if (activity.id.startsWith("commentary:runtime-error:")) {
+      const chunks = fullAssistantText ? splitText(text, ACTIVITY_TEXT_CHUNK) : [text];
+      return chunks.map((chunk) => markdown(codeBlock(chunk, fullAssistantText ? ACTIVITY_TEXT_CHUNK : MAX_LIVE_ASSISTANT_TEXT)));
+    }
     return fullAssistantText
       ? splitText(text, ACTIVITY_TEXT_CHUNK).map(markdown)
       : [markdown(truncateText(text, MAX_LIVE_ASSISTANT_TEXT))];
