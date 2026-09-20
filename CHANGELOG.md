@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.2] - 2026-09-20
+
 - Preserve App Server error details in live notifications, recovered Turns, and task summaries, and render runtime errors as literal text in cards and Turn Preview.
 - Resolve relative file links in Feishu answers and thinking cards against the saved Turn project directory, preserving references and code while avoiding invalid web links for unavailable files.
 - Keep the execution settings card available from `/provider` when only one Provider is configured or Provider switching is unsupported.
