@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   compareSemver,
+  finalizeSelfUpdatePlan,
   defaultUpdateChannel,
   inspectNpmInstallation,
   parseSelfUpdateOptions,
@@ -248,3 +249,16 @@ function temporaryDirectory(): string {
 function command(stdout: string, status = 0) {
   return { status, stdout: `${stdout}\n`, stderr: "" };
 }
+
+
+describe("self-update notification routing", () => {
+  test("preserves the initiating group or topic in the prepared plan for recovery", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-update-target-"));
+    temporaryDirectories.push(directory);
+    const planPath = path.join(directory, "plan.json");
+    fs.writeFileSync(planPath, JSON.stringify({ fromVersion: "0.1.23", toVersion: "0.1.24-alpha.1" }));
+    const notificationTarget = { contextKey: "chat_id:group:thread_id:topic", replyMessageId: "update-card" };
+    finalizeSelfUpdatePlan(planPath, { controlEndpoint: "endpoint", databasePath: "state.sqlite", restartService: true, notificationTarget });
+    expect(JSON.parse(fs.readFileSync(planPath, "utf8"))).toMatchObject({ fromVersion: "0.1.23", toVersion: "0.1.24-alpha.1", notificationTarget, restartService: true });
+  });
+});

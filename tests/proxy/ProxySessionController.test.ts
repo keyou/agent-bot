@@ -577,6 +577,8 @@ function fixture(
   const cancelSafeRestart = vi.fn(async () => true);
   const forceSafeRestart = vi.fn(async () => true);
   const cancelAutomaticUpdate = vi.fn(async () => undefined);
+  const showUpdates = vi.fn(async () => undefined);
+  const selectUpdate = vi.fn(async () => undefined);
   const rememberFeishuUserOpenId = vi.fn(async () => undefined);
   const persistAgentExecutionDefaults = vi.fn(async () => undefined);
   const shellCommandExecutor = vi.fn(async () => ({
@@ -603,6 +605,8 @@ function fixture(
       cancelSafeRestart,
       forceSafeRestart,
       cancelAutomaticUpdate,
+      showUpdates,
+      selectUpdate,
       rememberFeishuUserOpenId,
       persistAgentExecutionDefaults,
     },
@@ -631,6 +635,8 @@ function fixture(
     cancelSafeRestart,
     forceSafeRestart,
     cancelAutomaticUpdate,
+    showUpdates,
+    selectUpdate,
     rememberFeishuUserOpenId,
     persistAgentExecutionDefaults,
     shellCommandExecutor,
@@ -642,6 +648,19 @@ function fixture(
 }
 
 describe("ProxySessionController", () => {
+  test("opens update choices without a task and routes explicit selections within their topic", async () => {
+    const { controller, showUpdates, selectUpdate, runtime, store } = fixture();
+    const incoming = { ...threadMessage("c1", "group", "topic-update", "root", "/update"), userId: "ou_owner" };
+    await controller.onMessage(incoming);
+    expect(showUpdates).toHaveBeenCalledWith(incoming.contextKey, "ou_owner");
+    expect(store.getUserContext(incoming.contextKey)?.currentSessionId).toBeUndefined();
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    const action = { actionId: "choose-update", contextKey: incoming.contextKey, userId: "ou_owner", messageId: "update-card", value: { action: "agentbot_update_select", token: "saved-token" } };
+    await controller.onCardAction(action);
+    expect(selectUpdate).toHaveBeenCalledWith(action, { messageId: "update-card", replyInThread: true });
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+  });
+
   test.each([undefined, "codex"])("clone selects the conversation default or explicit Agent (%s) without touching active work", async (agentName) => {
     const { controller, runtime, sessions, store, config } = fixture();
     await controller.onMessage(message("source work"));
@@ -11003,6 +11022,7 @@ describe("ProxySessionController", () => {
       "/status",
       "/restart",
       "/release",
+      "/update",
       "/mute",
       "/help",
     ];

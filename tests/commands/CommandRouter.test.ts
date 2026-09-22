@@ -43,6 +43,13 @@ describe("CommandRouter", () => {
     expect(() => router.parse("/restart --force extra")).toThrow("只接受一个可选的 --force 参数");
   });
 
+  test("opens the update selector and accepts unique prefixes without arguments", () => {
+    expect(router.parse("/update")).toEqual({ type: "update" });
+    expect(router.parse("/upd")).toEqual({ type: "update" });
+    expect(() => router.parse("/update alpha")).toThrow("不接受参数");
+    expect(() => router.parse("/update --force")).toThrow("不接受参数");
+  });
+
   test("parses App Server release commands", () => {
     expect(router.parse("/release")).toEqual({ type: "release" });
     expect(router.parse("/rel")).toEqual({ type: "release" });

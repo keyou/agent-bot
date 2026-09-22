@@ -109,6 +109,7 @@ describe("CLI help", () => {
       provider: "task provider|model",
       queue: "task queue",
       release: "task release",
+      update: "agentbot update",
       restart: "task restart",
       sessions: "task list",
       status: "task status|chat",

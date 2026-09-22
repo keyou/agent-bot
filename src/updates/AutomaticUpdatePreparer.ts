@@ -5,11 +5,11 @@ import { z } from "zod";
 import { loadConfig } from "../config/loadConfig.js";
 import { controlEndpoint } from "../cli/controlProtocol.js";
 import { finalizeSelfUpdatePlan, prepareSelfUpdate, releaseSelfUpdatePlan, requireNpmSelfUpdateInstallation } from "../cli/SelfUpdater.js";
-import { stableVersionSchema } from "./PublishedRelease.js";
+import { publishedVersionSchema, stableVersionSchema } from "./PublishedRelease.js";
 
 const resultSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("current") }),
-  z.object({ status: z.literal("prepared"), planPath: z.string().min(1), targetVersion: stableVersionSchema }),
+  z.object({ status: z.literal("prepared"), planPath: z.string().min(1), targetVersion: publishedVersionSchema }),
 ]);
 const runFile = promisify(execFile);
 type RunPreparation = (file: string, args: string[], options: ExecFileOptionsWithStringEncoding) => Promise<{ stdout: string }>;
@@ -32,11 +32,24 @@ export async function prepareAutomaticUpdate(
   return result;
 }
 
-async function runPreparer(argument: string, profile: UpdateProfile, run: RunPreparation): Promise<unknown> {
+export async function prepareSelectedUpdate(
+  version: string,
+  profile: UpdateProfile,
+  run: RunPreparation = runFile,
+): Promise<z.infer<typeof resultSchema>> {
+  publishedVersionSchema.parse(version);
+  const result = resultSchema.parse(await runPreparer("--manual", profile, run, version));
+  if (result.status === "prepared" && result.targetVersion !== version) {
+    throw new Error("The prepared update does not match the selected version.");
+  }
+  return result;
+}
+
+async function runPreparer(argument: string, profile: UpdateProfile, run: RunPreparation, version?: string): Promise<unknown> {
   const environment: NodeJS.ProcessEnv = { ...process.env, AGENT_BOT_HOME: profile.home, AGENT_BOT_CONFIG: profile.configPath };
   delete environment.AGENT_BOT;
   // npm preparation is synchronous and can take minutes; keep it off the live worker's event loop.
-  const { stdout } = await run(process.execPath, [fileURLToPath(import.meta.url), argument], {
+  const { stdout } = await run(process.execPath, [fileURLToPath(import.meta.url), argument, ...(version ? [version] : [])], {
     env: environment, windowsHide: true, encoding: "utf8", maxBuffer: 1_000_000,
   });
   return JSON.parse(String(stdout)) as unknown;
@@ -48,9 +61,10 @@ async function main(): Promise<void> {
     process.stdout.write(JSON.stringify({ status: "supported" }));
     return;
   }
-  const version = stableVersionSchema.parse(process.argv[2]);
+  const manual = process.argv[2] === "--manual";
+  const version = manual ? publishedVersionSchema.parse(process.argv[3]) : stableVersionSchema.parse(process.argv[2]);
   const config = loadConfig();
-  const prepared = await prepareSelfUpdate({ version, channel: "latest" });
+  const prepared = await prepareSelfUpdate({ version });
   if (prepared.status === "prepared") {
     try {
       finalizeSelfUpdatePlan(prepared.planPath, {
@@ -58,7 +72,7 @@ async function main(): Promise<void> {
         databasePath: config.storage.sqlitePath,
         restartService: true,
         workingDirectory: process.cwd(),
-        reason: `Agent Bot 自动更新到 ${version}`,
+        reason: `Agent Bot ${manual ? "更新" : "自动更新"}到 ${version}`,
       });
     } catch (error) {
       releaseSelfUpdatePlan(prepared.planPath);

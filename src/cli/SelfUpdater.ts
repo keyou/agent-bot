@@ -316,6 +316,7 @@ export function finalizeSelfUpdatePlan(
     workingDirectory?: string;
     reason?: string;
     notificationSessionId?: string;
+    notificationTarget?: SelfUpdatePlan["notificationTarget"];
   },
 ): void {
   const plan = readSelfUpdatePlan(planPath);
@@ -324,6 +325,7 @@ export function finalizeSelfUpdatePlan(
   plan.restartService = values.restartService;
   if (values.workingDirectory) plan.workingDirectory = values.workingDirectory;
   if (values.reason) plan.reason = values.reason;
+  if (values.notificationTarget) plan.notificationTarget = values.notificationTarget;
   if (values.notificationSessionId)
     plan.notificationSessionId = values.notificationSessionId;
   fs.writeFileSync(planPath, `${JSON.stringify(plan, null, 2)}\n`);

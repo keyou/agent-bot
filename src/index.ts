@@ -29,9 +29,10 @@ import { ProxySessionController } from "./proxy/ProxySessionController.js";
 import type { AgentEnvironmentContext } from "./runtime/agentEnvironment.js";
 import { createAgentRuntimeRegistry } from "./runtime/createAgentRuntimeRegistry.js";
 import { StateStore } from "./state/StateStore.js";
+import { ManualUpdateController } from "./updates/ManualUpdateController.js";
 import { DailyUpdateMonitor } from "./updates/DailyUpdateMonitor.js";
-import { readLatestStableVersion, readReleaseNotes } from "./updates/PublishedRelease.js";
-import { checkAutomaticUpdateSupport, prepareAutomaticUpdate } from "./updates/AutomaticUpdatePreparer.js";
+import { readLatestStableVersion, readReleaseNotes, readPublishedReleases } from "./updates/PublishedRelease.js";
+import { checkAutomaticUpdateSupport, prepareAutomaticUpdate, prepareSelectedUpdate } from "./updates/AutomaticUpdatePreparer.js";
 import { StartupNotifier } from "./startup/StartupNotifier.js";
 import { SessionMetadataHydrator } from "./startup/SessionMetadataHydrator.js";
 import { startFeishu } from "./startup/startFeishu.js";
@@ -56,6 +57,7 @@ import {
 import { refreshedSystemEnvironment } from "./supervision/systemEnvironment.js";
 import {
   assertSelfUpdatePlanPath,
+  finalizeSelfUpdatePlan,
   launchSelfUpdateRunner,
   readPendingSelfUpdate,
   releaseSelfUpdatePlan,
@@ -155,6 +157,7 @@ const outbound = new OutboundRouter(routes);
 let shuttingDown = false;
 let restartRequested = false;
 let pendingSelfUpdatePlanPath: string | undefined;
+let preparingSelfUpdate = false;
 const safeRestart = new SafeRestartScheduler({
   readActivity: () => store.getServerActivityState(),
   onReady: (reason, notificationTargets) => pendingSelfUpdatePlanPath
@@ -170,29 +173,62 @@ if (feishuOutbound && config.updates?.enabled !== false) {
     readLatest: readLatestStableVersion,
     readNotes: readReleaseNotes,
     checkSupport: () => checkAutomaticUpdateSupport({ home: agentBotHome(), configPath: activeConfigPath }),
-    hasPendingUpdate: () => shuttingDown || restartRequested || !!pendingSelfUpdatePlanPath || safeRestart.scheduled,
+    hasPendingUpdate: () => preparingSelfUpdate || shuttingDown || restartRequested || !!pendingSelfUpdatePlanPath || safeRestart.scheduled,
     pendingVersion: () => pendingSelfUpdatePlanPath ? readPendingSelfUpdate(agentBotHome())?.plan.toVersion : undefined,
-    applyUpdate: async (version) => {
-      const prepared = await prepareAutomaticUpdate(version, { home: agentBotHome(), configPath: activeConfigPath });
-      try {
-        if (shuttingDown || restartRequested || pendingSelfUpdatePlanPath || safeRestart.scheduled) {
-          throw new Error("服务正在停止或已有更新/重启等待执行，本次自动更新已停止。");
-        }
-        const target = privateRestartNotificationTarget(config.feishu.userOpenId);
-        if (prepared.status === "prepared") {
-          assertSelfUpdatePlanPath(prepared.planPath, agentBotHome());
-          pendingSelfUpdatePlanPath = prepared.planPath;
-        }
-        safeRestart.schedule(`Agent Bot 自动更新到 ${version}`, target);
-      } catch (error) {
-        if (prepared.status === "prepared") releaseSelfUpdatePlan(prepared.planPath);
-        throw error;
-      }
-    },
+    applyUpdate: (version) => prepareAndScheduleUpdate(version, privateRestartNotificationTarget(config.feishu.userOpenId)),
   });
 }
+const manualUpdates = new ManualUpdateController({
+  store, outbound, logger, currentVersion: agentBotVersion,
+  ownerOpenId: () => config.feishu.userOpenId,
+  readReleases: readPublishedReleases,
+  checkSupport: () => checkAutomaticUpdateSupport({ home: agentBotHome(), configPath: activeConfigPath }),
+  hasPendingUpdate: () => preparingSelfUpdate || shuttingDown || restartRequested || !!pendingSelfUpdatePlanPath || safeRestart.scheduled,
+  applyUpdate: (version, contextKey, replyTarget) => prepareAndScheduleUpdate(version, {
+    contextKey,
+    ...(replyTarget ? { replyMessageId: replyTarget.messageId } : {}),
+  }, true),
+});
+
+async function prepareAndScheduleUpdate(version: string, target: RestartNotificationTarget, manual = false): Promise<void> {
+  if (preparingSelfUpdate || shuttingDown || restartRequested || pendingSelfUpdatePlanPath || safeRestart.scheduled) {
+    throw new Error("已有更新或重启正在进行，请稍后重试。");
+  }
+  preparingSelfUpdate = true;
+  try {
+    const prepare = manual ? prepareSelectedUpdate : prepareAutomaticUpdate;
+    const prepared = await prepare(version, { home: agentBotHome(), configPath: activeConfigPath });
+    try {
+      if (shuttingDown || restartRequested || pendingSelfUpdatePlanPath || safeRestart.scheduled) {
+        throw new Error("服务正在停止或已有更新/重启等待执行，本次更新已停止。");
+      }
+      if (prepared.status === "prepared") {
+        assertSelfUpdatePlanPath(prepared.planPath, agentBotHome());
+        finalizeSelfUpdatePlan(prepared.planPath, {
+          controlEndpoint: controlEndpoint(config.storage.sqlitePath),
+          databasePath: config.storage.sqlitePath,
+          restartService: true,
+          notificationTarget: target,
+        });
+        pendingSelfUpdatePlanPath = prepared.planPath;
+      }
+      safeRestart.schedule(`Agent Bot ${manual ? "更新" : "自动更新"}到 ${version}`, target);
+    } catch (error) {
+      if (prepared.status === "prepared") {
+        if (pendingSelfUpdatePlanPath === prepared.planPath) pendingSelfUpdatePlanPath = undefined;
+        releaseSelfUpdatePlan(prepared.planPath);
+      }
+      throw error;
+    }
+  } finally {
+    preparingSelfUpdate = false;
+  }
+}
+
 const controller = new ProxySessionController(config, store, runtimes, outbound, logger, {
   supervised,
+  showUpdates: (contextKey, userId) => manualUpdates.show(contextKey, userId),
+  selectUpdate: (action, replyTarget) => manualUpdates.select(action, replyTarget),
   restart: requestRestart,
   forceSafeRestart: async (scheduleId) => {
     if (shuttingDown || restartRequested) return false;
@@ -281,7 +317,7 @@ function recoverPendingSelfUpdate(): void {
   if (!pending || pendingSelfUpdatePlanPath || restartRequested || safeRestart.scheduled) return;
   let notificationTarget: RestartNotificationTarget | undefined;
   try {
-    notificationTarget = inferServerRestartTarget(pending.plan.notificationSessionId);
+    notificationTarget = pending.plan.notificationTarget ?? inferServerRestartTarget(pending.plan.notificationSessionId);
   } catch (error) {
     logger.warn({ error }, "Could not restore the self-update notification target; update recovery will continue.");
   }

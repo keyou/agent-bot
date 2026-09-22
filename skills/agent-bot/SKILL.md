@@ -178,6 +178,8 @@ agentbot server restart --task <task> --reason "<reason>"
 agentbot server stop
 ```
 
+In Feishu, `/update` checks npm’s latest stable and Alpha releases and displays exact-version update buttons and release notes. It does not install on its own. Only the configured owner can select an update; choices expire after 30 minutes and never permit downgrade. It is available even when automatic checks are disabled. Let the user choose a version; do not click an update button merely to test this command. Source and npm-link installations can inspect releases but cannot use self-update.
+
 `update` is only for npm-installed Agent Bot packages. It verifies the new package, sends a safe-restart card, waits for active tasks, and restarts immediately when the service is already idle. It automatically restores the prior version if activation fails. It refuses source checkouts and `npm link` installations.
 
 The Feishu service also checks stable npm `latest` once daily at a persisted random time between 10:00 and 17:00 (server local time). A new version sends the owner a private release-notes card with 60 seconds to cancel. If not cancelled, preparation runs in the background and activation waits for tasks, final deliveries, and the quiet inbound window before restarting. Each version is notified once per Profile; cancellation survives restarts. An interrupted countdown resumes with a fresh minute on the same card. No private recipient, unconfirmed notification delivery, or missing release notes means no automatic installation. Source/npm-link protections still apply. Set `updates.enabled: false` in the Profile config and safely restart to disable checks. Do not bypass the countdown or idle gate.

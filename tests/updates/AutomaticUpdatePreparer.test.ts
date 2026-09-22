@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { checkAutomaticUpdateSupport, prepareAutomaticUpdate } from "../../src/updates/AutomaticUpdatePreparer.js";
+import { checkAutomaticUpdateSupport, prepareAutomaticUpdate, prepareSelectedUpdate } from "../../src/updates/AutomaticUpdatePreparer.js";
 import type { ExecFileOptionsWithStringEncoding } from "node:child_process";
 
 afterEach(() => vi.unstubAllEnvs());
@@ -32,6 +32,16 @@ describe("automatic update preparation", () => {
     await expect(prepareAutomaticUpdate("0.1.23-alpha.1", profile, run)).rejects.toThrow();
     expect(run).not.toHaveBeenCalled();
     await expect(prepareAutomaticUpdate("0.1.23", profile, run)).rejects.toThrow("announced version");
+  });
+
+  test("prepares an explicitly selected Alpha in a hidden child without permitting arbitrary package specs", async () => {
+    const run = vi.fn(async () => ({ stdout: JSON.stringify({ status: "prepared", planPath: "plan.json", targetVersion: "0.1.24-alpha.2" }) }));
+    const profile = { home: "rescue-profile", configPath: "rescue-config.yaml" };
+    await expect(prepareSelectedUpdate("0.1.24-alpha.2", profile, run)).resolves.toMatchObject({ status: "prepared", targetVersion: "0.1.24-alpha.2" });
+    expect(run).toHaveBeenCalledWith(process.execPath, [expect.stringContaining("AutomaticUpdatePreparer"), "--manual", "0.1.24-alpha.2"], expect.objectContaining({ windowsHide: true, env: expect.objectContaining({ AGENT_BOT_HOME: profile.home }) }));
+    await expect(prepareSelectedUpdate("other-package@latest", profile, run)).rejects.toThrow();
+    await expect(prepareSelectedUpdate("0.1.25", profile, run)).rejects.toThrow("selected version");
+    expect(run).toHaveBeenCalledTimes(2);
   });
 
   test("propagates installation guard and preparation failures without scheduling activation", async () => {

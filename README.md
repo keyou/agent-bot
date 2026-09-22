@@ -140,6 +140,9 @@ While the Feishu service is running, automatic updates check only npm's stable `
 
 Set `updates.enabled: false` in the Profile configuration and safely restart to disable automatic checks. Without a configured private recipient, confirmed card delivery, or release notes, no automatic installation starts. Failed checks are retried on the next day's schedule; failed installations are not automatically retried for the same version. Automatic updates never install Alpha versions or downgrade, and the same npm-only installation protection applies. Manual `agentbot update` behavior is unchanged.
 
+Send `/update` in Feishu to check the latest stable and Alpha releases together, read their release notes, and choose an **Update <version>** button. Release introductions prefer Chinese for that exact version (including bundled translations for existing releases), falling back to the original notes when Chinese is unavailable. Only the configured bot owner can start installation; checking does not install anything. Older or already-installed versions have no update button. Preparation happens in the background, then installation waits for tasks and final replies to finish before a safe restart. The existing rollback protection applies. This manual command remains available when automatic checks are disabled; source checkouts and `npm link` installations can view releases but cannot update in place. If a choice expires or a download fails, send `/update` again.
+
+
 To replace the global package manually, stop the running service first:
 
 ```bash
@@ -244,6 +247,7 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 | `/new [title] [--agent <name>] [--dir <path> \| --nodir]`      | Start a new task                     |
 | `/dir [path]`                                 | Browse files or start work in a directory |
 | `/file <file-path>`                           | Send a file to the current Feishu conversation |
+| `/update`                                    | Check stable and Alpha releases; choose an update |
 | `/sessions [keyword]`                         | Find and manage tasks                |
 | `/archive [task]`                             | Archive the current or selected task |
 | `/dismiss`                                    | Archive the current task and dissolve the group after confirmation |

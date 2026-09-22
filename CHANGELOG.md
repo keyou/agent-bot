@@ -12,6 +12,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Add SwitchGroup to each sessions-card task to create a group bound to the same task, retaining history/settings and source bindings without forking or interrupting active work.
 
+- Add `/update` with Chinese-first stable/Alpha release introductions (falling back to original notes) and owner-only exact-version update buttons, reusing safe activation and rollback without auto-installing or permitting downgrade.
+
 - Add Turns to each sessions-card task, with task-scoped history pagination and read-only browsing of non-current or unbound external tasks without switching or resuming them.
 
 - Add a Preview link to status cards for the active or latest saved Turn, preserving Refresh and Stop/Switch controls and hiding unavailable previews.
@@ -33,12 +35,33 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [0.1.24-alpha.2] - 2026-09-20
 
+### 中文
+
+- 在实时通知、恢复的轮次和任务摘要中保留 App Server 的详细错误原因，并在卡片与 Turn Preview 中按原文显示。
+- 飞书回答和思考卡片中的相对文件链接按本轮保存的项目目录解析，保留文件引用和代码，避免为不可用文件生成无效网页链接。
+- 仅配置一个 Provider 或不支持切换 Provider 时，仍可通过 `/provider` 打开运行设置卡片。
+- Windows 自更新检查、安装、校验和回滚时隐藏内部 npm、Node 命令窗口，同时保留输出和错误信息。
+
+### English
+
 - Preserve App Server error details in live notifications, recovered Turns, and task summaries, and render runtime errors as literal text in cards and Turn Preview.
 - Resolve relative file links in Feishu answers and thinking cards against the saved Turn project directory, preserving references and code while avoiding invalid web links for unavailable files.
 - Keep the execution settings card available from `/provider` when only one Provider is configured or Provider switching is unsupported.
 - Hide internal npm and Node command windows during Windows self-update checks, installation, validation, and rollback while preserving captured output and errors.
 
 ## [0.1.24-alpha.1] - 2026-09-19
+
+### 中文
+
+- Turn Preview 显示本轮总 Token 和缓存命中 Token，保留原有非缓存统计，支持实时更新和悬停查看精确值；不改写缺少用量明细的历史快照。
+- 显示 TraeX 内置完整模型列表，在设置卡片中提示 Provider 模型列表读取失败及回退原因，并在现有进度卡片上显示 App Server 错误和原生重试。
+- 将未标记阶段的助手消息保留在进度时间线中，仅将最后符合条件的消息作为最终回答，避免重复或提前显示答案。
+- 支持 TraeX 的计划和执行确认操作，在工具更新期间保留等待确认状态，并在只读 Preview 与任务状态中显示待确认项。
+- 安全重启卡片提供 ForceRestart 和各运行任务的 Stop 操作，校验过期计划并沿用正常中断流程。
+- `/new` 和 `/newgroup` 支持通过 `--agent` 指定已配置的 Agent，保留会话默认值、项目继承和各 Agent 的运行设置。
+- 为通用 Read、Grep 工具标题补充可用的文件路径、搜索内容和范围，不改变完整命令。
+
+### English
 
 - Show per-Turn total and cache-hit tokens in live Preview alongside the existing non-cached count, with exact values on hover and deduplicated usage updates; keep historical snapshots without usage details unchanged.
 - Show the full built-in TraeX model catalog, surface Provider model-discovery fallback warnings on settings cards, and display App Server errors and native retries on the existing progress card.
@@ -50,12 +73,29 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [0.1.24-alpha.0] - 2026-09-17
 
+### 中文
+
+- Worker 启动时读取各 Codex Agent 的 `CODEX_HOME/.env`，用于 Provider 模型发现和 Codex 进程；不覆盖已有环境或显式设置，也不在 Agent 之间共享这些值。
+- 获取引用消息和合并转发卡片的原始内容，包括可用的文字、图片，不再只显示客户端升级提示。
+- Provider 或模型切换未生效时，基于最近完成轮次创建分支后重试，验证成功再重新绑定；失败时保留原设置。
+- 新增 `/clone`、`/clonegroup` 及对应 CLI 命令，将用户 Prompt 和最终回答迁移到新任务，可选择其他 Agent 或新群；不复制思考、工具日志或图片数据。
+
+### English
+
 - Load each Codex Agent's `CODEX_HOME/.env` at Worker startup for Provider model discovery and the Codex process, without overriding existing environment or explicit Agent settings or sharing those values with other Agents.
 - Retrieve original quoted and merged-forwarded card content, including available text and images, instead of client-upgrade placeholders.
 - Retry ignored Provider and model changes on a thread forked through the latest completed Turn, verify the result before rebinding, and preserve the previous settings on failure.
 - Add `/clone`, `/clonegroup`, and matching CLI commands to transfer user Prompts and final answers into a fresh task, optionally on another Agent or in a new group, without copying reasoning, tool logs, or image payloads.
 
 ## [0.1.23] - 2026-09-16
+
+### 中文
+
+- 每天 10:00–17:00 之间检查一次 npm 正式版更新，通过私聊向所有者发送更新简介和可取消的 60 秒倒计时；随后后台准备更新，等待任务和最终回复完成再安装。跨重启保留各版本的通知、取消记录，并沿用仅支持 npm 安装和失败回滚的保护。
+- 简化 Turn Preview 工具展示为一级折叠，提供命令摘要、实时简短耗时、状态图标、共用滚动区和固定详情底栏；触屏隐藏滚动条但保留手势滚动，项目内文件使用相对路径。
+- 切换模型或 Provider 后更新后续轮次 Preview 中显示的模型，不改变正在执行或已完成轮次的模型标记。
+
+### English
 
 - Check stable npm updates once daily between 10:00 and 17:00, notify the owner privately with release notes and a cancellable 60-second countdown, then prepare updates in the background and activate only after tasks and final deliveries finish. Persist per-version reminders and cancellations across restarts, and retain npm-only installation and rollback protections.
 - Simplify Turn Preview tools to one collapsed level with command summaries, compact live durations, status icons, a shared scroll area, and a fixed detail footer. Hide touch-device scrollbars while preserving gesture scrolling, and display project files using relative paths.

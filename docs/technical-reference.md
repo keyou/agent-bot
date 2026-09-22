@@ -405,6 +405,12 @@ The default target is `~/.agents/skills`. `AGENT_BOT_SKILLS_DIR` or `--target` s
 
 ## npm Package And Releases
 
+### Manual update cards
+
+`/update` queries npm `latest` and `alpha` concurrently with bounded responses/timeouts. Each channel fails independently; missing release notes fall back to the exact GitHub tag link. Only newer exact stable/Alpha SemVer values are selectable. Card-message-bound, owner-bound tokens expire after 30 minutes and are consumed together before preparation. Replayed, forwarded, expired, or non-owner selections cannot install a package. Manual and daily updates share a preparation guard and use a hidden child process for npm preparation; activation uses the existing safe-restart and rollback flow. The prepared plan persists the initiating chat/topic notification target for recovery. `updates.enabled` controls the daily monitor, not this explicit command.
+
+
+
 The public package is `@keyou007/agent-bot`; its primary executable is `agentbot`. The deprecated `agent-bot` executable remains as a forwarding compatibility entry and prints a localized warning before each invocation. The package uses a `files` allowlist so runtime code, templates, the managed skill, source code, and user-facing documentation are published without tests or internal design plans.
 
 `npm-shrinkwrap.json` is published with the CLI to keep transitive runtime dependencies reproducible. Direct runtime and development dependencies are also pinned to exact versions.

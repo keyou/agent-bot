@@ -29,6 +29,7 @@ export const COMMAND_NAMES = [
   "thinking",
   "title",
   "turns",
+  "update",
 ] as const;
 
 type CommandName = (typeof COMMAND_NAMES)[number];
@@ -121,6 +122,9 @@ export class CommandRouter {
         if (args.length === 0) return { type: "restart" };
         if (args.length === 1 && args[0] === "--force") return { type: "restart", force: true };
         throw new Error("/restart 只接受一个可选的 --force 参数。");
+      case "update":
+        if (args.length > 0) throw new Error("/update 不接受参数，请在卡片中选择版本。");
+        return { type: "update" };
       case "release":
         if (args.length > 0) throw new Error("/release 不接受参数。");
         return { type: "release" };

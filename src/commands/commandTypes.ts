@@ -21,6 +21,7 @@ export type Command =
   | { type: "goal"; action: "pause" | "resume" | "clear" }
   | { type: "restart"; force?: boolean }
   | { type: "release" }
+  | { type: "update" }
   | { type: "mute"; enabled: boolean }
   | { type: "turns"; turnReference?: string }
   | { type: "model" }

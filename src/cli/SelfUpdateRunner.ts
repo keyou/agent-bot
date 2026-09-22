@@ -24,6 +24,7 @@ export interface SelfUpdatePlan {
   restartService: boolean;
   reason?: string;
   notificationSessionId?: string;
+  notificationTarget?: { contextKey: string; replyMessageId?: string };
   resultPath: string;
   logPath: string;
 }

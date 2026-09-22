@@ -348,6 +348,7 @@ const HELP_COMMAND_SECTIONS: Array<{
         usage: "[--force]",
         description: "默认安全重启；--force 立即重启",
       },
+      { command: "/update", description: "查看正式版和 Alpha 版更新，选择版本安全更新" },
       {
         command: "/release",
         description: "释放 Agent Bot 占用的 App Server 任务",
@@ -509,6 +510,8 @@ export interface ProxyLifecycle {
   cancelSafeRestart?(scheduleId: number): Promise<boolean>;
   forceSafeRestart?(scheduleId: number): Promise<boolean>;
   cancelAutomaticUpdate?(action: CardAction): Promise<void>;
+  showUpdates?(contextKey: string, userId?: string): Promise<void>;
+  selectUpdate?(action: CardAction, replyTarget?: MessageReplyTarget): Promise<void>;
   rememberFeishuUserOpenId?(userOpenId: string): Promise<void> | void;
   persistAgentExecutionDefaults?(
     agentName: string,
@@ -1011,6 +1014,9 @@ export class ProxySessionController {
         if (kind === "agentbot_update_cancel") {
           if (!this.lifecycle?.cancelAutomaticUpdate) throw new Error("自动更新功能未启用。");
           await this.lifecycle.cancelAutomaticUpdate(scopedAction);
+        } else if (kind === "agentbot_update_select") {
+          if (!this.lifecycle?.selectUpdate) throw new Error("当前运行方式不支持在线更新。");
+          await this.lifecycle.selectUpdate(scopedAction, replyTarget);
         } else if (kind === "help_command") {
           await this.executeHelpCommandAction(scopedAction, contextKey, replyTarget);
         } else if (kind === "turn_details") {
@@ -2172,6 +2178,10 @@ export class ProxySessionController {
       case "restart":
         if (!this.lifecycle) throw new Error("当前运行方式不支持自动重启。");
         await this.lifecycle.restart(contextKey, command.force === true, replyTarget);
+        return;
+      case "update":
+        if (!this.lifecycle?.showUpdates) throw new Error("当前运行方式不支持检查更新。");
+        await this.lifecycle.showUpdates(contextKey, userId);
         return;
       case "release":
         await this.requestAppServerRelease(contextKey);
@@ -8892,7 +8902,7 @@ function isBotOwnedActiveTurn(record: SessionRecord, remote: RemoteSessionSummar
 }
 
 function isQueueIndependentCommand(command: Command): boolean {
-  if (["archive", "dismiss", "stop", "status", "restart", "release", "mute", "help", "sessions", "dir", "file", "goal", "nosteer", "shell"].includes(command.type)) return true;
+  if (["archive", "dismiss", "stop", "status", "restart", "update", "release", "mute", "help", "sessions", "dir", "file", "goal", "nosteer", "shell"].includes(command.type)) return true;
   if (command.type === "agent") return command.agent === undefined;
   if (["model", "provider", "thinking", "permissions"].includes(command.type)) return true;
   return false;
