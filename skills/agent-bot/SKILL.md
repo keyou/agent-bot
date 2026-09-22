@@ -145,6 +145,10 @@ agentbot task reset <turn-id>
 
 In Feishu, `/turn` (also `/turns`) opens history. `/turn <Turn ID>` or `/turn <index>` shows saved runtime details for the current task without resetting, resuming, or interrupting it. Indices match the history card: one-based, newest first, including a running Turn at the top. Missing records use only necessary summary pages; Fork queries stay within the branch anchor. Summary-only external Turns do not contain unrecorded tool output. This does not change the CLI's `task turns [task]` task-reference argument.
 
+The Feishu `/sessions` card also has `SwitchGroup`: create a new group bound to the selected existing task, without forking or creating a new Agent task. Source bindings remain unchanged, and active Agent Bot Turns keep their original delivery route; messages from the new group queue instead of steering them. External active tasks are not taken over.
+
+The Feishu `/sessions` card provides `Turns` for each task, including unbound external tasks. Browsing and pagination never switch, resume, or bind a task; Reset is available only for the current task.
+
 Use `turns` to obtain a real Turn ID before `reset`. Reset changes conversation context only; it does not revert local files. Agent Bot announces an interactive Reset when it starts and queues every new message after its Reaction until the replacement thread is ready.
 
 ## Files And Local Commands

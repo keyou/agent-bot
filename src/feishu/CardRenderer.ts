@@ -246,6 +246,8 @@ export interface ResetHistoryCardEntry extends TaskListCardEntry {
 }
 
 export interface ResetHistoryCardView {
+  taskTitle?: string;
+  readOnly?: boolean;
   entries: ResetHistoryCardEntry[];
   footerLines: string[];
   pageActions: TaskListCardAction[];
@@ -1609,13 +1611,16 @@ export class CardRenderer {
   renderResetHistoryCard(view: ResetHistoryCardView): Record<string, unknown> {
     const elements: Record<string, unknown>[] = [
       {
-        ...markdown("<font color='grey'>Reset 会将当前任务的对话上下文恢复到所选轮次完成时；不会回退本地文件。</font>"),
+        ...markdown(view.readOnly
+          ? "<font color='grey'>仅查看此任务的轮次；如需 Reset，请先切换到此任务。</font>"
+          : "<font color='grey'>Reset 会将当前任务的对话上下文恢复到所选轮次完成时；不会回退本地文件。</font>"),
         text_size: "notation",
       },
       { tag: "hr" },
     ];
+    if (view.taskTitle) elements.unshift(markdown(`**任务**：${escapeCardActionText(view.taskTitle)}`));
     if (view.entries.length === 0) {
-      elements.push(markdown("当前任务还没有成功完成的 turn。"));
+      elements.push(markdown(view.readOnly ? "此任务还没有可显示的 turn。" : "当前任务还没有成功完成的 turn。"));
     } else {
       const sequenceWidth = `${Math.max(16, ...view.entries.map((entry) => String(entry.sequence).length * 10))}px`;
       view.entries.forEach((entry) => {

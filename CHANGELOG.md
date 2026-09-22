@@ -8,6 +8,11 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Use the leading content title as the Turn Preview reasoning header and show expanded text directly without redundant Summary/Content labels, preserving lazy loading, live updates, and existing thinking cards.
 
+- Add SwitchGroup to each sessions-card task to create a group bound to the same task, retaining history/settings and source bindings without forking or interrupting active work.
+
+- Add Turns to each sessions-card task, with task-scoped history pagination and read-only browsing of non-current or unbound external tasks without switching or resuming them.
+
+- Add a Preview link to status cards for the active or latest saved Turn, preserving Refresh and Stop/Switch controls and hiding unavailable previews.
 - Retain both reasoning summaries and content in lazy, expandable Turn Preview panels, retain complete streamed/completed reasoning in snapshots, and leave thinking cards unchanged.
 
 - Ignore whitespace-only Commentary when pinning thinking-card messages and coalesce adjacent generated omission markers, preserving literal text, execution panels, and saved history.

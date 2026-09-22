@@ -2807,6 +2807,24 @@ describe("CardRenderer", () => {
     expect(JSON.stringify(card)).toContain('"action":"directory_new_folder_cancel"');
   });
 
+  test("renders status Preview as a separated blue URL action after Stop", () => {
+    const url = "https://viewer.example/turn-preview/signed?turn=turn_1";
+    const card = new CardRenderer().renderSectionsCard("Agent 状态", [{ lines: ["执行中"] }], [
+      { text: "Refresh", value: { action: "session_status_refresh" } },
+      { text: "Stop", type: "danger", value: { action: "session_stop" } },
+      { text: "Preview", value: {}, url },
+    ]);
+    const actions = collectObjects(card).filter((item) => item.tag === "interactive_container");
+    expect(actions).toHaveLength(3);
+    expect(actions[2]).toMatchObject({ has_border: false,
+      elements: [{ tag: "markdown", content: "<font color='blue'>Preview</font>" }],
+      behaviors: [{ type: "open_url", default_url: url }],
+    });
+    expect(collectObjects(card)).toContainEqual(expect.objectContaining({
+      tag: "column_set", horizontal_spacing: "8px", columns: expect.any(Array),
+    }));
+  });
+
   test("renders status card actions as callback links after the sections", () => {
     const card = new CardRenderer().renderSectionsCard("Codex 状态", [
       {
@@ -2970,6 +2988,17 @@ describe("CardRenderer", () => {
     });
   });
 
+  test("labels read-only task Turns without suggesting Reset of the current task", () => {
+    const card = new CardRenderer().renderResetHistoryCard({
+      taskTitle: "Other <task>", readOnly: true, entries: [], footerLines: [], pageActions: [],
+    });
+    const text = JSON.stringify(card);
+    expect(text).toContain("Other &lt;task&gt;");
+    expect(text).toContain("仅查看此任务");
+    expect(text).toContain("此任务还没有可显示的 turn");
+    expect(text).not.toContain("Reset 会将当前任务");
+  });
+
   test("renders project-grouped sessions as compact collapsed task rows", () => {
     const card = new CardRenderer().renderSessionTaskListCard("任务列表", "任务", [{
       title: "📁 D:\\work\\agent-bot",
@@ -2984,7 +3013,11 @@ describe("CardRenderer", () => {
           "**最新 Prompt**：优化任务列表",
           "<font color='grey'>最近更新：刚刚</font>",
         ],
-        actions: [{ text: "Status", value: { action: "session_status", sessionId: "thr_1" } }],
+        actions: [
+          { text: "Status", value: { action: "session_status", sessionId: "thr_1" } },
+          { text: "Turns", value: { action: "session_turns", sessionId: "thr_1" } },
+          { text: "SwitchGroup", value: { action: "session_switch_group", sessionId: "thr_1" } },
+        ],
         current: true,
       }],
     }], ["> 点击任务行展开详情与操作。"]);
@@ -3021,6 +3054,10 @@ describe("CardRenderer", () => {
     expect(JSON.stringify(panel)).toContain('"tag":"overflow"');
     expect(JSON.stringify(panel)).toContain('"content":"Status"');
     expect(JSON.stringify(panel)).toContain('session_status');
+    expect(JSON.stringify(panel)).toContain('"content":"Turns"');
+    expect(JSON.stringify(panel)).toContain('session_turns');
+    expect(JSON.stringify(panel)).toContain('"content":"SwitchGroup"');
+    expect(JSON.stringify(panel)).toContain('session_switch_group');
     expect(JSON.stringify(panel)).toContain('thr_1');
     expect(JSON.stringify(panel)).not.toContain('"action":"session_new"');
     expect(JSON.stringify(panel)).not.toContain('"tag":"interactive_container"');
@@ -3044,9 +3081,11 @@ describe("CardRenderer", () => {
         ],
         actions: [
           { text: "Switch", value: { t: `switch-${index + 1}` } },
+          { text: "SwitchGroup", value: { t: `switch-group-${index + 1}` } },
           { text: "Fork", value: { t: `fork-${index + 1}` } },
           { text: "ForkGroup", value: { t: `fork-group-${index + 1}` } },
           { text: "Status", value: { t: `status-${index + 1}` } },
+          { text: "Turns", value: { t: `turns-${index + 1}` } },
           { text: "Archive", value: { t: `archive-${index + 1}` } },
         ],
       }],

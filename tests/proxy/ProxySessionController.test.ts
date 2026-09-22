@@ -7061,6 +7061,149 @@ describe("ProxySessionController", () => {
     );
   });
 
+  test("opens a selected task's Turns from the sessions action token without switching or resuming it", async () => {
+    const { controller, runtime, outbound, store, presenter } = fixture();
+    store.createSession({ localSessionId: "current", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "ready" });
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    store.setCurrentSession("chat_id:c1", "current");
+    store.createSession({ localSessionId: "other", contextKey: "chat_id:other", agentName: "codex", cwd: process.cwd(), status: "ready" });
+    store.updateRuntimeSession("other", { runtimeKind: "codex", remoteSessionId: "other_remote", title: "Selected history" });
+    for (let index = 1; index <= 12; index += 1) {
+      store.saveTurnSnapshot(`selected_${index}`, "other", {
+        sessionId: "other", turnId: `selected_${index}`, prompt: `Selected prompt ${index}`,
+        status: "completed", startedAt: index * 1000, completedAt: index * 1000,
+        assistantText: "", plan: [], activities: [], completedTools: [], failedTools: [], fileSummary: [],
+      }, "chat_id:other");
+    }
+    vi.mocked(runtime.listRemoteSessions!).mockResolvedValue({ sessions: [{
+      id: "other_remote", title: "Selected history", cwd: process.cwd(), source: "agent-bot", status: "idle",
+    }] });
+    await controller.onMessage(message("/sessions Selected"));
+    const list = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
+    const token = sessionOverflowToken(list, "Turns");
+    expect(token).toBeDefined();
+    vi.mocked(runtime.listRemoteTurnSummaries!).mockImplementation(async () => {
+      expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "正在读取历史轮次，请稍后。");
+      return { turns: [] };
+    });
+    await controller.onCardAction({ actionId: "selected-turns", contextKey: "chat_id:c1", messageId: "card", value: { t: token! } });
+    const history = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(history)).toContain("Selected history");
+    expect(JSON.stringify(history)).toContain("Selected prompt 12");
+    expect(JSON.stringify(history)).not.toContain('"action":"turn_reset"');
+    expect(JSON.stringify(history)).toContain("仅查看此任务");
+    const next = sessionOverflowActions(history).find((action) => action.action === "session_turns_page");
+    expect(next).toMatchObject({ sessionId: "agent-runtime:codex:other_remote", page: "1" });
+    await controller.onCardAction({ actionId: "selected-page", contextKey: "chat_id:c1", messageId: "history", value: next! });
+    expect(outbound.updateInteractiveCard).toHaveBeenCalledWith("history", expect.any(Object));
+    const page = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1]);
+    expect(page).toContain("Selected prompt 1");
+    expect(page).not.toContain("Selected prompt 12");
+    expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe("current");
+    expect(store.getSessionForContext("other", "chat_id:c1")).toBeUndefined();
+    expect(presenter.registerSession).not.toHaveBeenCalled();
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+    expect(runtime.createSession).not.toHaveBeenCalled();
+  });
+
+  test("keeps Reset available when opening Turns for the current task", async () => {
+    const { controller, runtime, outbound, store, remoteSessions } = fixture();
+    store.createSession({ localSessionId: "current", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "ready" });
+    store.updateRuntimeSession("current", { runtimeKind: "codex", remoteSessionId: "current_remote", lastTurnId: "current_2", lastTurnStatus: "completed" });
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    store.setCurrentSession("chat_id:c1", "current");
+    remoteSessions.push({ id: "current_remote", cwd: process.cwd(), source: "agent-bot", status: "idle", completedTurns: [
+      { id: "current_1", prompt: "Earlier prompt", completedAt: 1000 },
+      { id: "current_2", prompt: "Latest prompt", completedAt: 2000 },
+    ] });
+    await controller.onCardAction({ actionId: "current-turns", contextKey: "chat_id:c1", value: { action: "session_turns", sessionId: "agent-runtime:codex:current_remote" } });
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(card)).toContain("Earlier prompt");
+    expect(JSON.stringify(card)).toContain('"action":"turn_reset","cardView":"reset_history","sessionId":"current","turnId":"current_1"');
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+  });
+
+  test("browses an unbound external task's Turns with cursor pagination without importing or binding it", async () => {
+    const { controller, runtime, outbound, store, remoteSessions } = fixture();
+    remoteSessions.push({ id: "external_history", title: "External history", cwd: process.cwd(), source: "vscode", status: "idle", completedTurns: Array.from({ length: 23 }, (_, i) => ({
+      id: `external_${i + 1}`, prompt: `External prompt ${i + 1}`, completedAt: (i + 1) * 1000,
+    })) });
+    await controller.onCardAction({ actionId: "external-turns", contextKey: "chat_id:c1", value: { action: "session_turns", sessionId: "agent-runtime:codex:external_history" } });
+    let card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(card)).toContain("External prompt 23");
+    expect(JSON.stringify(card)).not.toContain("External prompt 13");
+    expect(JSON.stringify(card)).not.toContain('"action":"turn_reset"');
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledExactlyOnceWith("external_history", { cursor: undefined, limit: 10 });
+    let next = sessionOverflowActions(card).find((action) => action.page === "1")!;
+    expect(next).toMatchObject({ sessionId: "agent-runtime:codex:external_history", cursor: "10" });
+    await controller.onCardAction({ actionId: "external-next", contextKey: "chat_id:c1", messageId: "history", value: next });
+    card = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(card)).toContain("External prompt 13");
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledTimes(2);
+    next = sessionOverflowActions(card).find((action) => action.page === "2")!;
+    await controller.onCardAction({ actionId: "external-last", contextKey: "chat_id:c1", messageId: "history", value: next });
+    card = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(card)).toContain("External prompt 1");
+    const previous = sessionOverflowActions(card).find((action) => action.page === "1")!;
+    await controller.onCardAction({ actionId: "external-previous", contextKey: "chat_id:c1", messageId: "history", value: previous });
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1])).toContain("External prompt 13");
+    expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBeUndefined();
+    expect(store.findSessionByRemoteSessionId("external_history")).toBeUndefined();
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+    expect(runtime.createSession).not.toHaveBeenCalled();
+  });
+
+  test("shows a running external Turn and handles empty or unavailable histories", async () => {
+    const { controller, runtime, outbound, remoteSessions } = fixture();
+    remoteSessions.push({ id: "active_history", cwd: process.cwd(), source: "vscode", status: "active", lastTurnId: "active_turn", lastTurnStatus: "inProgress", lastUserPrompt: "In progress" });
+    await controller.onCardAction({ actionId: "running-turns", contextKey: "chat_id:c1", value: { action: "session_turns", sessionId: "agent-runtime:codex:active_history" } });
+    let card = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1]);
+    expect(card).toContain("In progress");
+    expect(card).toContain("运行中");
+    expect(card).not.toContain('"action":"turn_reset"');
+    expect(runtime.listRemoteTurnSummaries).toHaveBeenCalledWith("active_history", { cursor: undefined, limit: 9 });
+    remoteSessions[0]!.lastTurnStatus = undefined;
+    await controller.onCardAction({ actionId: "empty-turns", contextKey: "chat_id:c1", value: { action: "session_turns", sessionId: "agent-runtime:codex:active_history" } });
+    card = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1]);
+    expect(card).toContain("此任务还没有可显示的 turn");
+    vi.mocked(runtime.listRemoteTurnSummaries!).mockRejectedValue(new Error("History unavailable"));
+    await controller.onCardAction({ actionId: "failed-turns", contextKey: "chat_id:c1", value: { action: "session_turns", sessionId: "agent-runtime:codex:active_history" } });
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("History unavailable"));
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+  });
+
+  test("routes Turns to the owning Agent and keeps topic browsing unbound", async () => {
+    const traexRuntime = {
+      kind: "codex",
+      readRemoteSession: vi.fn(async () => ({ id: "shared_history", title: "TraeX history", cwd: process.cwd(), source: "traex", status: "idle" })),
+      listRemoteTurnSummaries: vi.fn(async () => ({ turns: [{ id: "traex_turn", prompt: "TraeX prompt" }] })),
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, runtime, outbound, remoteSessions, store } = fixture({ traex: traexRuntime });
+    remoteSessions.push({ id: "shared_history", cwd: process.cwd(), source: "codex", status: "idle" });
+    const contextKey = "chat_id:c1:thread_id:topic1";
+    await controller.onCardAction({ actionId: "topic-turns", contextKey, messageId: "topic-card", value: { action: "session_turns", sessionId: "agent-runtime:traex:shared_history", contextKey } });
+    const card = JSON.stringify(vi.mocked(outbound.replyInteractiveCard!).mock.calls.at(-1)?.[2]);
+    expect(card).toContain("TraeX prompt");
+    expect(outbound.replyText).toHaveBeenCalledWith(contextKey, { messageId: "topic-card", replyInThread: true }, "正在读取历史轮次，请稍后。");
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+    expect(store.getUserContext(contextKey)?.currentSessionId).toBeUndefined();
+    expect(store.findSessionByRemoteSessionId("shared_history")).toBeUndefined();
+  });
+
+  test("does not fall back to the current task for invalid Turns actions", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onCardAction({ actionId: "missing-turns", contextKey: "chat_id:c1", value: { action: "session_turns" } });
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("任务轮次卡片无效"));
+    store.createSession({ localSessionId: "closed", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "closed" });
+    await controller.onCardAction({ actionId: "closed-turns", contextKey: "chat_id:c1", value: { action: "session_turns", sessionId: "closed" } });
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("找不到任务"));
+    expect(outbound.sendInteractiveCard).not.toHaveBeenCalled();
+    expect(runtime.listRemoteTurnSummaries).not.toHaveBeenCalled();
+  });
+
   test("lists all Codex tasks through one unified view", async () => {
     const { controller, remoteSessions, outbound, store } = fixture();
     store.createSession({
@@ -7110,7 +7253,9 @@ describe("ProxySessionController", () => {
       }),
       expect.objectContaining({ action: "session_fork", sessionId: "agent-runtime:codex:external_1" }),
       expect.objectContaining({ action: "session_fork_group", sessionId: "agent-runtime:codex:external_1" }),
+      expect.objectContaining({ action: "session_switch_group", sessionId: "agent-runtime:codex:external_1" }),
       expect.objectContaining({ action: "session_status", sessionId: "agent-runtime:codex:external_1" }),
+      expect.objectContaining({ action: "session_turns", sessionId: "agent-runtime:codex:external_1" }),
     ]));
     expect(serialized).toContain('"tag":"plain_text","content":"New"');
     expect(serialized).toContain('"tag":"plain_text","content":"NewGroup"');
@@ -7794,6 +7939,153 @@ describe("ProxySessionController", () => {
     expect(outbound.updateInteractiveCard).toHaveBeenCalledWith("om_sessions", expect.any(Object));
   });
 
+  test("SwitchGroup binds an existing local task, preserves its settings and source, and follows token actions", async () => {
+    const { controller, runtime, remoteSessions, outbound, store, presenter } = fixture();
+    const cwd = path.resolve("test-workspaces", "shared-project");
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    store.createSession({ localSessionId: "shared", contextKey: "chat_id:c1", agentName: "codex", cwd, status: "ready" });
+    store.updateRuntimeSession("shared", { runtimeKind: "codex", remoteSessionId: "shared_remote", title: "Keep task title", modelProvider: "custom", model: "gpt-test", reasoningEffort: "high", permissionMode: "confirm", lastTurnId: "shared_turn", lastTurnStatus: "completed" });
+    store.setCurrentSession("chat_id:c1", "shared");
+    remoteSessions.push({ id: "shared_remote", cwd, title: "Keep task title", source: "agent-bot", status: "idle" });
+    await controller.onMessage(message("/sessions Keep"));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
+    const token = sessionOverflowToken(card, "SwitchGroup");
+    expect(token).toBeDefined();
+    await controller.onCardAction({ actionId: "switch-group-token", contextKey: "chat_id:c1", userId: "ou_user", messageId: "card", value: { t: token! } });
+    expect(store.getUserContext("chat_id:oc_new_group")).toMatchObject({ currentSessionId: "shared", boundProjectCwd: cwd, defaultAgent: "codex" });
+    expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe("shared");
+    expect(store.listAllSessions()).toHaveLength(1);
+    expect(store.getSession("shared")).toMatchObject({ contextKey: "chat_id:c1", title: "Keep task title", modelProvider: "custom", reasoningEffort: "high", permissionMode: "confirm", lastTurnId: "shared_turn" });
+    expect(outbound.createGroup).toHaveBeenCalledWith(expect.objectContaining({ name: expect.stringContaining("Keep task title"), userOpenId: "ou_user" }));
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:oc_new_group", expect.stringContaining("当前模型：gpt-test\n思考强度：high\n权限类型：执行前确认"));
+    expect(vi.mocked(outbound.sendText).mock.invocationCallOrder.find((order, i) => vi.mocked(outbound.sendText).mock.calls[i]?.[1] === "正在创建群聊并绑定所选任务，请稍后。")).toBeLessThan(vi.mocked(runtime.inspectRemoteSessionActivity!).mock.invocationCallOrder[0]!);
+    expect(outbound.updateInteractiveCard).toHaveBeenCalledWith("card", expect.any(Object));
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+    expect(runtime.setTitle).not.toHaveBeenCalled();
+    expect(presenter.registerSession).toHaveBeenCalledWith("shared", "chat_id:oc_new_group", "Keep task title", cwd, "Codex");
+  });
+
+  test("SwitchGroup imports only a local binding for an external task and continues the same remote thread", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    remoteSessions.push({ id: "external_switch_group", title: "External task", cwd: process.cwd(), source: "desktop", status: "idle", modelProvider: "custom", model: "gpt-custom", reasoningEffort: "xhigh", permissionMode: "confirm", lastTurnId: "last_external", lastTurnStatus: "completed" });
+    await controller.onCardAction({ actionId: "external-switch-group", contextKey: "chat_id:c1", userId: "ou_user", value: { action: "session_switch_group", sessionId: "agent-runtime:codex:external_switch_group" } });
+    const id = store.getUserContext("chat_id:oc_new_group")!.currentSessionId!;
+    expect(store.getSession(id)).toMatchObject({ remoteSessionId: "external_switch_group", title: "External task", modelProvider: "custom", model: "gpt-custom", reasoningEffort: "xhigh", permissionMode: "confirm", lastTurnId: "last_external", lastTurnStatus: "completed" });
+    expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBeUndefined();
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+    expect(runtime.forkSession).not.toHaveBeenCalled();
+    await controller.onMessage(groupMessage("oc_new_group", "Continue existing work"));
+    expect(runtime.resumeSession).toHaveBeenCalledWith(expect.objectContaining({ localSessionId: id, remoteSessionId: "external_switch_group", modelProvider: "custom", model: "gpt-custom", reasoningEffort: "xhigh", permissionMode: "confirm" }));
+    expect(runtime.startTurn).toHaveBeenCalledWith(id, "Continue existing work");
+  });
+
+  test("SwitchGroup does not redirect a running task and messages in the new group queue instead of steer", async () => {
+    const { controller, runtime, store, outboundRouter, presenter } = fixture();
+    await controller.onMessage(message("running original work"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    store.saveTurnSnapshot("turn_1", id, { sessionId: id, turnId: "turn_1", status: "running", startedAt: 1, plan: [], activities: [], completedTools: [], failedTools: [], fileSummary: [] }, "chat_id:c1");
+    vi.mocked(presenter.registerSession).mockClear();
+    await controller.onCardAction({ actionId: "running-switch-group", contextKey: "chat_id:c1", userId: "ou_user", value: { action: "session_switch_group", sessionId: "agent-runtime:codex:thr_1" } });
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBe(id);
+    expect(outboundRouter.getSessionContextKey(id)).toBe("chat_id:c1");
+    expect(presenter.registerSession).not.toHaveBeenCalled();
+    expect(runtime.cancelTurn).not.toHaveBeenCalled();
+    await controller.onMessage(groupMessage("oc_new_group", "New group followup"));
+    expect(runtime.startTurn).toHaveBeenCalledOnce();
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
+    expect(store.listQueuedPrompts(id)).toEqual(expect.arrayContaining([expect.objectContaining({ text: "New group followup", contextKey: "chat_id:oc_new_group" })]));
+  });
+
+  test("SwitchGroup rejects external execution and invalid targets before creating a group", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    remoteSessions.push({ id: "external_busy", title: "Busy", cwd: process.cwd(), source: "desktop", status: "active", lastTurnId: "busy_turn", lastTurnStatus: "inProgress" });
+    for (const [actionId, sessionId, userId] of [["busy", "external_busy", "ou_user"], ["missing", "", "ou_user"], ["no-user", "external_busy", undefined]]) {
+      await controller.onCardAction({ actionId: actionId!, contextKey: "chat_id:c1", userId, value: { action: "session_switch_group", sessionId } });
+    }
+    store.createSession({ localSessionId: "closed", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "closed" });
+    await controller.onCardAction({ actionId: "closed", contextKey: "chat_id:c1", userId: "ou_user", value: { action: "session_switch_group", sessionId: "closed" } });
+    expect(outbound.createGroup).not.toHaveBeenCalled();
+    expect(runtime.interruptRemoteTurn).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("正在外部 Agent 中执行"));
+  });
+
+  test("SwitchGroup reports a post-creation binding failure without switching the source", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    remoteSessions.push({ id: "race", title: "Race", cwd: process.cwd(), source: "desktop", status: "idle" });
+    vi.mocked(outbound.createGroup!).mockImplementationOnce(async (input) => {
+      remoteSessions[0]!.status = "active";
+      remoteSessions[0]!.lastTurnStatus = "inProgress";
+      return { chatId: "oc_new_group", name: input.name };
+    });
+    await controller.onCardAction({ actionId: "race", contextKey: "chat_id:c1", userId: "ou_user", value: { action: "session_switch_group", sessionId: "race" } });
+    expect(outbound.createGroup).toHaveBeenCalledOnce();
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBeUndefined();
+    expect(store.listAllSessions()).toHaveLength(0);
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:oc_new_group", expect.stringContaining("群已创建，但绑定任务失败"));
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("已创建，但绑定任务失败"));
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+  });
+
+  test("SwitchGroup deduplicates concurrent group creation and permits a retry after creation fails", async () => {
+    const { controller, remoteSessions, outbound, store } = fixture();
+    remoteSessions.push({ id: "dedup", title: "Dedup", cwd: process.cwd(), source: "desktop", status: "idle" });
+    let reject!: (error: Error) => void;
+    vi.mocked(outbound.createGroup!).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const action = { contextKey: "chat_id:c1", userId: "ou_user", value: { action: "session_switch_group", sessionId: "dedup" } };
+    const first = controller.onCardAction({ ...action, actionId: "first" });
+    await vi.waitFor(() => expect(outbound.createGroup).toHaveBeenCalledOnce());
+    await controller.onCardAction({ ...action, actionId: "second" });
+    expect(outbound.createGroup).toHaveBeenCalledOnce();
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("请勿重复点击"));
+    reject(new Error("create failed"));
+    await first;
+    expect(store.listAllSessions()).toHaveLength(0);
+    await controller.onCardAction({ ...action, actionId: "retry" });
+    expect(outbound.createGroup).toHaveBeenCalledTimes(2);
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBeDefined();
+  });
+
+  test("SwitchGroup respects the owning Agent and creates a projectless group from a topic", async () => {
+    const cwd = path.join(os.homedir(), "Documents", "Codex", "2026-09-22", "new-chat");
+    const remote = { id: "shared_id", title: "TraeX task", cwd, source: "traex", status: "idle" as const, model: "traex-model" };
+    const traex = {
+      kind: "codex", readRemoteSession: vi.fn(async () => remote), getSession: vi.fn(),
+      onEvent: vi.fn(() => () => undefined), close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, runtime, remoteSessions, outbound, store } = fixture({ traex });
+    remoteSessions.push({ id: "shared_id", title: "Unrelated Codex task", cwd: process.cwd(), source: "desktop", status: "idle" });
+    const contextKey = "chat_id:c1:thread_id:topic";
+    await controller.onCardAction({ actionId: "topic-switch-group", contextKey: "chat_id:c1", userId: "ou_user", messageId: "topic-card", value: { action: "session_switch_group", sessionId: "agent-runtime:traex:shared_id", contextKey } });
+    expect(traex.readRemoteSession).toHaveBeenCalledTimes(2);
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    const group = store.getUserContext("chat_id:oc_new_group")!;
+    expect(group).toMatchObject({ defaultAgent: "traex" });
+    expect(group.boundProjectCwd).toBeUndefined();
+    expect(store.getSession(group.currentSessionId!)).toMatchObject({ agentName: "traex", remoteSessionId: "shared_id", cwd, title: "TraeX task", model: "traex-model" });
+    expect(store.getUserContext(contextKey)?.currentSessionId).toBeUndefined();
+    expect(outbound.createGroup).toHaveBeenCalledWith(expect.objectContaining({ name: "[traex] TraeX task" }));
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:oc_new_group", expect.stringContaining("未绑定（Projectless）"));
+    expect(outbound.replyText).toHaveBeenCalledWith(contextKey, { messageId: "topic-card", replyInThread: true }, expect.stringContaining("已创建飞书群"));
+  });
+
+  test("SwitchGroup reuses a canonical task attached during the group-creation request", async () => {
+    const { controller, runtime, remoteSessions, outbound, store } = fixture();
+    remoteSessions.push({ id: "appeared", title: "Same task", cwd: process.cwd(), source: "desktop", status: "idle" });
+    vi.mocked(outbound.createGroup!).mockImplementationOnce(async (input) => {
+      store.createSession({ localSessionId: "canonical", contextKey: "chat_id:other", agentName: "codex", cwd: process.cwd(), status: "ready" });
+      store.updateRuntimeSession("canonical", { runtimeKind: "codex", remoteSessionId: "appeared", title: "Same task" });
+      return { chatId: "oc_new_group", name: input.name };
+    });
+    await controller.onCardAction({ actionId: "appeared", contextKey: "chat_id:c1", userId: "ou_user", value: { action: "session_switch_group", sessionId: "appeared" } });
+    expect(store.getUserContext("chat_id:oc_new_group")?.currentSessionId).toBe("canonical");
+    expect(store.listAllSessions()).toHaveLength(1);
+    expect(runtime.createSession).not.toHaveBeenCalled();
+  });
+
   test("creates a new group and task in the selected sessions-card project", async () => {
     const { controller, remoteSessions, runtime, outbound, store } = fixture();
     const cwd = path.resolve("test-workspaces", "card-new-group-source");
@@ -8387,6 +8679,74 @@ describe("ProxySessionController", () => {
     });
     expect(runtime.respondToApproval).toHaveBeenCalledWith(task.localSessionId, "mode:thr_1:r1", decision);
     expect(runtime.cancelTurn).not.toHaveBeenCalled();
+  });
+
+  test.each(["running", "completed"] as const)("links the %s Turn from the status card", async (status) => {
+    const { controller, outbound, presenter, runtime, remoteSessions, store } = fixture();
+    await controller.onMessage(message("preview this task"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    if (status === "completed") {
+      runtime.getSession(id)!.activeTurnId = undefined;
+      Object.assign(remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+      store.updateSession(id, { status: "ready" });
+      store.updateRuntimeSession(id, { lastTurnStatus: "completed" });
+    }
+    const url = "https://viewer.example/prefix/turn-preview/signed?turn=turn_1";
+    vi.mocked(presenter.getTurnPreviewUrl!).mockReturnValue(url);
+    await controller.onMessage(message("/status"));
+    expect(presenter.getTurnPreviewUrl).toHaveBeenLastCalledWith("turn_1");
+    const card = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("<font color='blue'>Preview</font>");
+    expect(card).toContain(JSON.stringify({ type: "open_url", default_url: url }));
+    expect(card.indexOf(">Refresh</font>")).toBeLessThan(card.indexOf(">Preview</font>"));
+    if (status === "running") expect(card.indexOf(">Stop</font>")).toBeLessThan(card.indexOf(">Preview</font>"));
+  });
+
+  test("uses the active Turn rather than a stale last Turn and refreshes Preview in place", async () => {
+    const { controller, outbound, presenter, runtime, remoteSessions, store } = fixture();
+    await controller.onMessage(message("keep working"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const runtimeSession = runtime.getSession(id)!;
+    store.updateRuntimeSession(id, { lastTurnId: "stale_turn" });
+    runtimeSession.activeTurnId = "active_turn";
+    Object.assign(remoteSessions[0]!, { status: "idle", lastTurnId: "stale_turn", lastTurnStatus: "completed" });
+    vi.mocked(presenter.getTurnPreviewUrl!).mockImplementation((turnId) => `https://viewer.example/${turnId}`);
+    await controller.onMessage(message("/status"));
+    expect(presenter.getTurnPreviewUrl).toHaveBeenLastCalledWith("active_turn");
+    runtimeSession.activeTurnId = "next_turn";
+    await controller.onCardAction({ actionId: "refresh-preview", contextKey: "chat_id:c1", messageId: "om_status",
+      value: { action: "session_status_refresh", sessionId: "agent-runtime:codex:thr_1", cardView: "status" } });
+    expect(presenter.getTurnPreviewUrl).toHaveBeenLastCalledWith("next_turn");
+    expect(outbound.updateInteractiveCard).toHaveBeenLastCalledWith("om_status", expect.any(Object));
+    const card = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("https://viewer.example/next_turn");
+    expect(card).not.toContain("https://viewer.example/active_turn");
+  });
+
+  test("omits Preview for a fresh task or unavailable preview service", async () => {
+    const { controller, outbound, presenter } = fixture();
+    await controller.onMessage(message("/new"));
+    await controller.onMessage(message("/status"));
+    expect(presenter.getTurnPreviewUrl).not.toHaveBeenCalled();
+    expect(JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1])).not.toContain(">Preview</font>");
+    await controller.onMessage(message("start working"));
+    await controller.onMessage({ ...message("/status"), messageId: "status-unavailable-preview" });
+    expect(presenter.getTurnPreviewUrl).toHaveBeenCalledWith("turn_1");
+    expect(JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1])).not.toContain(">Preview</font>");
+  });
+
+  test("uses the specified remote task's Preview without switching the current task", async () => {
+    const { controller, outbound, presenter, remoteSessions, store } = fixture();
+    await controller.onMessage(message("current work"));
+    const currentId = store.getUserContext("chat_id:c1")!.currentSessionId;
+    remoteSessions.push({ id: "external_preview", cwd: process.cwd(), title: "External", source: "vscode", status: "idle", lastTurnId: "external_turn", lastTurnStatus: "completed" });
+    vi.mocked(presenter.getTurnPreviewUrl!).mockImplementation((id) => id === "external_turn" ? "https://viewer.example/external_turn" : undefined);
+    await controller.onMessage(message("/status external_preview"));
+    expect(presenter.getTurnPreviewUrl).toHaveBeenLastCalledWith("external_turn");
+    const card = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("https://viewer.example/external_turn");
+    expect(card).toContain(">Switch</font>");
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(currentId);
   });
 
   test("shows Stop on the current running task status card", async () => {
