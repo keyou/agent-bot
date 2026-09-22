@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import { CardRenderer } from "../../src/feishu/CardRenderer.js";
 import { FeishuTurnPresenter } from "../../src/feishu/FeishuTurnPresenter.js";
 import type { FeishuOutbound } from "../../src/feishu/types.js";
+import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import type { AgentEvent } from "../../src/runtime/types.js";
 import type { TurnPresentationStore } from "../../src/feishu/FeishuTurnPresenter.js";
 
@@ -41,6 +42,50 @@ function createFixture(delivered = false, renderer?: CardRenderer) {
 }
 
 describe("FeishuTurnPresenter", () => {
+  test("provides the progress-card Preview URL only for available real Turn snapshots", async () => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const url = vi.fn((turnId: string) => `https://viewer.example/prefix/turn-preview/signed?turn=${turnId}`);
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0, turnPreviewUrl: url });
+    presenter.registerSession("s1", "chat_id:c1");
+    expect(presenter.getTurnPreviewUrl("missing")).toBeUndefined();
+    expect(url).not.toHaveBeenCalled();
+    const pending = await presenter.startPendingTurn("s1", "chat_id:c1", "Task");
+    expect(presenter.getTurnPreviewUrl(pending!)).toBeUndefined();
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    expect(presenter.getTurnPreviewUrl("turn_1")).toBe(url("turn_1"));
+    await presenter.flushAll();
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1])).toContain(url("turn_1"));
+    await presenter.onEvent(completed());
+    const recovered = new FeishuTurnPresenter(outbound, store, undefined, { turnPreviewUrl: url });
+    expect(recovered.getTurnPreviewUrl("turn_1")).toBe(url("turn_1"));
+    expect(new FeishuTurnPresenter(outbound, store).getTurnPreviewUrl("turn_1")).toBeUndefined();
+    expect(new FeishuTurnPresenter(outbound, store, undefined, { turnPreviewUrl: () => undefined }).getTurnPreviewUrl("turn_1")).toBeUndefined();
+    store.saveTurnSnapshot("mismatched", "s1", store.getTurnSnapshot("turn_1"));
+    expect(recovered.getTurnPreviewUrl("mismatched")).toBeUndefined();
+  });
+
+
+  test("persists preview-only reasoning without refreshing or changing the thinking card", async () => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, { normalIntervalMs: 1, criticalGapMs: 0 });
+    presenter.registerSession("s1", "chat_id:c1");
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.flushAll();
+    const before = store.getTurnSnapshot("turn_1") as TurnViewState;
+    vi.mocked(outbound.updateInteractiveCard).mockClear();
+    await presenter.onEvent({ type: "reasoning_delta", sessionId: "s1", turnId: "turn_1", itemId: "r1", contentIndex: 0, text: "Body" });
+    await presenter.onEvent({ type: "reasoning_completed", sessionId: "s1", turnId: "turn_1", itemId: "r1", summary: ["Summary"], content: ["Final body"] });
+    const after = store.getTurnSnapshot("turn_1") as TurnViewState;
+    expect(after.reasoningItems).toEqual([{ itemId: "r1", afterActivityId: undefined, summary: ["Summary"], content: ["Final body"], completed: true }]);
+    expect(new CardRenderer().renderTurn(after)).toEqual(new CardRenderer().renderTurn(before));
+    expect(outbound.updateInteractiveCard).not.toHaveBeenCalled();
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    expect(outbound.sendMarkdown).not.toHaveBeenCalled();
+    await presenter.onEvent(completed());
+  });
+
   test("refreshes runtime warnings promptly on the same card without ending the turn", async () => {
     const { outbound } = createFixture();
     const store = new MemoryStore();
@@ -564,6 +609,31 @@ describe("FeishuTurnPresenter", () => {
         }),
       }),
     );
+  });
+
+  test("persists image-only pending updates and steer attachments across snapshot recovery", async () => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
+    presenter.registerSession("s1", "chat_id:c1");
+    await presenter.startPendingTurn("s1", "chat_id:c1", "Title", undefined, "Prompt");
+    await presenter.startPendingTurn("s1", "chat_id:c1", "Title", undefined, "Prompt", ["C:/cache/initial.png"]);
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.appendSteerMessage("s1", "turn_1", "See this", "om_image", ["C:/cache/appended.png"]);
+    await presenter.flushAll();
+    expect(store.getTurnSnapshot("turn_1")).toMatchObject({
+      prompt: "Prompt", promptImagePaths: ["C:/cache/initial.png"],
+      activities: [{ kind: "user", text: "See this", localImagePaths: ["C:/cache/appended.png"] }],
+    });
+    await presenter.onEvent(completed("done"));
+    const recovered = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
+    recovered.registerSession("s1", "chat_id:c1");
+    await recovered.appendSteerMessage("s1", "turn_1", "More", "om_more", ["C:/cache/more.png"]);
+    const snapshot = store.getTurnSnapshot("turn_1") as TurnViewState;
+    expect(snapshot.promptImagePaths).toEqual(["C:/cache/initial.png"]);
+    expect(snapshot.activities.filter((activity) => activity.kind === "user").map((activity) => activity.localImagePaths))
+      .toEqual([["C:/cache/appended.png"], ["C:/cache/more.png"]]);
+    await recovered.flushAll();
   });
 
   test("persists a steer message and updates the active thinking card", async () => {

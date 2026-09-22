@@ -73,6 +73,7 @@ agentbot task title "<title>"
 
 - `prompt` posts the Prompt to the task's Feishu conversation before submitting it.
 - `queue` creates a later turn instead of steering the active turn. `nosteer` is an alias.
+- The Feishu `/status` card includes `Preview` for the active or latest Turn when a saved preview and the file viewer are available; opening it does not switch or control the task.
 - `stop` requests an Agent interrupt; it does not kill the Agent process.
 - `release` sends a Lark confirmation card for releasing the Agent's shared App Server. It never releases automatically; the user must click **Release** or **Release Now** on the card.
 - `dismiss --yes` irreversibly dissolves the task's current Feishu group and archives its current task. Use it only after the user explicitly confirms.

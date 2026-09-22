@@ -8,6 +8,101 @@ import { CodexRuntime, type AppServerClientProvider } from "../../src/codex/Code
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
 
 describe("CodexRuntime", () => {
+
+  test("locates one historical Turn with summary cursors and reads only that Turn in full", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    const output = "complete output\n".repeat(1000);
+    client.turnListResults = [
+      { data: [{ id: "newest" }], nextCursor: "page2" },
+      { data: [{ id: "before" }, { id: "target" }, { id: "after" }], nextCursor: "page3" },
+      { data: [{ id: "before" }], nextCursor: "target-boundary" },
+      { data: [{ id: "target", status: "completed", itemsView: "full", startedAt: 10, completedAt: 13, durationMs: 3000, items: [
+        { type: "userMessage", id: "u", content: [{ type: "text", text: "Original prompt" }, { type: "localImage", path: "C:/input.png" }] },
+        { type: "agentMessage", id: "c", text: "Inspecting", phase: null },
+        { type: "reasoning", id: "r", summary: ["Summary"], content: ["Body"] },
+        { type: "plan", id: "p", text: "The plan" },
+        { type: "commandExecution", id: "cmd", command: "npm test", status: "completed", aggregatedOutput: output, exitCode: 0 },
+        { type: "mcpToolCall", id: "mcp", server: "browser", tool: "open", status: "completed", result: { ok: true } },
+        { type: "agentMessage", id: "final", text: "Answer", phase: null },
+      ] }], nextCursor: "unused" },
+    ];
+    const details = await runtime.readRemoteTurn("original-thread", "target");
+    expect(client.requests).toEqual([
+      { method: "thread/turns/list", params: { threadId: "original-thread", limit: 50, itemsView: "summary", sortDirection: "desc" } },
+      { method: "thread/turns/list", params: { threadId: "original-thread", cursor: "page2", limit: 50, itemsView: "summary", sortDirection: "desc" } },
+      { method: "thread/turns/list", params: { threadId: "original-thread", cursor: "page2", limit: 1, itemsView: "summary", sortDirection: "desc" } },
+      { method: "thread/turns/list", params: { threadId: "original-thread", cursor: "target-boundary", limit: 1, itemsView: "full", sortDirection: "desc" } },
+    ]);
+    expect(details).toMatchObject({ turnId: "target", status: "completed", startedAt: 10000, completedAt: 13000, durationMs: 3000, finalResponse: "Answer" });
+    expect(details.items).toEqual([
+      { kind: "message", id: "u", role: "user", text: "Original prompt", localImagePaths: ["C:/input.png"] },
+      { kind: "message", id: "c", role: "assistant", text: "Inspecting" },
+      { kind: "reasoning", id: "r", summary: ["Summary"], content: ["Body"] },
+      { kind: "message", id: "p", role: "assistant", text: "The plan" },
+      { kind: "tool", tool: expect.objectContaining({ id: "cmd", output }) },
+      { kind: "tool", tool: expect.objectContaining({ id: "mcp", title: "browser.open" }) },
+    ]);
+    expect(events).toEqual([]);
+    expect(runtime.getSession("original-thread")).toBeUndefined();
+  });
+
+  test.each(["failed", "interrupted"])("reads historical %s status and error without emitting terminal events", async (status) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    client.turnListResults = [{ data: [{ id: "target" }] }, { data: [{ id: "target", status, items: [], error: { message: "Failure", additionalDetails: "Reason" } }] }];
+    expect(await runtime.readRemoteTurn("thread", "target")).toMatchObject({
+      status: status === "failed" ? "failed" : "cancelled", error: "Failure\n\nReason",
+    });
+  });
+
+  test.each([
+    [{ data: [], nextCursor: null }, "未找到"],
+    [{ data: [{ id: "target", status: "inProgress", items: [] }] }, "仍在执行"],
+    [{ data: [{ id: "different", status: "completed", items: [] }] }, "历史发生变化"],
+    [{ data: [{ id: "target", status: "completed", itemsView: "summary", items: [] }] }, "未返回完整"],
+  ])("rejects unavailable or changing historical details", async (response, error) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    client.turnListResults = response.data.length ? [{ data: [{ id: "target" }] }, response] : [response];
+    await expect(runtime.readRemoteTurn("thread", "target")).rejects.toThrow(error);
+    expect(client.requests.every((request) => request.method === "thread/turns/list")).toBe(true);
+  });
+
+  test("stops repeated cursors and propagates history failures without fetching whole threads", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    client.turnListResults = [{ data: [], nextCursor: "same" }, { data: [], nextCursor: "same" }];
+    await expect(runtime.readRemoteTurn("thread", "target")).rejects.toThrow("repeated");
+    client.turnListErrors = [new Error("history request timed out")];
+    await expect(runtime.readRemoteTurn("thread", "target")).rejects.toThrow("timed out");
+    expect(client.requests.every((request) => request.method === "thread/turns/list")).toBe(true);
+  });
+
+  test.each(["codex", "traex"])("routes %s reasoning content and completions only to preview events", async (agentName) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await runtime.createSession({ localSessionId: "s1", agentName, cwd: process.cwd(), permissionMode: "auto" });
+    const turnId = await runtime.startTurn("s1", "hello");
+    const base = { threadId: "thr_1", turnId, itemId: "r1" };
+    client.emit("item/reasoning/textDelta", { ...base, contentIndex: 0, delta: "Body" });
+    expect(events.at(-1)).toEqual({ type: "reasoning_delta", sessionId: "s1", turnId, itemId: "r1", contentIndex: 0, text: "Body" });
+    client.emit("item/completed", { ...base, item: { type: "reasoning", id: "r1", summary: ["Summary"], content: ["Final body"] } });
+    expect(events.at(-1)).toEqual({ type: "reasoning_completed", sessionId: "s1", turnId, itemId: "r1", summary: ["Summary"], content: ["Final body"] });
+    expect(events.filter((event) => event.type === "progress" || event.type === "agent_text_delta")).toHaveLength(0);
+    client.emit("item/reasoning/summaryTextDelta", { ...base, summaryIndex: 0, delta: "Summary" });
+    expect(events.at(-1)).toMatchObject({ type: "progress", reasoning: { itemId: "r1", summaryIndex: 0 } });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status: "completed" } });
+    const count = events.length;
+    client.emit("item/reasoning/textDelta", { ...base, contentIndex: 0, delta: "late" });
+    expect(events).toHaveLength(count);
+    expect(events.find((event) => event.type === "turn_completed")).toMatchObject({ finalResponse: "" });
+  });
+
   test.each(["notification", "snapshot"])("separates unphased progress from the final answer through %s", async (completion) => {
     const client = new FakeAppServerClient();
     const runtime = new CodexRuntime(provider(client), logger());

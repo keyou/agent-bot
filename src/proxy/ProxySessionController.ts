@@ -54,6 +54,7 @@ import { classifyFileContent } from "../local-files/LocalFileViewerServer.js";
 import { errorLogValue } from "../logging/errorLogValue.js";
 import type { OutboundRouter } from "../presentation/OutboundRouter.js";
 import type { TurnActivity, TurnViewState } from "../presentation/turnViewTypes.js";
+import { hydrateTurnViewState } from "../presentation/TurnStateReducer.js";
 import { buildTurnGraphRows } from "../presentation/turnGraph.js";
 import type { AgentRuntimeRegistry } from "../runtime/AgentRuntimeRegistry.js";
 import type {
@@ -535,6 +536,7 @@ export class ProxySessionController {
   private readonly resetHistoryOperations = new Map<string, string>();
   private readonly remoteTurnHistoryRefreshes = new Map<string, number>();
   private readonly turnHistoryHydrations = new Map<string, Promise<boolean>>();
+  private readonly turnDetailHydrations = new Map<string, Promise<TurnViewState | undefined>>();
   private readonly forkHistoryCursors = new Map<string, ForkHistoryCursor>();
   private readonly lastSessionListings = new Map<string, string[]>();
   private readonly threadInitializations = new Map<string, Promise<void>>();
@@ -997,7 +999,9 @@ export class ProxySessionController {
         } else if (kind === "help_command") {
           await this.executeHelpCommandAction(scopedAction, contextKey, replyTarget);
         } else if (kind === "turn_details") {
-          await this.outbound.showDetails(contextKey, String(scopedAction.value.turnId ?? ""));
+          const turnId = String(scopedAction.value.turnId ?? "");
+          await this.loadTurnDetails(turnId);
+          await this.outbound.showDetails(contextKey, turnId);
         } else if (kind === "activity_history") {
           const requestedPage = String(scopedAction.value.page ?? "0");
           const numericPage = Number(requestedPage);
@@ -2696,6 +2700,7 @@ export class ProxySessionController {
         record.title,
         replyTarget,
         displayPrompt ?? text,
+        localImagePaths,
       );
     }
     let loaded: LoadedSession;
@@ -2736,7 +2741,7 @@ export class ProxySessionController {
       }
       try {
         await loaded.runtime.steerTurn(record.localSessionId, activeTurnId, runtimePrompt(text, localImagePaths));
-        await this.presentSteerMessage(record.localSessionId, activeTurnId, displayPrompt ?? text, messageId);
+        await this.presentSteerMessage(record.localSessionId, activeTurnId, displayPrompt ?? text, messageId, localImagePaths);
         if (messageId) await this.bindMessageReactionToTurn(messageId, record.localSessionId, activeTurnId);
         return;
       } catch (error) {
@@ -2764,6 +2769,7 @@ export class ProxySessionController {
               current.activeTurnId,
               displayPrompt ?? text,
               messageId,
+              localImagePaths,
             );
             if (messageId) await this.bindMessageReactionToTurn(messageId, record.localSessionId, current.activeTurnId);
             return;
@@ -2792,10 +2798,11 @@ export class ProxySessionController {
     turnId: string,
     text: string,
     messageId?: string,
+    localImagePaths?: string[],
   ): Promise<void> {
     this.store.touchTurnAttempt(turnId);
     try {
-      await this.outbound.appendSteerMessage(localSessionId, turnId, text, messageId);
+      await this.outbound.appendSteerMessage(localSessionId, turnId, text, messageId, localImagePaths);
     } catch (error) {
       this.logger.warn(
         { error, sessionId: localSessionId, turnId, messageId },
@@ -3458,6 +3465,7 @@ export class ProxySessionController {
               sessionId: input.localSessionId,
               turnId: turn.id,
               prompt: turn.prompt ?? "未记录对话内容",
+              historyDetail: "summary",
               status: "completed",
               startedAt,
               completedAt,
@@ -3817,6 +3825,7 @@ export class ProxySessionController {
             title,
             replyTarget,
             cardPrompt,
+            localImagePaths,
           );
         } catch (error) {
           this.store.updateTurnAttempt(attemptId, {
@@ -5936,6 +5945,46 @@ export class ProxySessionController {
     };
   }
 
+  async loadTurnDetails(turnId: string): Promise<TurnViewState | undefined> {
+    const existing = this.turnDetailHydrations.get(turnId);
+    if (existing) return existing;
+    const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(turnId));
+    if (!snapshot || !needsHistoricalDetails(snapshot)) return snapshot;
+    const hydration = this.hydrateTurnDetails(snapshot);
+    this.turnDetailHydrations.set(turnId, hydration);
+    try {
+      return await hydration;
+    } finally {
+      if (this.turnDetailHydrations.get(turnId) === hydration) this.turnDetailHydrations.delete(turnId);
+    }
+  }
+
+  private async hydrateTurnDetails(snapshot: TurnViewState): Promise<TurnViewState | undefined> {
+    let updated: TurnViewState;
+    try {
+      const origin = this.store.getTurnRuntimeOrigin(snapshot.turnId);
+      if (!origin) throw new Error("未保存本轮的原始 Agent 会话信息，无法读取历史执行详情。");
+      const runtime = this.runtimes.forAgent(origin.agentName);
+      if (!runtime.readRemoteTurn) throw new Error("此 Agent 不支持读取历史执行详情。");
+      const details = await runtime.readRemoteTurn(origin.remoteSessionId, snapshot.turnId);
+      if (details.turnId !== snapshot.turnId) throw new Error("Agent 返回的轮次与请求不一致，请重试。");
+      const session = this.store.getSession(snapshot.sessionId);
+      updated = hydrateTurnViewState({
+        ...snapshot,
+        projectCwd: snapshot.projectCwd ?? session?.cwd,
+        agentLabel: snapshot.agentLabel ?? this.agentLabel(origin.agentName),
+      }, details);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn({ error, turnId: snapshot.turnId }, "Failed to load historical Turn details.");
+      updated = { ...snapshot, historyDetail: "summary", historyDetailError: message };
+    }
+    const latest = turnViewSnapshot(this.store.getTurnSnapshot(snapshot.turnId));
+    if (!latest || !needsHistoricalDetails(latest)) return latest;
+    this.store.saveTurnSnapshot(snapshot.turnId, snapshot.sessionId, updated);
+    return updated;
+  }
+
   private async openTurnDetails(contextKey: string, reference: string): Promise<void> {
     const current = this.requireCurrentSession(contextKey);
     let turnId: string | undefined;
@@ -5974,6 +6023,7 @@ export class ProxySessionController {
       ));
       return;
     }
+    await this.loadTurnDetails(turnId);
     await this.outbound.showDetails(contextKey, turnId);
   }
 
@@ -8200,6 +8250,17 @@ function runtimeErrorMessage(error: unknown): string {
 function isUnmaterializedCodexThreadError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /thread\/read failed:[^\n]*(?:not materialized|not loaded|includeTurns is unavailable before first user message)/i.test(message);
+}
+
+function needsHistoricalDetails(state: TurnViewState): boolean {
+  if (!isTerminalTurnViewStatus(state.status) || state.historyDetail === "full") return false;
+  if (state.historyDetail === "summary") return true;
+  return state.status === "completed" && state.finalResponse === undefined && !state.assistantText
+    && !state.error && !state.progressText && !state.approval && !state.activeTool
+    && !state.activities?.length && !state.plan?.length && !state.reasoningItems?.length
+    && !state.completedTools?.length && !state.failedTools?.length && !state.fileSummary?.length
+    && !state.totalToolCount && !state.totalTokens
+    && state.fullToolOutputs === undefined && state.fullToolErrors === undefined && state.toolStatuses === undefined;
 }
 
 function turnViewSnapshot(value: unknown): TurnViewState | undefined {

@@ -51,7 +51,10 @@ export type MappedCodexNotification =
       activityId: string;
       text: string;
       append: boolean;
+      reasoning?: { itemId: string; summaryIndex: number };
     }
+  | { kind: "reasoning_delta"; threadId: string; turnId: string; itemId: string; contentIndex: number; text: string }
+  | { kind: "reasoning_completed"; threadId: string; turnId: string; itemId: string; summary: string[]; content: string[] }
   | ({ kind: "mode_change_requested"; threadId: string; turnId: string } & z.infer<typeof modeChangeRequest>)
   | ({ kind: "mode_change_resolved"; threadId: string; turnId: string } & z.infer<typeof modeChangeResolution>)
   | { kind: "plan"; threadId: string; turnId: string; steps: PlanStep[] }
@@ -146,15 +149,23 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
     const text = stringValue(params.delta);
     const itemId = stringValue(params.itemId);
     const summaryIndex = numberValue(params.summaryIndex);
-    if (text === undefined || !itemId || summaryIndex === undefined) return undefined;
+    if (text === undefined || !itemId || !isReasoningIndex(summaryIndex)) return undefined;
     return {
       kind: "progress",
       threadId,
       turnId,
       activityId: `reasoning:${itemId}:${summaryIndex}`,
+      reasoning: { itemId, summaryIndex },
       text,
       append: true,
     };
+  }
+  if (method === "item/reasoning/textDelta") {
+    const text = stringValue(params.delta);
+    const itemId = stringValue(params.itemId);
+    const contentIndex = numberValue(params.contentIndex);
+    if (text === undefined || !itemId || !isReasoningIndex(contentIndex)) return undefined;
+    return { kind: "reasoning_delta", threadId, turnId, itemId, contentIndex, text };
   }
   if (method === "turn/plan/updated" && Array.isArray(params.plan)) {
     const steps = params.plan.flatMap((value): PlanStep[] => {
@@ -164,6 +175,14 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
     return { kind: "plan", threadId, turnId, steps };
   }
   if ((method === "item/started" || method === "item/completed") && isRecord(params.item)) {
+    if (params.item.type === "reasoning") {
+      if (method !== "item/completed") return undefined;
+      const itemId = stringValue(params.item.id);
+      const summary = reasoningSections(params.item.summary);
+      const content = reasoningSections(params.item.content);
+      if (!itemId || !summary || !content) return undefined;
+      return { kind: "reasoning_completed", threadId, turnId, itemId, summary, content };
+    }
     if (params.item.type === "plan") {
       const itemId = stringValue(params.item.id);
       const text = stringValue(params.item.text);
@@ -211,6 +230,15 @@ export function mapCodexNotification(method: string, params: unknown): MappedCod
     };
   }
   return undefined;
+}
+
+function isReasoningIndex(value: number | undefined): value is number {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 0 && value < 10_000;
+}
+
+function reasoningSections(value: unknown): string[] | undefined {
+  if (value === undefined) return [];
+  return Array.isArray(value) && value.every((section) => typeof section === "string") ? value : undefined;
 }
 
 export function formatCodexError(error: unknown): string | undefined {

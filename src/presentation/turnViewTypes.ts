@@ -18,9 +18,17 @@ export interface FileSummary {
 
 export type TurnActivity =
   | { kind: "assistant"; id: string; text: string }
-  | { kind: "user"; id: string; text: string }
+  | { kind: "user"; id: string; text: string; localImagePaths?: string[] }
   | { kind: "reasoning"; id: string; text: string }
   | { kind: "tool"; id: string; tool: ToolState };
+
+export interface TurnReasoningItem {
+  itemId: string;
+  afterActivityId?: string;
+  summary: string[];
+  content: string[];
+  completed?: boolean;
+}
 
 export interface TurnViewState {
   sessionId: string;
@@ -29,6 +37,7 @@ export interface TurnViewState {
   model?: string;
   taskTitle?: string;
   prompt?: string;
+  promptImagePaths?: string[];
   projectCwd?: string;
   replyTarget?: MessageReplyTarget;
   status: TurnViewStatus;
@@ -55,6 +64,7 @@ export interface TurnViewState {
   assistantText: string;
   plan: PlanStep[];
   activities: TurnActivity[];
+  reasoningItems?: TurnReasoningItem[];
   fullToolOutputs?: Record<string, string>;
   fullToolErrors?: Record<string, string>;
   activitiesTruncated?: boolean;
@@ -69,4 +79,6 @@ export interface TurnViewState {
   approval?: ApprovalRequest;
   finalResponse?: string;
   error?: string;
+  historyDetail?: "summary" | "full";
+  historyDetailError?: string;
 }

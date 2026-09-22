@@ -27,6 +27,7 @@ export interface TurnPresenter {
     taskTitle?: string,
     replyTarget?: MessageReplyTarget,
     prompt?: string,
+    localImagePaths?: string[],
   ): Promise<string | undefined>;
   failPendingTurn(
     sessionId: string,
@@ -34,9 +35,10 @@ export interface TurnPresenter {
     replacementCard?: Record<string, unknown>,
   ): Promise<boolean>;
   interruptTurnForRecovery(sessionId: string, contextKey: string, turnId: string, message: string): Promise<void>;
-  appendSteerMessage(sessionId: string, turnId: string, text: string, messageId?: string): Promise<void>;
+  appendSteerMessage(sessionId: string, turnId: string, text: string, messageId?: string, localImagePaths?: string[]): Promise<void>;
   onEvent(event: AgentEvent): Promise<void>;
   showDetails(contextKey: string, turnId: string): Promise<void>;
+  getTurnPreviewUrl?(turnId: string): string | undefined;
   showActivityPage(
     contextKey: string,
     turnId: string,
@@ -112,13 +114,14 @@ export class OutboundRouter {
     taskTitle?: string,
     replyTarget?: MessageReplyTarget,
     prompt?: string,
+    localImagePaths?: string[],
   ): Promise<string | undefined> {
     const route = this.route(contextKey);
     this.sessionRoutes.set(sessionId, route);
     this.sessionContextKeys.set(sessionId, contextKey);
     if (replyTarget) this.sessionReplyTargets.set(sessionId, replyTarget);
     else this.sessionReplyTargets.delete(sessionId);
-    return route.presenter.startPendingTurn(sessionId, contextKey, taskTitle, replyTarget, prompt);
+    return route.presenter.startPendingTurn(sessionId, contextKey, taskTitle, replyTarget, prompt, ...(localImagePaths ? [localImagePaths] : []));
   }
 
   async failPendingTurn(
@@ -147,8 +150,13 @@ export class OutboundRouter {
     turnId: string,
     text: string,
     messageId?: string,
+    localImagePaths?: string[],
   ): Promise<void> {
-    await this.sessionRoutes.get(sessionId)?.presenter.appendSteerMessage(sessionId, turnId, text, messageId);
+    await this.sessionRoutes.get(sessionId)?.presenter.appendSteerMessage(sessionId, turnId, text, messageId, ...(localImagePaths ? [localImagePaths] : []));
+  }
+
+  getTurnPreviewUrl(contextKey: string, turnId: string): string | undefined {
+    return this.route(contextKey).presenter.getTurnPreviewUrl?.(turnId);
   }
 
   async onEvent(event: AgentEvent): Promise<void> {

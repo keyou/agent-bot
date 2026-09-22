@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 
@@ -588,6 +588,92 @@ describe("LocalFileViewerServer", () => {
     expect(fs.readFileSync(path.join(directory, "port"), "utf8").trim()).toBe(String(firstAddress.port));
   });
 
+  test("hydrates authenticated history pages and reports retryable failures without loading for HEAD or detail requests", async () => {
+    const directory = createTemporaryDirectory();
+    const snapshot: TurnViewState = { sessionId: "s", turnId: "historical", status: "completed", startedAt: 1,
+      historyDetail: "summary", assistantText: "", activities: [], plan: [], completedTools: [], failedTools: [], fileSummary: [] };
+    const load = vi.fn(async () => ({ ...snapshot, historyDetail: "full" as const, finalResponse: "Restored answer" }));
+    const server = new LocalFileViewerServer({ host: "127.0.0.1", port: 0, stateDirectory: directory,
+      getTurnSnapshot: (id) => id === snapshot.turnId ? snapshot : undefined, loadTurnSnapshot: load });
+    await server.start();
+    servers.push(server);
+    const url = new URL(server.createTurnPreviewUrl(snapshot.turnId)!);
+    const forged = new URL(url);
+    forged.searchParams.set("turn", "other");
+    expect((await fetch(forged)).status).toBe(403);
+    await fetch(url, { method: "HEAD" });
+    const detail = new URL(url);
+    detail.searchParams.set("detail", "tool:missing");
+    await fetch(detail);
+    expect(load).not.toHaveBeenCalled();
+    load.mockRejectedValueOnce(new Error("RPC <script>failed</script>"));
+    const failed = await fetch(url, { headers: { "accept-language": "zh-CN" } });
+    expect(failed.status).toBe(200);
+    const html = await failed.text();
+    expect(html).toContain("历史执行详情读取失败");
+    expect(html).toContain("RPC &lt;script&gt;failed&lt;/script&gt;");
+    expect(html).toContain('class="status completed"');
+    expect(await (await fetch(url)).text()).toContain("Restored answer");
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  test("serves only requested deferred details under the original Turn signature", async () => {
+    const directory = createTemporaryDirectory();
+    const imagePath = path.join(directory, "lazy.png");
+    fs.writeFileSync(imagePath, "image placeholder");
+    let snapshot: TurnViewState = {
+      sessionId: "session", turnId: "lazy-turn", startedAt: 1_000, completedAt: 2_000, status: "completed",
+      reasoningItems: [{ itemId: "r1", summary: ["Private summary"], content: ["Private reasoning body"] }],
+      prompt: "Completed task", assistantText: "", plan: [], completedTools: [], failedTools: [], fileSummary: [],
+      activities: [{ kind: "tool", id: "first", tool: { id: "first", kind: "image", title: "Image", status: "completed", imagePath, output: "First private log" } },
+        { kind: "tool", id: "second", tool: { id: "second", kind: "command", title: "Command", status: "completed", output: "Other private log" } }],
+    };
+    const server = new LocalFileViewerServer({ host: "127.0.0.1", port: 0, stateDirectory: directory, getTurnSnapshot: (id) => id === snapshot.turnId ? snapshot : undefined });
+    servers.push(server);
+    await server.start();
+    const url = new URL(server.createTurnPreviewUrl(snapshot.turnId)!);
+    const page = await (await fetch(url)).text();
+    expect(page).toContain('data-terminal="true"');
+    expect(page).not.toContain("First private log");
+    expect(page).not.toContain("Other private log");
+    expect(page).not.toContain("Private summary");
+    expect(page).not.toContain("Private reasoning body");
+    expect(page).not.toContain("lazy.png");
+    url.searchParams.set("detail", "tool:first");
+    const response = await fetch(url);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    const detail = await response.json() as { key: string; revision: string; content: string };
+    expect(detail.key).toBe("tool:first");
+    expect(detail.content).toContain("First private log");
+    expect(detail.content).not.toContain("Other private log");
+    expect(detail.content).toContain("lazy.png");
+    const head = await fetch(url, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    snapshot = { ...snapshot, fullToolOutputs: { first: "Updated private log" } };
+    const changed = await (await fetch(url)).json() as typeof detail;
+    expect(changed.content).toContain("Updated private log");
+    expect(changed.revision).not.toBe(detail.revision);
+    url.searchParams.set("detail", "reasoning:r1");
+    const reasoningResponse = await fetch(url);
+    expect(reasoningResponse.headers.get("cache-control")).toBe("no-store");
+    const reasoningDetail = await reasoningResponse.json() as typeof detail;
+    expect(reasoningDetail.key).toBe("reasoning:r1");
+    expect(reasoningDetail.content).toContain("Private summary");
+    expect(reasoningDetail.content).toContain("Private reasoning body");
+    expect(reasoningDetail.content).not.toContain("Other private log");
+    url.searchParams.set("detail", "reasoning:unknown");
+    expect((await fetch(url)).status).toBe(404);
+    url.searchParams.set("detail", "tool:unknown");
+    expect((await fetch(url)).status).toBe(404);
+    url.searchParams.set("detail", "files");
+    expect((await fetch(url)).status).toBe(404);
+    url.searchParams.set("detail", "reasoning:r1");
+    url.searchParams.set("turn", "different-turn");
+    expect((await fetch(url)).status).toBe(403);
+  });
+
   test("serves signed live Turn previews from persisted presentation snapshots", async () => {
     const directory = createTemporaryDirectory();
     const changedFile = "changed & reviewed.ts";
@@ -634,7 +720,11 @@ describe("LocalFileViewerServer", () => {
     expect(page).toContain('title="总计: 3,563 tokens"');
     expect(page).toContain('title="缓存命中: 3,555 tokens"');
     expect(page).not.toContain("检查 <preview> & SSE");
-    const fileUrl = /class="file-link" href="([^"]+)"/u.exec(page)?.[1]?.replaceAll("&amp;", "&");
+    expect(page).not.toContain('class="file-link"');
+    const filesDetailUrl = new URL(previewUrl!);
+    filesDetailUrl.searchParams.set("detail", "files");
+    const filesDetail = await (await fetch(filesDetailUrl)).json() as { content: string };
+    const fileUrl = /class="file-link" href="([^"]+)"/u.exec(filesDetail.content)?.[1]?.replaceAll("&amp;", "&");
     expect(fileUrl).toBe(server.createFileUrl(path.join(directory, changedFile)));
     const fileResponse = await fetch(fileUrl!);
     expect(fileResponse.status).toBe(200);
@@ -694,7 +784,11 @@ describe("LocalFileViewerServer", () => {
       expect(update.metadata).toContain('title="总计: 7,126 tokens"');
       expect(update.metadata).toContain('title="缓存命中: 7,110 tokens"');
       expect(update.content).toContain("npm test");
-      expect(update.content).toContain("all passed");
+      expect(update.content).not.toContain("all passed");
+      const toolDetailUrl = new URL(previewUrl!);
+      toolDetailUrl.searchParams.set("detail", "tool:tool_1");
+      const toolDetail = await (await fetch(toolDetailUrl)).json() as { content: string };
+      expect(toolDetail.content).toContain("all passed");
       expect(update.content).not.toContain("/bin/zsh -lc");
       expect(update.content).toContain('class="tool-header-timing">1s</span>');
       expect(update.content).toContain("完成 <strong>Preview</strong>。");
@@ -702,8 +796,9 @@ describe("LocalFileViewerServer", () => {
       expect(updatedImageUrl).toBe(imageUrl);
       expect(Buffer.from(await (await fetch(updatedImageUrl!)).arrayBuffer())).toEqual(png);
       expect(update.terminal).toBe(true);
-      expect(update.content.match(/class="file-link"/gu)).toHaveLength(2);
-      expect(update.content).toContain(`href="${fileUrl!.replaceAll("&", "&amp;")}"`);
+      expect(update.content).not.toContain('class="file-link"');
+      expect(toolDetail.content.match(/class="file-link"/gu)).toHaveLength(1);
+      expect(toolDetail.content).toContain(`href="${fileUrl!.replaceAll("&", "&amp;")}"`);
     } finally {
       controller.abort();
     }

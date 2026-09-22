@@ -1267,6 +1267,11 @@ export class CardRenderer {
       : "任务执行详情";
     const elements = [markdown(`Turn: \`${state.turnId}\``)];
     if (state.prompt) elements.push(markdown(`**Prompt**\n${truncateText(state.prompt, 1_000)}`));
+    if (state.historyDetailError) {
+      elements.push(markdown(`**历史执行详情读取失败**\n${truncateText(state.historyDetailError, 1_000)}\n请重新打开详情或 Preview 重试；本轮执行状态未改变。`));
+    } else if (state.historyDetail === "summary") {
+      elements.push(markdown("当前仅保存轮次摘要，尚未加载历史执行详情。"));
+    }
     elements.push(...renderTurnElements(state, "always"));
     if (previewUrl) elements.push(taskActionRow([turnPreviewAction(previewUrl)]));
     return turnCard(title, "blue", elements, renderTurnSubtitle(state));
@@ -1753,8 +1758,10 @@ function renderGroupedTurnElements(
       },
     }]));
   }
-  if (state.activitiesTruncated && visible.groups[0]?.kind !== "gap") elements.push(markdown("…"));
-  elements.push(...renderGroupedActivityGroups(visible.groups, state.projectCwd));
+  const visibleGroups: GroupedTurnActivity[] = state.activitiesTruncated
+    ? [{ kind: "gap", id: "gap:truncated" }, ...visible.groups]
+    : visible.groups;
+  elements.push(...renderGroupedActivityGroups(visibleGroups, state.projectCwd));
   if (state.fileSummary.length > 0) elements.push(fileSummaryPanel(state));
 
   if (state.approval) {
@@ -1913,17 +1920,24 @@ function renderGroupedActivityGroups(
     fullActivityText?: boolean;
   } = {},
 ): Record<string, unknown>[] {
-  return groups.flatMap((group) => {
-    if (group.kind === "gap") return [markdown("…")];
-    if (group.kind === "activity") {
-      return renderActivity(group.activity, projectCwd, options.fullActivityText === true);
+  const elements: Record<string, unknown>[] = [];
+  let previousWasGap = false;
+  for (const group of groups) {
+    if (group.kind === "gap") {
+      if (!previousWasGap) elements.push(markdown("…"));
+      previousWasGap = true;
+      continue;
     }
-    if (group.tools.length === 0) {
-      const reasonings = group.latestReasoning ? [group.latestReasoning] : [];
-      return renderReasoningGroup(reasonings);
-    }
-    return [executionActivityPanel(group, projectCwd)];
-  });
+    const rendered = group.kind === "activity"
+      ? renderActivity(group.activity, projectCwd, options.fullActivityText === true)
+      : group.tools.length === 0
+        ? renderReasoningGroup(group.latestReasoning ? [group.latestReasoning] : [])
+        : [executionActivityPanel(group, projectCwd)];
+    if (rendered.length === 0) continue;
+    elements.push(...rendered);
+    previousWasGap = false;
+  }
+  return elements;
 }
 
 function groupTurnActivities(activities: TurnActivity[]): GroupedTurnActivity[] {
@@ -2144,7 +2158,10 @@ function groupedLiveActivityPage(
 }
 
 function isCommentaryGroup(group: GroupedTurnActivity): boolean {
-  return group.kind === "activity" && isCommentaryActivity(group.activity);
+  return group.kind === "activity"
+    && group.activity.kind !== "tool"
+    && isCommentaryActivity(group.activity)
+    && group.activity.text.trim().length > 0;
 }
 
 function groupsWithGaps(

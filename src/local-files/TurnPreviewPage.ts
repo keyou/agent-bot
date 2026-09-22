@@ -1,8 +1,12 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
+import { enableDiagramFences, DIAGRAM_PREVIEW_CLIENT_SCRIPT, DIAGRAM_PREVIEW_CSS } from "./DiagramPreview.js";
 import MarkdownIt from "markdown-it";
+import { highlightPreviewCode, PREVIEW_SYNTAX_CSS } from "./PreviewSyntaxHighlight.js";
 import type { ToolState } from "../runtime/types.js";
-import type { FileSummary, TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
+import type { FileSummary, TurnActivity, TurnReasoningItem, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
 import { displayFilePath, displayToolCommand, formatShellCommandForDisplay, toolStatusIcon } from "../feishu/CardRenderer.js";
+import { turnReasoningItems } from "../presentation/turnReasoning.js";
 import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 
 const MARKDOWN = new MarkdownIt({
@@ -10,7 +14,9 @@ const MARKDOWN = new MarkdownIt({
   html: false,
   linkify: true,
   typographer: false,
+  highlight: highlightPreviewCode,
 });
+enableDiagramFences(MARKDOWN);
 const validateLink = MARKDOWN.validateLink.bind(MARKDOWN);
 MARKDOWN.validateLink = (url) => isFileUrl(url) || validateLink(url);
 const defaultLinkOpen = MARKDOWN.renderer.rules.link_open
@@ -33,6 +39,7 @@ const PREVIEW_LABELS = {
     unknown: "未知",
     plan: "计划",
     error: "错误",
+    reasoning: "思考",
     finalAnswer: "最终回答",
     generating: "回答生成中",
     command: "命令",
@@ -74,6 +81,7 @@ const PREVIEW_LABELS = {
     unknown: "Unknown",
     plan: "Plan",
     error: "Error",
+    reasoning: "Reasoning",
     finalAnswer: "Final answer",
     generating: "Generating answer",
     command: "Command",
@@ -128,13 +136,13 @@ export function detectTurnPreviewLanguage(
   return /^zh(?:[-_]|$)/iu.test(candidates[0]?.tag ?? "") ? "zh" : "en";
 }
 
-export const TURN_PREVIEW_CLIENT_SCRIPT = `(() => {
+export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() => {
   const eventsUrl = document.body.dataset.eventsUrl;
   const content = document.getElementById("turn-content");
   const metadata = document.getElementById("turn-metadata");
   const status = document.getElementById("turn-status");
   const live = document.getElementById("turn-live");
-  if (!eventsUrl || !content || !metadata || !status || !live || typeof EventSource !== "function") return;
+  if (!eventsUrl || !content || !metadata || !status || !live) return;
 
   const isChinese = /^zh/i.test(document.documentElement.lang);
   const labels = {
@@ -143,9 +151,13 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = `(() => {
     waitingForUpdates: isChinese ? "等待更新" : "Waiting for updates",
     unavailable: isChinese ? "暂时不可用" : "Temporarily unavailable",
     reconnecting: isChinese ? "正在重连" : "Reconnecting",
+    loading: isChinese ? "正在加载…" : "Loading…",
+    loadFailed: isChinese ? "加载失败，请重试。" : "Could not load details.",
+    retry: isChinese ? "重试" : "Retry",
   };
 
   let source;
+  const terminalAtLoad = document.body.dataset.terminal === "true";
   const updateElapsed = () => {
     document.querySelectorAll("[data-live-elapsed]").forEach((element) => {
       const startedAt = Number(element.dataset.startedAt);
@@ -179,41 +191,223 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = `(() => {
     });
   };
   updateElapsed();
-  setInterval(updateElapsed, 1000);
+  const clock = terminalAtLoad ? undefined : setInterval(updateElapsed, 1000);
 
-  const replaceSnapshot = (update) => {
-    const disclosures = new Map(Array.from(content.querySelectorAll("details[data-activity-id]"), (item) => [item.dataset.activityId, item.open]));
-    const scrollPositions = new Map(Array.from(content.querySelectorAll("[data-scroll-id]"), (item) => [item.dataset.scrollId, [item.scrollLeft, item.scrollTop]]));
+  const nodeKey = (node) => {
+    if (node.nodeType !== 1) return undefined;
+    for (const attribute of ["data-preview-key", "data-activity", "data-activity-id", "data-scroll-id", "data-reasoning-field", "data-reasoning-part"]) {
+      if (node.hasAttribute(attribute)) return attribute + ":" + node.getAttribute(attribute);
+    }
+    if (node.tagName === "IMG") return "image:" + node.getAttribute("src");
+    // Keep Markdown image paragraphs/links anchored when text is inserted before them.
+    if (["P", "A", "FIGURE", "PICTURE"].includes(node.tagName)) {
+      const image = node.querySelector("img");
+      if (image) return node.tagName + ":image:" + image.getAttribute("src");
+    }
+    for (const name of ["markdown", "tool-command", "tool-image", "files", "tool-header", "tool-body", "tool-footer"]) {
+      if (node.classList.contains(name)) return node.tagName + ":" + name;
+    }
+    return undefined;
+  };
+  const compatible = (current, next) => current.nodeType === next.nodeType && current.nodeName === next.nodeName;
+  const patchNode = (current, next) => {
+    // Summary snapshots never own a detail body that has already been fetched.
+    if (current.nodeType === 1 && current.hasAttribute("data-detail-body") && next.hasAttribute("data-detail-body")) return;
+    if (current.isEqualNode(next)) return;
+    if (current.nodeType !== 1) {
+      if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+      return;
+    }
+    if (current.hasAttribute("data-diagram") && next.hasAttribute("data-diagram")) {
+      const code = current.querySelector(".diagram-source code");
+      const nextCode = next.querySelector(".diagram-source code");
+      if (code && nextCode && code.textContent !== nextCode.textContent) {
+        code.textContent = nextCode.textContent;
+        window.agentBotDiagrams.refresh(current);
+      }
+      return;
+    }
+    const preserveOpen = current.tagName === "DETAILS";
+    for (const attribute of Array.from(current.attributes)) {
+      if (preserveOpen && attribute.name === "open") continue;
+      if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+    }
+    for (const attribute of Array.from(next.attributes)) {
+      if (preserveOpen && attribute.name === "open") continue;
+      if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+    }
+    patchChildren(current, next);
+  };
+  const patchChildren = (parent, next) => {
+    const nextChildren = Array.from(next.childNodes);
+    const nextKeys = new Set(nextChildren.map(nodeKey).filter((key) => key !== undefined));
+    const remaining = new Set(Array.from(parent.childNodes));
+    const keyed = new Map();
+    for (const child of remaining) {
+      const key = nodeKey(child);
+      if (key === undefined) continue;
+      if (!nextKeys.has(key)) {
+        child.remove();
+        remaining.delete(child);
+        continue;
+      }
+      const matches = keyed.get(key) || [];
+      matches.push(child);
+      keyed.set(key, matches);
+    }
+    let cursor = parent.firstChild;
+    for (const child of nextChildren) {
+      const key = nodeKey(child);
+      const matches = key === undefined ? undefined : keyed.get(key);
+      const current = key === undefined
+        ? cursor && nodeKey(cursor) === undefined && compatible(cursor, child) ? cursor : undefined
+        : matches?.find((candidate) => remaining.has(candidate) && compatible(candidate, child));
+      if (current) {
+        remaining.delete(current);
+        // Drop obsolete text/markup before a retained block without detaching that block.
+        while (cursor && cursor !== current && nodeKey(cursor) === undefined) {
+          const obsolete = cursor;
+          cursor = cursor.nextSibling;
+          remaining.delete(obsolete);
+          obsolete.remove();
+        }
+        if (current !== cursor) {
+          if (typeof parent.moveBefore === "function" && current.isConnected) parent.moveBefore(current, cursor);
+          else parent.insertBefore(current, cursor);
+        }
+        patchNode(current, child);
+        cursor = current.nextSibling;
+      } else {
+        const added = child.cloneNode(true);
+        parent.insertBefore(added, cursor);
+      }
+    }
+    for (const child of remaining) child.remove();
+  };
+  const patchMarkup = (element, markup) => {
+    const template = document.createElement("template");
+    template.innerHTML = markup;
+    patchChildren(element, template.content);
+  };
+  const detailStates = new WeakMap();
+  const detailState = (details) => {
+    if (!detailStates.has(details)) detailStates.set(details, {});
+    return detailStates.get(details);
+  };
+  const loadDetails = async (details, retry = false) => {
+    if (!details.open || !details.isConnected) return;
+    const state = detailState(details);
+    const revision = details.dataset.detailRevision;
+    if (state.loadedRevision === revision) state.loadedFor = revision;
+    if (state.pending || state.loadedFor === revision || (!retry && state.failedRevision === revision)) return;
+    const body = details.querySelector("[data-detail-body]");
+    const target = details.querySelector("[data-detail-content]");
+    const message = details.querySelector("[data-detail-message]");
+    if (!body || !target || !message) return;
+    const controller = new AbortController();
+    const request = { controller, revision };
+    state.pending = request;
+    state.failedRevision = undefined;
+    body.setAttribute("aria-busy", "true");
+    message.textContent = state.loadedRevision ? "" : labels.loading;
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const url = new URL(eventsUrl, window.location.href);
+      url.searchParams.delete("events");
+      url.searchParams.set("detail", details.dataset.detailKey);
+      const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+      if (!response.ok) throw new Error("Detail HTTP " + response.status);
+      const result = await response.json();
+      if (result.key !== details.dataset.detailKey || typeof result.content !== "string" || typeof result.revision !== "string") throw new Error("Invalid detail response");
+      if (state.pending !== request || !details.open || !details.isConnected) return;
+      if (details.dataset.detailRevision !== revision && result.revision !== details.dataset.detailRevision) return;
+      const positions = Array.from(target.querySelectorAll("[data-scroll-id]"), (item) => [item, item.scrollLeft, item.scrollTop]);
+      patchMarkup(target, result.content);
+      window.agentBotDiagrams?.scan();
+      for (const [item, left, top] of positions) { if (item.isConnected) { item.scrollLeft = left; item.scrollTop = top; } }
+      state.loadedRevision = result.revision;
+      state.loadedFor = details.dataset.detailRevision;
+      message.textContent = "";
+      updateElapsed();
+    } catch {
+      if (state.pending !== request || !details.open || !details.isConnected) return;
+      state.failedRevision = revision;
+      message.textContent = labels.loadFailed;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = labels.retry;
+      button.addEventListener("click", () => { void loadDetails(details, true); });
+      message.append(button);
+    } finally {
+      clearTimeout(timeout);
+      if (state.pending === request) {
+        state.pending = undefined;
+        body.removeAttribute("aria-busy");
+        if (details.dataset.detailRevision !== revision) void loadDetails(details);
+      }
+    }
+  };
+  content.addEventListener("toggle", (event) => {
+    const details = event.target;
+    if (!details.matches?.("details[data-detail-key]")) return;
+    if (details.open) { void loadDetails(details, true); return; }
+    const state = detailState(details);
+    state.pending?.controller.abort();
+    state.pending = undefined;
+    details.querySelector("[data-detail-body]")?.removeAttribute("aria-busy");
+    const message = details.querySelector("[data-detail-message]");
+    if (message) message.textContent = "";
+  }, true);
+  const refreshDetails = () => {
+    for (const details of content.querySelectorAll("details[data-detail-key][open]")) void loadDetails(details);
+  };
+  window.addEventListener("pagehide", () => {
+    source?.close();
+    clearInterval(clock);
+    for (const details of content.querySelectorAll("details[data-detail-key]")) detailStates.get(details)?.pending?.controller.abort();
+  }, { once: true });
+  let previousContent;
+  let previousMetadata;
+  const applySnapshot = (update) => {
+    const contentChanged = update.content !== previousContent;
+    const scrollPositions = new Map(Array.from(contentChanged ? content.querySelectorAll("[data-scroll-id]") : [], (item) => [item.dataset.scrollId, [item.scrollLeft, item.scrollTop]]));
     const top = window.scrollY;
     const maxTop = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
     const atBottom = maxTop - top <= 32;
-    content.innerHTML = update.content;
-    metadata.innerHTML = update.metadata;
+    if (contentChanged) {
+      patchMarkup(content, update.content);
+      window.agentBotDiagrams.scan();
+      previousContent = update.content;
+    }
+    if (update.metadata !== previousMetadata) {
+      patchMarkup(metadata, update.metadata);
+      previousMetadata = update.metadata;
+    }
     status.textContent = update.statusLabel;
     status.className = "status " + update.status;
-    for (const item of content.querySelectorAll("details[data-activity-id]")) {
-      if (disclosures.has(item.dataset.activityId)) item.open = disclosures.get(item.dataset.activityId);
-    }
     for (const item of content.querySelectorAll("[data-scroll-id]")) {
       const position = scrollPositions.get(item.dataset.scrollId);
       if (position) { item.scrollLeft = position[0]; item.scrollTop = position[1]; }
     }
     updateElapsed();
+    refreshDetails();
+    if (!contentChanged) return;
     requestAnimationFrame(() => {
       const nextMaxTop = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
       window.scrollTo(0, atBottom ? nextMaxTop : Math.min(top, nextMaxTop));
     });
   };
 
+  if (terminalAtLoad || typeof EventSource !== "function") return;
   source = new EventSource(eventsUrl);
   source.addEventListener("update", (event) => {
     try {
       const update = JSON.parse(event.data);
       if (typeof update.content !== "string" || typeof update.metadata !== "string") return;
-      replaceSnapshot(update);
+      applySnapshot(update);
       live.textContent = update.terminal ? "" : labels.live;
       live.className = update.terminal ? "live terminal" : "live connected";
-      if (update.terminal) source.close();
+      if (update.terminal) { source.close(); clearInterval(clock); }
     } catch {
       live.textContent = labels.waitingForUpdates;
       live.className = "live";
@@ -227,7 +421,6 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = `(() => {
     live.textContent = labels.reconnecting;
     live.className = "live disconnected";
   };
-  window.addEventListener("pagehide", () => source.close(), { once: true });
 })();
 `;
 
@@ -256,11 +449,12 @@ export function renderTurnPreviewPage(input: {
   state: TurnViewState;
   eventsUrl: string;
   scriptPath: string;
+  diagramScriptPath?: string;
   localFileUrl?: (filePath: string) => string | undefined;
   language?: TurnPreviewLanguage;
 }): string {
   const language = input.language ?? "zh";
-  const snapshot = renderTurnPreviewSnapshot(input.state, input.localFileUrl, language);
+  const snapshot = renderTurnPreviewSnapshot(input.state, input.localFileUrl, language, { deferDetails: true });
   const title = previewTitle(input.state);
   return `<!doctype html>
 <html lang="${language === "zh" ? "zh-CN" : "en"}">
@@ -268,9 +462,9 @@ export function renderTurnPreviewPage(input: {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)} · Agent Bot</title>
-  <style>${TURN_PREVIEW_CSS}</style>
+  <style>${TURN_PREVIEW_CSS}${DIAGRAM_PREVIEW_CSS}${PREVIEW_SYNTAX_CSS}</style>
 </head>
-<body data-events-url="${escapeAttribute(input.eventsUrl)}">
+<body data-terminal="${snapshot.terminal}" data-events-url="${escapeAttribute(input.eventsUrl)}" data-diagram-script="${escapeAttribute(input.diagramScriptPath ?? "")}">
   <header class="page-header">
     <div class="header-inner">
       <div class="header-top">
@@ -291,6 +485,7 @@ export function renderTurnPreviewSnapshot(
   state: TurnViewState,
   localFileUrl?: (filePath: string) => string | undefined,
   language: TurnPreviewLanguage = "zh",
+  options: { deferDetails?: boolean } = {},
 ): TurnPreviewSnapshot {
   const labels = previewLabels(language);
   const resolveFileUrl = localFileUrl ? (filePath: string): string | undefined => {
@@ -298,25 +493,35 @@ export function renderTurnPreviewSnapshot(
     if (!state.projectCwd || !path.isAbsolute(state.projectCwd)) return undefined;
     return localFileUrl(path.resolve(state.projectCwd, filePath));
   } : undefined;
-  const renderText = (value: string): string => renderMarkdown(value, state.projectCwd, localFileUrl);
-  const timeline = renderTimeline(state.activities ?? [], renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd);
+  const renderText = (value: string): string => renderMarkdown(value, state.projectCwd, localFileUrl, language);
+  const timeline = renderTimeline(state, renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd, options.deferDetails);
+  const terminal = isTerminal(state.status);
+  const waitingForProgress = !terminal && !state.finalResponse && !state.assistantText
+    && !state.error && !state.approval && state.status !== "waiting_for_approval"
+    && state.plan.length === 0 && state.fileSummary.length === 0;
+  const timelineContent = timeline || (waitingForProgress
+    ? `<div class="empty">${escapeHtml(language === "zh" ? "正在等待 Agent 返回进度…" : "Waiting for Agent progress…")}</div>`
+    : "");
   const sections = [
-    state.prompt ? renderMessageActivity("prompt", state.prompt, "user prompt", renderText) : "",
+    state.prompt || state.promptImagePaths?.length ? renderMessageActivity("prompt", state.prompt ?? "", "user prompt", renderText, renderMessageImages(state.promptImagePaths, resolveFileUrl, language)) : "",
+    state.historyDetailError
+      ? `<section class="notice" data-preview-key="history-detail"><h2>${language === "zh" ? "历史执行详情读取失败" : "Failed to load historical execution details"}</h2><pre>${escapeHtml(state.historyDetailError)}</pre><p>${language === "zh" ? "刷新页面重试；本轮执行状态未改变。" : "Refresh to retry; the Turn's execution status is unchanged."}</p></section>`
+      : state.historyDetail === "summary"
+        ? `<section class="notice" data-preview-key="history-detail">${language === "zh" ? "当前仅保存轮次摘要，尚未加载历史执行详情。" : "Only a Turn summary is saved; execution details have not been loaded."}</section>` : "",
     state.plan.length > 0 ? renderPlan(state, language) : "",
     state.activitiesTruncated
-      ? `<div class="notice">${escapeHtml(labels.truncated)}</div>`
+      ? `<div class="notice" data-preview-key="truncated">${escapeHtml(labels.truncated)}</div>`
       : "",
-    timeline ? `<section class="timeline">${timeline}</section>` : `<div class="empty">${escapeHtml(language === "zh" ? "正在等待 Agent 返回进度…" : "Waiting for Agent progress…")}</div>`,
-    state.fileSummary.length > 0 ? renderFileSummary(state, language, resolveFileUrl) : "",
-    state.approval ? `<section class="notice"><h2>${escapeHtml(state.approval.title)}</h2><div class="markdown">${renderText(state.approval.reason ?? "")}</div><p>${escapeHtml(language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu.")}</p></section>` : "",
-    state.error ? `<section class="result error-result"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(state.error)}</pre></section>` : "",
+    `<section class="timeline" data-preview-key="timeline"${timelineContent ? "" : " hidden"}>${timelineContent}</section>`,
+    state.fileSummary.length > 0 ? renderFileSummary(state, language, resolveFileUrl, options.deferDetails) : "",
+    state.approval ? `<section class="notice" data-preview-key="approval"><h2>${escapeHtml(state.approval.title)}</h2><div class="markdown">${renderText(state.approval.reason ?? "")}</div><p>${escapeHtml(language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu.")}</p></section>` : "",
+    state.error ? `<section class="result error-result" data-preview-key="error"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(state.error)}</pre></section>` : "",
     state.finalResponse
-      ? `<section class="result final-result"><h2>${escapeHtml(labels.finalAnswer)}</h2><div class="markdown">${renderText(state.finalResponse)}</div></section>`
+      ? `<section class="result final-result" data-preview-key="result"><h2>${escapeHtml(labels.finalAnswer)}</h2><div class="markdown">${renderText(state.finalResponse)}</div></section>`
       : state.assistantText
-        ? `<section class="result"><h2>${escapeHtml(labels.generating)}</h2><div class="markdown">${renderText(state.assistantText)}</div></section>`
+        ? `<section class="result" data-preview-key="result"><h2>${escapeHtml(labels.generating)}</h2><div class="markdown">${renderText(state.assistantText)}</div></section>`
         : "",
   ].filter(Boolean).join("");
-  const terminal = isTerminal(state.status);
   return {
     content: sections,
     metadata: renderMetadata(state, language),
@@ -333,22 +538,103 @@ function renderPlan(state: TurnViewState, language: TurnPreviewLanguage): string
     const marker = step.status === "completed" ? "✓" : step.status === "in_progress" ? "↻" : "○";
     return `<li class="${step.status}"><span>${marker}</span><span>${escapeHtml(step.text)}</span></li>`;
   }).join("");
-  return `<section class="plan"><h2>${escapeHtml(labels.plan)} <span>${completed}/${state.plan.length}</span></h2><ol>${items}</ol></section>`;
+  return `<section class="plan" data-preview-key="plan"><h2>${escapeHtml(labels.plan)} <span>${completed}/${state.plan.length}</span></h2><ol>${items}</ol></section>`;
 }
 
 function renderTimeline(
-  activities: TurnActivity[],
+  state: TurnViewState,
   renderText: (value: string) => string,
   localFileUrl?: (filePath: string) => string | undefined,
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
   projectCwd?: string,
+  deferDetails = false,
 ): string {
-  return activities
-    .filter((activity): activity is Exclude<TurnActivity, { kind: "reasoning" }> => activity.kind !== "reasoning")
-    .map((activity) => renderActivity(activity, renderText, localFileUrl, fullToolOutputs, fullToolErrors, language, projectCwd))
-    .join("");
+  const activities = state.activities ?? [];
+  const positions = new Map(activities.map((activity, index) => [activity.id, index]));
+  const reasoning = new Map<number, TurnReasoningItem[]>();
+  for (const item of turnReasoningItems(state)) {
+    const position = item.afterActivityId ? positions.get(item.afterActivityId) ?? -1 : -1;
+    const items = reasoning.get(position) ?? [];
+    items.push(item);
+    reasoning.set(position, items);
+  }
+  const renderReasoning = (position: number): string => (reasoning.get(position) ?? [])
+    .map((item) => renderReasoningItem(item, state.projectCwd, localFileUrl, language, deferDetails)).join("");
+  return renderReasoning(-1) + activities.map((activity, index) => {
+    const visible = activity.kind === "reasoning"
+      ? activity.id.startsWith("commentary:") ? { ...activity, kind: "assistant" as const } : undefined
+      : activity;
+    return (visible ? renderActivity(visible, renderText, localFileUrl, fullToolOutputs, fullToolErrors, language, projectCwd, deferDetails) : "")
+      + renderReasoning(index);
+  }).join("");
+}
+
+function reasoningPresentation(item: TurnReasoningItem): {
+  title?: string;
+  sections: Array<{ field: "summary" | "content"; parts: Array<{ index: number; text: string }> }>;
+} {
+  let title: string | undefined;
+  const sections = (["summary", "content"] as const).map((field) => ({
+    field,
+    parts: item[field].map((text, index) => {
+      const heading = !title && text?.trim() ? leadingReasoningHeading(text) : undefined;
+      if (heading) title = heading.title;
+      return { index, text: heading?.body ?? text };
+    }).filter((part) => part.text?.trim()),
+  }));
+  return { title, sections };
+}
+
+function leadingReasoningHeading(text: string): { title: string; body: string } | undefined {
+  const first = /^(?:[ \t]*\r?\n)*([^\r\n]*)(?:\r?\n|$)/u.exec(text);
+  if (!first || !/^ {0,3}(?:#{1,6}[ \t]+|\*\*|__)/u.test(first[1])) return undefined;
+  // Parse only a possible title line; collapsed panels must not render the full Markdown.
+  const [block, inline] = MARKDOWN.parse(first[1], {});
+  const tokens = inline?.children?.filter((token) => token.type !== "text" || token.content !== "") ?? [];
+  const strongTitle = block?.type === "paragraph_open"
+    && tokens[0]?.type === "strong_open" && tokens.at(-1)?.type === "strong_close"
+    && tokens.slice(1, -1).every((token) => token.level > 0);
+  if (block?.type !== "heading_open" && !strongTitle) return undefined;
+  const title = tokens.map((token) => token.content).join("").trim();
+  if (!title) return undefined;
+  // Keep linked/image headings in the body so moving their text never discards an attachment or link.
+  const keepHeading = tokens.some((token) => token.type === "link_open" || token.type === "image");
+  return { title, body: keepHeading ? text : text.slice(first[0].length) };
+}
+
+function renderReasoningItem(
+  item: TurnReasoningItem,
+  cwd: string | undefined,
+  localFileUrl: ((filePath: string) => string | undefined) | undefined,
+  language: TurnPreviewLanguage,
+  deferDetails: boolean,
+): string {
+  const presentation = reasoningPresentation(item);
+  if (!presentation.title && !presentation.sections.some((section) => section.parts.length > 0)) return "";
+  const title = presentation.title ?? previewLabels(language).reasoning;
+  const lazy = deferDetails ? lazyDetailAttributes(`reasoning:${item.itemId}`, reasoningRevision(item, cwd)) : "";
+  const body = deferDetails ? lazyDetailBody() : renderReasoningBody(item, cwd, localFileUrl, language, presentation);
+  return `<details class="reasoning-step" data-activity-id="reasoning:${escapeAttribute(item.itemId)}"${lazy}><summary class="reasoning-header" title="${escapeAttribute(title)}"><span class="reasoning-title">💭 ${escapeHtml(title)}</span></summary>${body}</details>`;
+}
+
+function renderReasoningBody(
+  item: TurnReasoningItem,
+  cwd: string | undefined,
+  localFileUrl: ((filePath: string) => string | undefined) | undefined,
+  language: TurnPreviewLanguage,
+  presentation = reasoningPresentation(item),
+): string {
+  return presentation.sections.map(({ field, parts }) => {
+    if (parts.length === 0) return "";
+    const sections = parts.map(({ index, text }) => `<div class="markdown reasoning-part" data-reasoning-part="${index}">${renderMarkdown(text, cwd, localFileUrl, language)}</div>`).join("");
+    return `<section class="reasoning-section" data-reasoning-field="${field}">${sections}</section>`;
+  }).join("");
+}
+
+function reasoningRevision(item: TurnReasoningItem, cwd?: string): string {
+  return createHash("sha256").update(JSON.stringify([item.summary, item.content, cwd])).digest("hex").slice(0, 24);
 }
 
 function renderActivity(
@@ -359,6 +645,7 @@ function renderActivity(
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
   projectCwd?: string,
+  deferDetails = false,
 ): string {
   switch (activity.kind) {
     case "assistant":
@@ -367,17 +654,68 @@ function renderActivity(
       }
       return renderMessageActivity(activity.id, activity.text, "commentary", renderText);
     case "user":
-      return renderMessageActivity(activity.id, activity.text, "user", renderText);
+      return renderMessageActivity(activity.id, activity.text, "user", renderText, renderMessageImages(activity.localImagePaths, localFileUrl, language));
     case "tool":
-      return renderToolActivity(activity.id, activity.tool, localFileUrl, fullToolOutputs, fullToolErrors, language, projectCwd);
+      return renderToolActivity(activity.id, activity.tool, localFileUrl, fullToolOutputs, fullToolErrors, language, projectCwd, deferDetails);
   }
 }
 
-function renderMessageActivity(id: string, text: string, kind: string, renderText: (value: string) => string): string {
-  return `<article class="activity message ${kind}" data-activity="${escapeAttribute(id)}"><div class="markdown">${renderText(text)}</div></article>`;
+function renderMessageActivity(id: string, text: string, kind: string, renderText: (value: string) => string, images = ""): string {
+  return `<article class="activity message ${kind}" data-activity="${escapeAttribute(id)}"><div class="markdown">${renderText(text)}${images}</div></article>`;
+}
+
+function renderMessageImages(paths: string[] | undefined, localFileUrl: ((filePath: string) => string | undefined) | undefined, language: TurnPreviewLanguage): string {
+  if (!paths?.length) return "";
+  return [...new Set(paths)].map((filePath, index) => {
+    const label = language === "zh" ? `图片 ${index + 1}` : `Image ${index + 1}`;
+    const unavailable = `<p class="muted">${escapeHtml(label)}${language === "zh" ? "不可用" : " unavailable"}</p>`;
+    const url = localFileUrl?.(filePath);
+    if (!url) return unavailable;
+    try {
+      const raw = new URL(url);
+      if (raw.protocol !== "http:" && raw.protocol !== "https:") return unavailable;
+      raw.searchParams.set("raw", "1");
+      return `<p class="message-image"><img src="${escapeAttribute(raw.toString())}" alt="${escapeAttribute(label)}" loading="lazy"></p>`;
+    } catch {
+      return unavailable;
+    }
+  }).join("");
 }
 
 function renderToolActivity(
+  activityId: string,
+  tool: ToolState,
+  localFileUrl?: (filePath: string) => string | undefined,
+  fullToolOutputs?: Record<string, string>,
+  fullToolErrors?: Record<string, string>,
+  language: TurnPreviewLanguage = "zh",
+  projectCwd?: string,
+  deferDetails = false,
+): string {
+  const labels = previewLabels(language);
+  const command = tool.command ? (displayToolCommand(tool.command) || tool.command.trim()) : undefined;
+  const repl = isReplTool(tool);
+  const displayCommand = repl
+    ? formatReplCommand(command ?? "")
+    : command
+      ? formatToolCommand(command)
+      : undefined;
+  const title = displayCommand ? summarizeToolCommand(displayCommand) : toolTitle(tool, command, repl, language);
+  const titleMarkup = displayCommand
+    ? `<code class="tool-command-title">${escapeHtml(title)}</code>`
+    : `<span class="tool-title">${escapeHtml(title)}</span>`;
+  const timing = renderToolTiming(tool, "header");
+  const statusLabel = toolStatusLabel(tool.status, language);
+  const icon = `<span class="tool-status-icon" role="img" aria-label="${escapeAttribute(statusLabel)}" title="${escapeAttribute(statusLabel)}">${toolStatusIcon(tool.status)}</span>`;
+  const header = `<summary class="tool-header">${icon}<span class="tool-summary-content">${titleMarkup}</span><span class="tool-meta">${timing}</span></summary>`;
+  const body = deferDetails
+    ? lazyDetailBody()
+    : renderToolBody(activityId, tool, localFileUrl, fullToolOutputs, fullToolErrors, language, projectCwd);
+  const lazy = deferDetails ? lazyDetailAttributes(`tool:${activityId}`, toolDetailRevision(tool, fullToolOutputs, fullToolErrors, projectCwd)) : "";
+  return `<article class="activity tool" data-activity="${escapeAttribute(activityId)}"><details class="tool-step" data-tool-status="${tool.status}" data-activity-id="${escapeAttribute(activityId)}"${lazy}>${header}${body}</details></article>`;
+}
+
+function renderToolBody(
   activityId: string,
   tool: ToolState,
   localFileUrl?: (filePath: string) => string | undefined,
@@ -389,12 +727,8 @@ function renderToolActivity(
   const labels = previewLabels(language);
   const command = tool.command ? (displayToolCommand(tool.command) || tool.command.trim()) : undefined;
   const repl = isReplTool(tool);
-  const displayCommand = repl
-    ? formatReplCommand(command ?? "")
-    : command
-      ? formatToolCommand(command)
-      : undefined;
-  const title = displayCommand ? summarizeToolCommand(displayCommand) : toolTitle(tool, command, repl, language);
+  const displayCommand = repl ? formatReplCommand(command ?? "") : command ? formatToolCommand(command) : undefined;
+  const status = `<span class="tool-state ${tool.status}">${escapeHtml(toolStatusLabel(tool.status, language))}</span>`;
   const output = fullToolOutputs?.[tool.id] ?? tool.output;
   const error = fullToolErrors?.[tool.id] ?? tool.error;
   const sameError = Boolean(output && error && normalizeOutput(output) === normalizeOutput(error));
@@ -413,21 +747,13 @@ function renderToolActivity(
       ? `<ul class="files" aria-label="${escapeAttribute(labels.files)}">${tool.files.map((file) => renderFileEntry(file, localFileUrl, projectCwd)).join("")}</ul>`
       : "",
   ].filter(Boolean).join("");
-  const titleMarkup = displayCommand
-    ? `<code class="tool-command-title">${escapeHtml(title)}</code>`
-    : `<span class="tool-title">${escapeHtml(title)}</span>`;
-  const timing = renderToolTiming(tool, "header");
-  const statusLabel = toolStatusLabel(tool.status, language);
-  const icon = `<span class="tool-status-icon" role="img" aria-label="${escapeAttribute(statusLabel)}" title="${escapeAttribute(statusLabel)}">${toolStatusIcon(tool.status)}</span>`;
-  const status = `<span class="tool-state ${tool.status}">${escapeHtml(statusLabel)}</span>`;
-  const header = `<summary class="tool-header">${icon}<span class="tool-summary-content">${titleMarkup}</span><span class="tool-meta">${timing}</span></summary>`;
   const startedAt = tool.startedAt === undefined ? undefined : new Date(tool.startedAt);
   const startTime = startedAt
     ? `<time datetime="${startedAt.toISOString()}" title="${escapeAttribute(labels.startingTime)}">${new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(startedAt)}</time>`
     : `<span title="${escapeAttribute(labels.startingTime)}">${escapeHtml(labels.unknown)}</span>`;
   const characterCount = (displayOutput?.length ?? 0) + (displayError?.length ?? 0);
   const footer = `<div class="tool-footer">${status}${startTime}${renderToolTiming(tool, "footer")}<span>${formatNumber(characterCount)} ${escapeHtml(labels.characters)}</span></div>`;
-  return `<article class="activity tool"><details class="tool-step" data-tool-status="${tool.status}" data-activity-id="${escapeAttribute(activityId)}">${header}<div class="tool-body"><div class="tool-content" data-scroll-id="${escapeAttribute(`${activityId}:content`)}" tabindex="0">${detailParts || `<div class="muted">${escapeHtml(labels.noToolDetails)}</div>`}</div>${footer}</div></details></article>`;
+  return `<div class="tool-body"><div class="tool-content" data-scroll-id="${escapeAttribute(`${activityId}:content`)}" tabindex="0">${detailParts || `<div class="muted">${escapeHtml(labels.noToolDetails)}</div>`}</div>${footer}</div>`;
 }
 
 function toolTitle(tool: ToolState, command?: string, repl = false, language: TurnPreviewLanguage = "zh"): string {
@@ -599,10 +925,67 @@ function renderFileSummary(
   state: TurnViewState,
   language: TurnPreviewLanguage,
   localFileUrl?: (filePath: string) => string | undefined,
+  deferDetails = false,
 ): string {
   const labels = previewLabels(language);
-  const files = state.fileSummary.map((file) => renderFileEntry(file, localFileUrl, state.projectCwd)).join("");
-  return `<details class="files-summary" data-activity-id="turn:files-summary"><summary><h2>${escapeHtml(labels.fileChanges)} <span>${state.fileSummary.length}</span></h2></summary><ul class="files">${files}</ul></details>`;
+  const body = deferDetails ? lazyDetailBody() : renderFileSummaryBody(state, localFileUrl);
+  const lazy = deferDetails ? lazyDetailAttributes("files", fileSummaryRevision(state)) : "";
+  return `<details class="files-summary" data-activity-id="turn:files-summary"${lazy}><summary><h2>${escapeHtml(labels.fileChanges)} <span>${state.fileSummary.length}</span></h2></summary>${body}</details>`;
+}
+
+function renderFileSummaryBody(state: TurnViewState, localFileUrl?: (filePath: string) => string | undefined): string {
+  return `<ul class="files">${state.fileSummary.map((file) => renderFileEntry(file, localFileUrl, state.projectCwd)).join("")}</ul>`;
+}
+
+function lazyDetailAttributes(key: string, revision: string): string {
+  return ` data-detail-key="${escapeAttribute(key)}" data-detail-revision="${revision}"`;
+}
+
+function lazyDetailBody(): string {
+  return '<div data-detail-body><div class="detail-message" data-detail-message role="status"></div><div data-detail-content></div></div>';
+}
+
+function toolDetailRevision(tool: ToolState, outputs?: Record<string, string>, errors?: Record<string, string>, cwd?: string): string {
+  return createHash("sha256").update(JSON.stringify([tool, outputs?.[tool.id], errors?.[tool.id], cwd])).digest("hex").slice(0, 24);
+}
+
+function fileSummaryRevision(state: TurnViewState): string {
+  return createHash("sha256").update(JSON.stringify([state.fileSummary, state.projectCwd])).digest("hex").slice(0, 24);
+}
+
+export interface TurnPreviewDetail {
+  key: string;
+  revision: string;
+  content: string;
+}
+
+export function renderTurnPreviewDetail(
+  state: TurnViewState,
+  key: string,
+  localFileUrl?: (filePath: string) => string | undefined,
+  language: TurnPreviewLanguage = "zh",
+): TurnPreviewDetail | undefined {
+  const resolveFileUrl = localFileUrl ? (filePath: string): string | undefined => {
+    if (path.isAbsolute(filePath) || path.win32.isAbsolute(filePath)) return localFileUrl(filePath);
+    if (!state.projectCwd || !path.isAbsolute(state.projectCwd)) return undefined;
+    return localFileUrl(path.resolve(state.projectCwd, filePath));
+  } : undefined;
+  if (key === "files" && state.fileSummary.length > 0) {
+    return { key, revision: fileSummaryRevision(state), content: renderFileSummaryBody(state, resolveFileUrl) };
+  }
+  if (key.startsWith("reasoning:")) {
+    const item = turnReasoningItems(state).find((item) => `reasoning:${item.itemId}` === key);
+    if (!item || ![...item.summary, ...item.content].some((text) => text?.trim())) return undefined;
+    return { key, revision: reasoningRevision(item, state.projectCwd),
+      content: renderReasoningBody(item, state.projectCwd, localFileUrl, language) };
+  }
+  const activity = state.activities?.find((item) => item.kind === "tool" && `tool:${item.id}` === key);
+  if (activity?.kind !== "tool") return undefined;
+  return {
+    key,
+    revision: toolDetailRevision(activity.tool, state.fullToolOutputs, state.fullToolErrors, state.projectCwd),
+    content: renderToolBody(activity.id, activity.tool, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd),
+  };
 }
 
 function renderFileEntry(file: FileSummary, localFileUrl?: (filePath: string) => string | undefined, projectCwd?: string): string {
@@ -646,8 +1029,8 @@ function previewTitle(state: TurnViewState): string {
   return value.length > 80 ? `${value.slice(0, 79)}…` : value;
 }
 
-function renderMarkdown(value: string, projectCwd?: string, localFileUrl?: (filePath: string) => string | undefined): string {
-  const environment = {};
+function renderMarkdown(value: string, projectCwd?: string, localFileUrl?: (filePath: string) => string | undefined, language: TurnPreviewLanguage = "zh"): string {
+  const environment = { language };
   const tokens = MARKDOWN.parse(value, environment);
   // Only the directory is used to resolve relative links; no Markdown file is created.
   const markdownPath = projectCwd && path.isAbsolute(projectCwd) ? path.join(projectCwd, "turn.md") : undefined;
@@ -712,6 +1095,10 @@ function escapeAttribute(value: string): string {
 const TURN_PREVIEW_CSS = `
 :root { color-scheme: light dark; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; --page: #fff; --surface: #f5f6f7; --code: #fafafa; --text: #25272b; --muted: #62666d; --line: #e0e2e5; --accent: #245bc0; --success: #257449; --danger: #b52c34; --scrollbar-thumb: #d4d7dc; --scrollbar-thumb-hover: #afb4bc; }
 * { box-sizing: border-box; letter-spacing: 0; }
+html { scrollbar-gutter: stable; }
+@supports not (scrollbar-gutter: stable) {
+  html { overflow-y: scroll; }
+}
 body { margin: 0; background: var(--page); color: var(--text); font-size: 13px; line-height: 1.55; }
 .page-header { position: sticky; top: 0; z-index: 3; background: var(--page); border-bottom: 1px solid var(--line); }
 .header-inner { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 12px; max-width: 1320px; margin: auto; padding: 6px 20px; }
@@ -756,6 +1143,11 @@ main { max-width: 1320px; margin: 0 auto; padding: 0 20px 40px; }
 .message > .markdown, .result > .markdown { font-size: 14px; font-weight: 400; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
+.reasoning-step { margin:8px 0; border:1px solid var(--line); border-radius:7px; min-width:0; }
+.reasoning-header { cursor:pointer; padding:8px 10px; color:var(--muted); }
+.reasoning-title { min-width:0; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.reasoning-section { margin:0 10px 10px; max-height:30em; overflow:auto; overflow-wrap:anywhere; }
+.reasoning-part + .reasoning-part { border-top:1px solid var(--line); padding-top:8px; }
 .markdown p, .markdown ul, .markdown ol, .markdown pre, .markdown blockquote { margin: 0 0 6px; }
 .markdown ul, .markdown ol { padding-left: 1.5em; }
 .markdown h1, .markdown h2, .markdown h3 { margin: 12px 0 6px; font-size: 14px; }
@@ -830,6 +1222,9 @@ summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; 
 .additions { color: var(--success); }
 .deletions { color: var(--danger); }
 .file-delta { display: inline-flex; flex: none; gap: 6px; font: 12px "Cascadia Mono", Consolas, monospace; }
+.detail-message { padding: 8px 12px; color: var(--muted); }
+.detail-message:empty { display: none; }
+.detail-message button { margin-left: 8px; cursor: pointer; }
 .tool-image img { display: block; max-width: 100%; max-height: 720px; }
 .final-result h2 { color: var(--success); }
 @media (max-width: 700px) {

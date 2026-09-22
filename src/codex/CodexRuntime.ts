@@ -16,6 +16,7 @@ import type {
   RemoteSessionPage,
   RemoteSessionSummary,
   RemoteTurnPage,
+  RemoteTurnDetails,
   ResumeRuntimeSessionInput,
   RuntimeGoal,
   RuntimeGoalUpdate,
@@ -396,6 +397,48 @@ export class CodexRuntime implements AgentRuntime {
       turns: remoteSessionSummary({ id: remoteSessionId, turns: response.data }).completedTurns ?? [],
       nextCursor: response.nextCursor ?? undefined,
     };
+  }
+
+  async readRemoteTurn(remoteSessionId: string, turnId: string): Promise<RemoteTurnDetails> {
+    const client = await this.client();
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.readTurnPage(client, remoteSessionId, {
+        cursor, limit: 50, itemsView: "summary",
+      }, CONTROL_REQUEST_TIMEOUT_MS);
+      const index = page.data.findIndex((turn) => turn.id === turnId);
+      if (index >= 0) {
+        // Cursors are opaque; ask for the prefix to obtain the target's boundary.
+        if (index > 0) {
+          const prefix = await this.readTurnPage(client, remoteSessionId, {
+            cursor, limit: index, itemsView: "summary",
+          }, CONTROL_REQUEST_TIMEOUT_MS);
+          if (!prefix.nextCursor || prefix.data.at(-1)?.id !== page.data[index - 1]?.id) {
+            throw new Error("轮次历史发生变化，请重新打开重试。");
+          }
+          cursor = prefix.nextCursor;
+        }
+        const full = await this.readTurnPage(client, remoteSessionId, {
+          cursor, limit: 1, itemsView: "full",
+        }, CONTROL_REQUEST_TIMEOUT_MS);
+        const turn = full.data[0];
+        if (!turn || turn.id !== turnId) throw new Error("轮次历史发生变化，请重新打开重试。");
+        if (turn.itemsView === "summary" || !Array.isArray(turn.items)) {
+          throw new Error("Agent 未返回完整的轮次执行记录。");
+        }
+        if (turn.status === "inProgress") throw new Error("该历史轮次仍在执行，请稍后重试。");
+        return remoteTurnDetails(remoteSessionId, turn);
+      }
+      const nextCursor = page.nextCursor ?? undefined;
+      if (!nextCursor) break;
+      if (nextCursor === cursor || seenCursors.has(nextCursor)) {
+        throw new Error("App Server repeated a Turn history cursor.");
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+    throw new Error(`Agent 历史中未找到 Turn：${turnId}`);
   }
 
   async *readConversation(remoteSessionId: string, throughTurnId?: string): AsyncIterable<ConversationTurn> {
@@ -1211,12 +1254,19 @@ export class CodexRuntime implements AgentRuntime {
         append: false,
         severity: "warning",
       });
+    } else if (mapped.kind === "reasoning_delta") {
+      this.emit({ type: "reasoning_delta", sessionId, turnId: mapped.turnId,
+        itemId: mapped.itemId, contentIndex: mapped.contentIndex, text: mapped.text });
+    } else if (mapped.kind === "reasoning_completed") {
+      this.emit({ type: "reasoning_completed", sessionId, turnId: mapped.turnId,
+        itemId: mapped.itemId, summary: mapped.summary, content: mapped.content });
     } else if (mapped.kind === "progress") {
       this.emit({
         type: "progress",
         sessionId,
         turnId: mapped.turnId,
         activityId: mapped.activityId,
+        ...(mapped.reasoning ? { reasoning: mapped.reasoning } : {}),
         text: mapped.text,
         append: mapped.append,
       });
@@ -1626,6 +1676,8 @@ interface CodexThreadSnapshot {
 
 interface CodexTurnSnapshot {
   id: string;
+  itemsView?: "summary" | "full";
+  completedAt?: number | null;
   status: "completed" | "interrupted" | "failed" | "inProgress";
   items?: Array<{
     id?: string;
@@ -1720,6 +1772,41 @@ function fallbackProviderModel(
 
 function turnStartedAt(turn: CodexTurnSnapshot): number {
   return typeof turn.startedAt === "number" ? turn.startedAt * 1_000 : Date.now();
+}
+
+function remoteTurnDetails(remoteSessionId: string, turn: CodexTurnSnapshot): RemoteTurnDetails {
+  const items: RemoteTurnDetails["items"] = [];
+  const finalMessages = new Set(finalResponseMessages(turn));
+  for (const [index, item] of (turn.items ?? []).entries()) {
+    const id = item.id ?? `history:${index}`;
+    if (item.type === "userMessage") {
+      const content: unknown[] = item.content ?? [];
+      const text = content.flatMap((block) => isRecord(block) && block.type === "text" && typeof block.text === "string" ? [block.text] : []).join("\n");
+      const localImagePaths = content.flatMap((block) => isRecord(block) && block.type === "localImage" && typeof block.path === "string" ? [block.path] : []);
+      items.push({ kind: "message", id, role: "user", text, ...(localImagePaths.length ? { localImagePaths } : {}) });
+      continue;
+    }
+    if (item.type === "agentMessage") {
+      if (!finalMessages.has(item) && item.text) items.push({ kind: "message", id, role: "assistant", text: item.text });
+      continue;
+    }
+    const mapped = mapCodexNotification("item/completed", { threadId: remoteSessionId, turnId: turn.id, item });
+    if (mapped?.kind === "tool") items.push({ kind: "tool", tool: mapped.tool });
+    else if (mapped?.kind === "reasoning_completed") {
+      items.push({ kind: "reasoning", id: mapped.itemId, summary: mapped.summary, content: mapped.content });
+    } else if (mapped?.kind === "progress") items.push({ kind: "message", id, role: "assistant", text: mapped.text });
+    else if (mapped?.kind === "plan") items.push({ kind: "plan", steps: mapped.steps });
+  }
+  return {
+    turnId: turn.id,
+    status: turn.status === "failed" ? "failed" : turn.status === "interrupted" ? "cancelled" : "completed",
+    startedAt: typeof turn.startedAt === "number" ? turn.startedAt * 1_000 : undefined,
+    completedAt: typeof turn.completedAt === "number" ? turn.completedAt * 1_000 : undefined,
+    durationMs: turn.durationMs ?? undefined,
+    finalResponse: appendGeneratedImageMarkdown(extractFinalResponse(turn), extractGeneratedImagePaths(turn)),
+    error: formatCodexError(turn.error),
+    items,
+  };
 }
 
 function extractFinalResponse(turn: CodexTurnSnapshot): string {

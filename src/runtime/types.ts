@@ -98,7 +98,10 @@ export type AgentEvent =
       activityId?: string;
       append?: boolean;
       severity?: "warning";
+      reasoning?: { itemId: string; summaryIndex: number };
     }
+  | { type: "reasoning_delta"; sessionId: string; turnId: string; itemId: string; contentIndex: number; text: string }
+  | { type: "reasoning_completed"; sessionId: string; turnId: string; itemId: string; summary: string[]; content: string[] }
   | { type: "plan_updated"; sessionId: string; turnId: string; steps: PlanStep[] }
   | { type: "tool_started"; sessionId: string; turnId: string; tool: ToolState }
   | { type: "tool_updated"; sessionId: string; turnId: string; tool: ToolState }
@@ -133,6 +136,22 @@ export interface RemoteCompletedTurnSummary {
 export interface ConversationTurn {
   turnId: string;
   messages: Array<{ role: "user" | "assistant"; text: string }>;
+}
+
+export interface RemoteTurnDetails {
+  turnId: string;
+  status: "completed" | "cancelled" | "failed";
+  startedAt?: number;
+  completedAt?: number;
+  durationMs?: number;
+  finalResponse: string;
+  error?: string;
+  items: Array<
+    | { kind: "message"; id: string; role: "user" | "assistant"; text: string; localImagePaths?: string[] }
+    | { kind: "reasoning"; id: string; summary: string[]; content: string[] }
+    | { kind: "tool"; tool: ToolState }
+    | { kind: "plan"; steps: PlanStep[] }
+  >;
 }
 
 export interface RemoteTurnPage {
@@ -273,6 +292,7 @@ export interface AgentRuntime {
   readRemoteForkSource?(remoteSessionId: string): Promise<RemoteSessionSummary>;
   listRemoteTurnSummaries?(remoteSessionId: string, input: { cursor?: string; limit: number }): Promise<RemoteTurnPage>;
   readConversation?(remoteSessionId: string, throughTurnId?: string): AsyncIterable<ConversationTurn>;
+  readRemoteTurn?(remoteSessionId: string, turnId: string): Promise<RemoteTurnDetails>;
   inspectRemoteSessionActivity?(remoteSessionId: string): Promise<RemoteSessionActivity>;
   synchronizeSession(sessionId: string): Promise<RuntimeSession>;
   startTurn(sessionId: string, prompt: RuntimePrompt): Promise<string>;

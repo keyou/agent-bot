@@ -474,6 +474,20 @@ describe("mapCodexNotification", () => {
     }));
   });
 
+
+  test("accepts independent summary/content completion arrays and validates section indexes", () => {
+    const base = { threadId: "thr_1", turnId: "turn_1", itemId: "r1" };
+    for (const [summary, content] of [[[], ["body"]], [["summary"], []], [["a", "b"], ["x", "y"]], [[], []]]) {
+      expect(mapCodexNotification("item/completed", { ...base, item: { type: "reasoning", id: "r1", summary, content } }))
+        .toEqual({ kind: "reasoning_completed", threadId: "thr_1", turnId: "turn_1", itemId: "r1", summary, content });
+    }
+    for (const index of [-1, 0.5, 10000, NaN]) {
+      expect(mapCodexNotification("item/reasoning/textDelta", { ...base, contentIndex: index, delta: "x" })).toBeUndefined();
+      expect(mapCodexNotification("item/reasoning/summaryTextDelta", { ...base, summaryIndex: index, delta: "x" })).toBeUndefined();
+    }
+    expect(mapCodexNotification("item/completed", { ...base, item: { type: "reasoning", id: "r1", summary: [123], content: [] } })).toBeUndefined();
+  });
+
   test("maps reasoning summary deltas with a stable activity id", () => {
     expect(
       mapCodexNotification("item/reasoning/summaryTextDelta", {
@@ -488,12 +502,13 @@ describe("mapCodexNotification", () => {
       threadId: "thr_1",
       turnId: "turn_1",
       activityId: "reasoning:reason_1:2",
+      reasoning: { itemId: "reason_1", summaryIndex: 2 },
       text: "正在分析调用链",
       append: true,
     });
   });
 
-  test("does not expose raw reasoning text deltas", () => {
+  test("maps reasoning content deltas separately from card progress", () => {
     expect(
       mapCodexNotification("item/reasoning/textDelta", {
         threadId: "thr_1",
@@ -502,6 +517,6 @@ describe("mapCodexNotification", () => {
         contentIndex: 0,
         delta: "private raw reasoning",
       }),
-    ).toBeUndefined();
+    ).toEqual({ kind: "reasoning_delta", threadId: "thr_1", turnId: "turn_1", itemId: "reason_1", contentIndex: 0, text: "private raw reasoning" });
   });
 });

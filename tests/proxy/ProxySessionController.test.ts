@@ -537,6 +537,7 @@ function fixture(
     appendSteerMessage: vi.fn(async () => undefined),
     onEvent: vi.fn(async () => undefined),
     showDetails: vi.fn(async () => undefined),
+    getTurnPreviewUrl: vi.fn(() => undefined),
     showActivityPage: vi.fn(async () => undefined),
     resumeDelivery: vi.fn(async () => undefined),
     flushAll: vi.fn(async () => undefined),
@@ -1771,6 +1772,70 @@ describe("ProxySessionController", () => {
         expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe("details");
       },
     );
+
+    test.each([true, false])("hydrates imported history from its original runtime and caches it (legacy: %s)", async (legacy) => {
+      const { controller, runtime, store, presenter } = historyFixture();
+      const summary = {
+        sessionId: "details", turnId: "inherited", status: "completed", startedAt: 1,
+        assistantText: "", activities: [], plan: [], completedTools: [], failedTools: [], fileSummary: [],
+        ...(legacy ? {} : { historyDetail: "summary" }),
+      };
+      store.saveTurnSnapshot("inherited", "details", summary, "chat_id:c1");
+      store.saveTurnRuntimeOrigin("inherited", "details", "codex", "original-thread");
+      const read = runtime.readRemoteTurn = vi.fn(async () => ({ turnId: "inherited", status: "completed" as const,
+        startedAt: 10, completedAt: 20, finalResponse: "Historical answer", items: [] }));
+      const before = store.getSession("details");
+      await controller.onMessage(message("/turn inherited"));
+      expect(presenter.showDetails).toHaveBeenCalledWith("chat_id:c1", "inherited");
+      expect(store.getTurnSnapshot("inherited")).toMatchObject({ historyDetail: "full", finalResponse: "Historical answer" });
+      await controller.loadTurnDetails("inherited");
+      expect(read).toHaveBeenCalledExactlyOnceWith("original-thread", "inherited");
+      expect(store.getSession("details")).toEqual(before);
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+      expect(runtime.resumeSession).not.toHaveBeenCalled();
+      expect(runtime.forkSession).not.toHaveBeenCalled();
+    });
+
+    test("coalesces concurrent detail reads, retries failures, and never overwrites newer snapshots", async () => {
+      const { controller, runtime, store } = historyFixture();
+      const summary = { sessionId: "details", turnId: "inherited", status: "completed", startedAt: 1,
+        historyDetail: "summary", assistantText: "", activities: [], plan: [], completedTools: [], failedTools: [], fileSummary: [] };
+      store.saveTurnSnapshot("inherited", "details", summary);
+      store.saveTurnRuntimeOrigin("inherited", "details", "codex", "original-thread");
+      const details = { turnId: "inherited", status: "completed" as const, finalResponse: "Answer", items: [] };
+      let resolve!: (value: typeof details) => void;
+      const read = runtime.readRemoteTurn = vi.fn(() => new Promise<typeof details>((done) => { resolve = done; }));
+      const first = controller.loadTurnDetails("inherited");
+      const second = controller.loadTurnDetails("inherited");
+      expect(read).toHaveBeenCalledOnce();
+      resolve(details);
+      expect(await first).toEqual(await second);
+      store.saveTurnSnapshot("inherited", "details", summary);
+      read.mockRejectedValueOnce(new Error("RPC timed out"));
+      expect(await controller.loadTurnDetails("inherited")).toMatchObject({ status: "completed", historyDetailError: "RPC timed out" });
+      const retry = controller.loadTurnDetails("inherited");
+      const live = { ...summary, historyDetail: "full", status: "running", assistantText: "New live text" };
+      store.saveTurnSnapshot("inherited", "details", live);
+      resolve(details);
+      expect(await retry).toEqual(live);
+      expect(store.getTurnSnapshot("inherited")).toEqual(live);
+    });
+
+    test("clears detail errors after recovery and preserves real empty snapshots", async () => {
+      const { controller, runtime, store } = historyFixture();
+      const summary = { sessionId: "details", turnId: "inherited", status: "completed", startedAt: 1,
+        historyDetail: "summary", assistantText: "", activities: [], plan: [], completedTools: [], failedTools: [], fileSummary: [] };
+      store.saveTurnSnapshot("inherited", "details", summary);
+      expect(await controller.loadTurnDetails("inherited")).toMatchObject({ historyDetailError: expect.stringContaining("原始 Agent") });
+      store.saveTurnRuntimeOrigin("inherited", "details", "codex", "original-thread");
+      expect(await controller.loadTurnDetails("inherited")).toMatchObject({ historyDetailError: expect.stringContaining("不支持") });
+      const read = runtime.readRemoteTurn = vi.fn(async () => ({ turnId: "inherited", status: "completed" as const, finalResponse: "Recovered", items: [] }));
+      expect(await controller.loadTurnDetails("inherited")).toMatchObject({ finalResponse: "Recovered", historyDetailError: undefined });
+      const saved = { ...summary, historyDetail: undefined, fullToolOutputs: {}, toolStatuses: {} };
+      store.saveTurnSnapshot("inherited", "details", saved);
+      expect(await controller.loadTurnDetails("inherited")).toEqual(JSON.parse(JSON.stringify(saved)));
+      expect(read).toHaveBeenCalledOnce();
+    });
 
     test.each([true, false])("shows the running Turn first, with saved snapshot = %s", async (saved) => {
       const { controller, runtime, store, presenter, outbound, save } = historyFixture();
@@ -3350,7 +3415,7 @@ describe("ProxySessionController", () => {
   });
 
   test("downloads a pure image and starts Codex with a default text prompt plus localImage input", async () => {
-    const { controller, runtime, outbound } = fixture();
+    const { controller, runtime, outbound, presenter } = fixture();
     await controller.onMessage({
       messageId: "om_image_input",
       contextKey: "chat_id:c1",
@@ -3358,6 +3423,7 @@ describe("ProxySessionController", () => {
       images: [{ imageKey: "img_input" }],
     });
 
+    expect(presenter.startPendingTurn).toHaveBeenCalledWith(expect.any(String), "chat_id:c1", expect.any(String), undefined, "请查看这张图片", [path.join(process.cwd(), "img_input.png")]);
     expect(outbound.downloadImage).toHaveBeenCalledWith("om_image_input", "img_input");
     expect(runtime.startTurn).toHaveBeenCalledWith(expect.any(String), {
       text: "请查看这张图片",
@@ -3404,6 +3470,7 @@ describe("ProxySessionController", () => {
       "总结图中的内容",
       undefined,
       "总结图中的内容",
+      [path.join(process.cwd(), "img_forwarded.png")],
     );
     expect(store.getMessageReaction("om_forwarded_image")).toMatchObject({ turnId: "turn_1" });
     expect(store.getMessageReaction("om_image_instruction")).toMatchObject({ turnId: "turn_1" });
@@ -6129,6 +6196,25 @@ describe("ProxySessionController", () => {
     await vi.waitFor(() => expect(store.getSession(session.localSessionId)?.lastTurnStatus).toBe("running"));
     expect(store.getMessageReaction("m-keep running")).toMatchObject({ status: "pending", emojiType: "OnIt" });
     expect(outbound.addReaction).not.toHaveBeenCalledWith("m-keep running", "CrossMark");
+  });
+
+  test.each([false, true])("retains appended image paths for Preview after steering (reconciled: %s)", async (reconciled) => {
+    const { controller, runtime, presenter, store } = fixture();
+    await controller.onMessage(message("keep working"));
+    const sessionId = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    if (reconciled) {
+      vi.mocked(runtime.steerTurn).mockRejectedValueOnce(new Error("Stale turn"));
+      vi.mocked(runtime.synchronizeSession).mockImplementation(async () => {
+        const session = runtime.getSession(sessionId)!;
+        session.activeTurnId = "turn_reconciled";
+        return session;
+      });
+    }
+    await controller.onMessage({ messageId: "om_steer_image", contextKey: "chat_id:c1", text: "See the screenshot", images: [{ imageKey: "img_steer" }] });
+    const turnId = reconciled ? "turn_reconciled" : "turn_1";
+    const paths = [path.join(process.cwd(), "img_steer.png")];
+    expect(runtime.steerTurn).toHaveBeenLastCalledWith(sessionId, turnId, { text: "See the screenshot", localImagePaths: paths });
+    expect(presenter.appendSteerMessage).toHaveBeenCalledWith(sessionId, turnId, "See the screenshot", "om_steer_image", paths);
   });
 
   test("plain text steers an active turn, inserts it into the thinking card, and stop bypasses prompt completion", async () => {

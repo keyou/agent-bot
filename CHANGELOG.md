@@ -6,6 +6,24 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Use the leading content title as the Turn Preview reasoning header and show expanded text directly without redundant Summary/Content labels, preserving lazy loading, live updates, and existing thinking cards.
+
+- Retain both reasoning summaries and content in lazy, expandable Turn Preview panels, retain complete streamed/completed reasoning in snapshots, and leave thinking cards unchanged.
+
+- Ignore whitespace-only Commentary when pinning thinking-card messages and coalesce adjacent generated omission markers, preserving literal text, execution panels, and saved history.
+
+- Hide the Turn Preview waiting-for-progress placeholder after a response, other visible progress, or a terminal status, including answer-only Turns without timeline activities.
+
+- Reserve Turn Preview page scrollbar space to prevent horizontal layout shifts when expanding or collapsing tool details, while preserving nested and touch scrolling.
+
+- Retain image attachment paths for initial and appended user messages in Turn snapshots and show them in Preview, including steering retries and live updates.
+- Fit Turn Preview diagrams to the available width on phones, bound preview height, and retain an actual-size toggle for inspecting details without losing the selection during live updates.
+- Highlight common-language Markdown code blocks in Turn Preview with light/dark colors, bounded caching for live updates, and complete plain-text fallbacks.
+- Defer collapsed Turn Preview tool details and file summaries until expansion, reuse loaded content with revision-aware live refresh and retry, and skip SSE for finished Turns.
+
+- Render Mermaid flowcharts in Turn Preview with preview/source controls, live-update mode preservation, local bundled rendering, and safe source fallback for invalid diagrams.
+- Update Turn Preview incrementally, preserving unchanged images, expanded steps, and scroll positions while patching new activities, tool results, and metadata in place.
+
 ## [0.1.24-alpha.2] - 2026-09-20
 
 - Preserve App Server error details in live notifications, recovered Turns, and task summaries, and render runtime errors as literal text in cards and Turn Preview.

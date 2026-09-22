@@ -142,12 +142,14 @@ export class FeishuTurnPresenter {
     taskTitle?: string,
     replyTarget?: MessageReplyTarget,
     prompt?: string,
+    localImagePaths?: string[],
   ): Promise<string | undefined> {
     const existing = this.pendingEntries.get(sessionId);
     if (existing) {
       await existing.initializing;
-      if (prompt && existing.state.prompt !== prompt) {
-        existing.state = { ...existing.state, prompt };
+      const images = localImagePaths === undefined ? existing.state.promptImagePaths : [...new Set(localImagePaths)];
+      if ((prompt && existing.state.prompt !== prompt) || JSON.stringify(images) !== JSON.stringify(existing.state.promptImagePaths)) {
+        existing.state = { ...existing.state, ...(prompt ? { prompt } : {}), ...(images ? { promptImagePaths: images } : {}) };
         this.store.saveTurnSnapshot(existing.state.turnId, sessionId, existing.state, existing.contextKey);
         if (!existing.historySnapshot) existing.scheduler?.update(existing.state, "critical");
       }
@@ -165,6 +167,7 @@ export class FeishuTurnPresenter {
       prompt,
       this.sessionAgentLabels.get(sessionId),
       this.sessionModels.get(sessionId),
+      localImagePaths,
     );
     const entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
     this.entries.set(state.turnId, entry);
@@ -256,6 +259,7 @@ export class FeishuTurnPresenter {
     turnId: string,
     text: string,
     messageId?: string,
+    localImagePaths?: string[],
   ): Promise<void> {
     const activityId = `steer:${messageId ?? createId("message")}`;
     let entry = this.entries.get(turnId);
@@ -279,7 +283,7 @@ export class FeishuTurnPresenter {
             ),
             status: "running" as const,
           };
-      const state = appendSteerMessageToState(initial, activityId, text);
+      const state = appendSteerMessageToState(initial, activityId, text, localImagePaths);
       entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
       this.entries.set(turnId, entry);
       this.store.saveTurnSnapshot(turnId, sessionId, state, contextKey);
@@ -289,7 +293,7 @@ export class FeishuTurnPresenter {
     }
 
     await entry.initializing;
-    entry.state = appendSteerMessageToState(entry.state, activityId, text);
+    entry.state = appendSteerMessageToState(entry.state, activityId, text, localImagePaths);
     this.store.saveTurnSnapshot(turnId, sessionId, entry.state, entry.contextKey);
     if (!entry.historySnapshot) entry.scheduler?.update(entry.state, "critical");
   }
@@ -312,6 +316,7 @@ export class FeishuTurnPresenter {
             pending.state.prompt,
             pending.state.agentLabel,
             pending.state.model,
+            pending.state.promptImagePaths,
           ),
           event,
         );
@@ -357,6 +362,7 @@ export class FeishuTurnPresenter {
       return;
     }
 
+    if (event.type === "reasoning_delta" || event.type === "reasoning_completed") return;
     if (!entry.historySnapshot) entry.scheduler.update(entry.state, eventPriority(event));
   }
 
@@ -515,6 +521,12 @@ export class FeishuTurnPresenter {
       normalizeTurnCardMarkdown(state, this.options.localFileUrl),
       page,
     );
+  }
+
+  getTurnPreviewUrl(turnId: string): string | undefined {
+    if (turnId.startsWith("pending_") || !this.options.turnPreviewUrl) return undefined;
+    const state = this.entries.get(turnId)?.state ?? this.store.getTurnSnapshot(turnId);
+    return isTurnViewState(state) && state.turnId === turnId ? this.turnPreviewUrl(state) : undefined;
   }
 
   private turnPreviewUrl(state: TurnViewState): string | undefined {

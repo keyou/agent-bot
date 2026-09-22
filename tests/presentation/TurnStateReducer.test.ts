@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import {
   appendSteerMessage,
   createTurnViewState,
+  hydrateTurnViewState,
   reduceTurnEvent,
 } from "../../src/presentation/TurnStateReducer.js";
 import type { AgentEvent, ToolState } from "../../src/runtime/types.js";
@@ -19,6 +20,88 @@ function event(type: AgentEvent["type"], fields: Record<string, unknown>): Agent
 }
 
 describe("TurnStateReducer", () => {
+
+  test.each(["completed", "failed", "cancelled"] as const)("reconstructs %s history without inventing tool timing or truncating full output", (status) => {
+    const initial = { ...createTurnViewState("s1", "t1", 1), historyDetail: "summary" as const, historyDetailError: "old failure" };
+    const output = "full log ".repeat(2000);
+    const result = hydrateTurnViewState(initial, {
+      turnId: "t1", status, startedAt: 1000, completedAt: 4000, finalResponse: "Answer",
+      error: status === "failed" ? "Execution failed" : undefined,
+      items: [
+        { kind: "message", id: "u", role: "user", text: "Prompt", localImagePaths: ["C:/first.png"] },
+        { kind: "message", id: "c", role: "assistant", text: "Inspecting" },
+        { kind: "reasoning", id: "r", summary: ["Summary"], content: ["Body"] },
+        { kind: "tool", tool: tool("cmd", "Read", "completed", { output }) },
+        { kind: "message", id: "u2", role: "user", text: "Continue", localImagePaths: ["C:/second.png"] },
+        { kind: "plan", steps: [{ text: "Finish", status: "completed" }] },
+      ],
+    });
+    expect(result).toMatchObject({ status, startedAt: 1000, completedAt: 4000, durationMs: 3000,
+      historyDetail: "full", prompt: "Prompt", promptImagePaths: ["C:/first.png"], finalResponse: "Answer" });
+    expect(result.historyDetailError).toBeUndefined();
+    expect(result.fullToolOutputs?.cmd).toBe(output);
+    expect(result.completedTools[0]?.startedAt).toBeUndefined();
+    expect(result.completedTools[0]?.completedAt).toBeUndefined();
+    expect(result.activities).toContainEqual({ kind: "user", id: "u2", text: "Continue", localImagePaths: ["C:/second.png"] });
+    expect(result.reasoningItems?.[0]).toMatchObject({ summary: ["Summary"], content: ["Body"], afterActivityId: "commentary:c" });
+    expect(result.activities.some((item) => item.kind === "reasoning" && item.text === "Summary")).toBe(true);
+    expect(result.plan).toEqual([{ text: "Finish", status: "completed" }]);
+    expect(result.activeTool).toBeUndefined();
+    expect(initial.activities).toEqual([]);
+  });
+
+  test("does not convert imported placeholder times into historical duration", () => {
+    const summary = { ...createTurnViewState("s", "t", 123), completedAt: 123 };
+    const result = hydrateTurnViewState(summary, { turnId: "t", status: "completed", finalResponse: "", items: [] });
+    expect(result.completedAt).toBeUndefined();
+    expect(result.durationMs).toBeUndefined();
+  });
+
+  test("keeps complete reasoning data separate from card activities and replaces completed sections", () => {
+    const initial = createTurnViewState("s1", "t1", 1);
+    const base = { sessionId: "s1", turnId: "t1", itemId: "r1" };
+    let input = reduceTurnEvent(initial, { type: "reasoning_delta", ...base, contentIndex: 1, text: "Body" });
+    expect(input.activities).toEqual(initial.activities);
+    expect(input.progressText).toBe(initial.progressText);
+    input = reduceTurnEvent(input, { type: "reasoning_delta", ...base, contentIndex: 1, text: " tail" });
+    input = reduceTurnEvent(input, { type: "reasoning_delta", ...base, contentIndex: 0, text: "First" });
+    const long = "x".repeat(8000);
+    input = reduceTurnEvent(input, { type: "progress", sessionId: "s1", turnId: "t1", activityId: "reasoning:r1:0",
+      text: long, append: true, reasoning: { itemId: "r1", summaryIndex: 0 } });
+    expect(input.reasoningItems?.[0]).toMatchObject({ content: ["First", "Body tail"], summary: [long] });
+    expect(input.activities[0]).toMatchObject({ kind: "reasoning", text: "x".repeat(5999) + "…" });
+    const activities = input.activities;
+    const event = { type: "reasoning_completed" as const, ...base, summary: ["Corrected summary"], content: ["Final body".repeat(1000)] };
+    input = reduceTurnEvent(input, event);
+    expect(input.activities).toBe(activities);
+    expect(input.reasoningItems?.[0]).toMatchObject({ summary: event.summary, content: event.content, completed: true });
+    expect(reduceTurnEvent(input, event)).toEqual(input);
+    expect(reduceTurnEvent(input, { type: "reasoning_delta", ...base, contentIndex: 0, text: "late" })).toBe(input);
+    expect(JSON.parse(JSON.stringify(input)).reasoningItems).toEqual(input.reasoningItems);
+    expect(initial.reasoningItems).toBeUndefined();
+    expect(reduceTurnEvent(input, { ...event, sessionId: "other" })).toBe(input);
+  });
+
+  test("retains legacy summaries and their position when resuming with reasoning content", () => {
+    let input = createTurnViewState("s1", "t1", 1);
+    const original = [
+      { kind: "assistant" as const, id: "intro", text: "Introduction" },
+      { kind: "reasoning" as const, id: "reasoning:r1:0", text: "Saved summary" },
+      { kind: "reasoning" as const, id: "reasoning:r1:1", text: "Second summary" },
+      { kind: "assistant" as const, id: "after", text: "Next message" },
+    ];
+    input = { ...input, activities: original };
+    input = reduceTurnEvent(input, { type: "reasoning_delta", sessionId: "s1", turnId: "t1", itemId: "r1", contentIndex: 0, text: "Resumed body" });
+    expect(input.activities).toBe(original);
+    expect(input.reasoningItems).toEqual([{
+      itemId: "r1", afterActivityId: "intro", summary: ["Saved summary", "Second summary"], content: ["Resumed body"],
+    }]);
+    input = reduceTurnEvent(input, { type: "progress", sessionId: "s1", turnId: "t1", activityId: "reasoning:r1:1",
+      text: " continued", append: true, reasoning: { itemId: "r1", summaryIndex: 1 } });
+    expect(input.reasoningItems?.[0]?.summary).toEqual(["Saved summary", "Second summary continued"]);
+    expect(original[2]?.text).toBe("Second summary");
+  });
+
   test("moves repeated warnings to the latest activity without accumulating duplicates", () => {
     let state = createTurnViewState("s1", "turn_1", 1_000);
     state = reduceTurnEvent(state, event("turn_started", { startedAt: 1_000 }));
@@ -448,6 +531,24 @@ describe("TurnStateReducer", () => {
       id: "t1",
       tool: { status: "completed", output: "a.ts" },
     });
+  });
+
+  test("persists initial and appended images separately from bounded message text", () => {
+    const images = ["C:/cache/first.png", "C:/cache/first.png", "C:/cache/second.png"];
+    let state = createTurnViewState("s1", "turn_1", 1000, undefined, undefined, undefined, "Prompt", undefined, undefined, images);
+    expect(state.promptImagePaths).toEqual(["C:/cache/first.png", "C:/cache/second.png"]);
+    state = appendSteerMessage(state, "steer:image", " ", images);
+    expect(state.activities[0]).toEqual({ kind: "user", id: "steer:image", text: "", localImagePaths: state.promptImagePaths });
+    state = appendSteerMessage(state, "steer:image", "x".repeat(7000));
+    expect(state.activities).toHaveLength(1);
+    expect(state.activities[0]).toMatchObject({ localImagePaths: ["C:/cache/first.png", "C:/cache/second.png"] });
+    images.push("C:/cache/later.png");
+    expect(state.promptImagePaths).toHaveLength(2);
+    expect(state.activities[0]).toMatchObject({ localImagePaths: ["C:/cache/first.png", "C:/cache/second.png"] });
+    const saved = JSON.parse(JSON.stringify(state));
+    state = reduceTurnEvent(saved, event("turn_completed", { finalResponse: "done" }));
+    expect(state.promptImagePaths).toHaveLength(2);
+    expect(state.activities[0]).toMatchObject({ localImagePaths: state.promptImagePaths });
   });
 
   test("inserts steer messages into the activity timeline once", () => {

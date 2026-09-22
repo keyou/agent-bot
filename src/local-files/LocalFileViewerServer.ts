@@ -1,5 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import hljs from "highlight.js/lib/common";
@@ -16,10 +17,13 @@ import {
   isTurnPreviewState,
   detectTurnPreviewLanguage,
   renderTurnPreviewPage,
+  renderTurnPreviewDetail,
   renderTurnPreviewSnapshot,
   TURN_PREVIEW_CLIENT_SCRIPT,
 } from "./TurnPreviewPage.js";
 
+const require = createRequire(import.meta.url);
+let mermaidSource: string | undefined;
 const SECRET_FILE = "secret";
 const PORT_FILE = "port";
 const SHORT_TOKEN_BYTES = 12;
@@ -231,6 +235,7 @@ export interface LocalFileViewerServerOptions {
   publicBaseUrl?: string;
   stateDirectory: string;
   getTurnSnapshot?: (turnId: string) => unknown;
+  loadTurnSnapshot?: (turnId: string) => Promise<unknown>;
   turnPreviewPollIntervalMs?: number;
 }
 
@@ -376,6 +381,11 @@ export class LocalFileViewerServer {
       this.sendJavascript(response, request.method === "HEAD", TURN_PREVIEW_CLIENT_SCRIPT);
       return;
     }
+    if (route === "/assets/mermaid.js") {
+      mermaidSource ??= fs.readFileSync(require.resolve("mermaid/dist/mermaid.min.js"), "utf8");
+      this.sendJavascript(response, request.method === "HEAD", mermaidSource);
+      return;
+    }
     const turnPreviewMatch = new RegExp(`^/turn-preview/([A-Za-z0-9_-]{${SHORT_TOKEN_LENGTH}})$`, "u").exec(route);
     if (turnPreviewMatch) {
       const turnId = this.verifyTurnPreviewToken(
@@ -386,9 +396,27 @@ export class LocalFileViewerServer {
         this.sendHtml(response, 403, errorPage("Turn 链接无效", "签名校验失败，Agent Bot 已拒绝该请求。"), request.method === "HEAD");
         return;
       }
-      const snapshot = this.options.getTurnSnapshot?.(turnId);
+      let snapshot = this.options.getTurnSnapshot?.(turnId);
+      if (isTurnPreviewState(snapshot) && this.options.loadTurnSnapshot && request.method !== "HEAD"
+        && requestUrl.searchParams.get("events") !== "1" && !requestUrl.searchParams.has("detail")) {
+        const saved = snapshot;
+        try {
+          snapshot = await this.options.loadTurnSnapshot(turnId);
+        } catch (error) {
+          snapshot = { ...saved, historyDetailError: error instanceof Error ? error.message : String(error) };
+        }
+      }
       if (!isTurnPreviewState(snapshot)) {
         this.sendHtml(response, 404, errorPage("Turn 不存在", "这次执行可能尚未保存或已被清理。"), request.method === "HEAD");
+        return;
+      }
+      if (requestUrl.searchParams.has("detail")) {
+        const detail = renderTurnPreviewDetail(snapshot, requestUrl.searchParams.get("detail") ?? "", (filePath) => this.createFileUrl(filePath), detectTurnPreviewLanguage(request.headers["accept-language"]));
+        setSecurityHeaders(response);
+        response.statusCode = detail ? 200 : 404;
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.end(request.method === "HEAD" ? undefined : JSON.stringify(detail ?? { error: "Turn detail not found." }));
         return;
       }
       if (requestUrl.searchParams.get("events") === "1") {
@@ -403,6 +431,7 @@ export class LocalFileViewerServer {
         eventsUrl: eventsUrl.toString(),
         scriptPath: `${this.basePath}/assets/turn-preview.js`.replace(/\/{2,}/gu, "/"),
         localFileUrl: (filePath) => this.createFileUrl(filePath),
+        diagramScriptPath: `${this.basePath}/assets/mermaid.js`.replace(/\/{2,}/gu, "/"),
         language,
       });
       this.sendHtml(response, 200, html, request.method === "HEAD");
@@ -710,7 +739,7 @@ export class LocalFileViewerServer {
       const serialized = JSON.stringify(state);
       if (serialized === previousSnapshot) return;
       previousSnapshot = serialized;
-      const snapshot = renderTurnPreviewSnapshot(state, (filePath) => this.createFileUrl(filePath), language);
+      const snapshot = renderTurnPreviewSnapshot(state, (filePath) => this.createFileUrl(filePath), language, { deferDetails: true });
       writeServerSentEvent(response, "update", JSON.stringify(snapshot));
     };
     sendSnapshot();

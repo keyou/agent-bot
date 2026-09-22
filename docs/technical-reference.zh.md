@@ -203,6 +203,12 @@ logging:
 
 同一服务也会为思考卡片生成带签名的 Turn Preview URL。预览直接渲染 SQLite 中持久化的 `TurnViewState` 时间线，不会重新扫描 Codex rollout 文件，也不会恢复或占用 App Server thread 的 writer。页面只展示 Agent Bot 已经可见的 Prompt、计划、Commentary/思考摘要、工具命令和完整保留的结果、文件摘要、错误与最终回答。命令默认展开，输出默认折叠；输出和错误在统一换行、去掉首尾空白后相同则合并展示。Shell 包装器复用思考卡片的清理逻辑。Provider 提供 `input` 或代码字段时，REPL 参数会格式化为可读代码。工具有已记录的时间时展示开始时间与耗时，仅执行中的工具实时计时。仅当页面保持 SSE 连接时，服务才轮询对应快照；状态变化时发送完整且可重复应用的快照，保留用户展开及折叠的状态和工具代码的滚动位置，并由 `EventSource` 在网络中断或 Worker 重启后自动重连。Turn 进入终态后，页面收到最后一份快照并关闭客户端流。该 URL 是当前 Profile 独立的持有者凭证，网络可达范围与 `fileViewer.host`、`publicBaseUrl` 配置完全相同。
 
+Turn Preview 复用 highlight.js，在服务端高亮显式标注语言的 Markdown 代码块。支持常见语言集合，以及 PowerShell、Dockerfile、Windows batch 和 `zsh`、`pwsh` 别名。未标注、未知语言、解析失败或 UTF-8 源码超过 64 KiB 时回退到完整转义文本，不截断内容。32 项/1 MiB 的 LRU 缓存避免在 SSE 快照中重复高亮未变代码。配色仅作用于 Markdown 代码块并跟随系统浅色/深色偏好，Mermaid 渲染和工具日志保持不变。
+
+输入附件路径分别保存在 `TurnViewState.promptImagePaths` 和用户活动的 `localImagePaths` 可选字段中，不混入受长度限制的文字。待启动轮次转为正式轮次、追加及重试、排队启动和快照恢复都会保留路径。Preview 通过现有签名文件服务加 `raw=1` 加载图片，文件缺失则显示占位提示。新增 JSON 字段不需要数据库迁移，也不会自动回填缺少路径的历史用户活动。
+
+Turn Preview 支持在 Prompt、Commentary 和回答的 Markdown 中使用 `mermaid`、`flowchart` 代码块。浏览器按需从同源 `/assets/mermaid.js` 加载锁定版本的 Mermaid（支持 `fileViewer.publicBaseUrl` 路径前缀），不依赖 CDN。严格模式禁用 HTML 标签和交互回调；拒绝 frontmatter、配置指令和超过 50,000 字符的源码，最多 500 条边。生成的 SVG 还会移除可执行元素和外部链接，保留现有 CSP。图表块默认预览并按宽度适配，SSE 更新保留手动模式、「适应 / 原大」选择和未变化的 SVG；加载或渲染失败时显示转义后的源码。SVG 宽度不超过 viewBox 原宽度和容器宽度，保持比例且不放大小图。窄屏或触摸设备的预览高度最多为 480 px 或 55 svh（回退为 55 vh），长图纵向滚动；原大恢复 viewBox 宽度并在块内滚动，切回适应时重置块内滚动位置。CSS 自动适应横竖屏切换，无需重新渲染 Mermaid。普通代码块和工具输出保持不变。
+
 HTML 文本文件（`.html`、`.htm`，不区分大小写）支持预览与代码模式。预览 iframe 使用带 `render=html` 的签名文件 URL，按检测到的编码流式加载完整原文，并携带文件版本参数用于实时刷新。iframe 与响应 CSP 都使用 `sandbox allow-scripts`，不授予 `allow-same-origin`；直接打开渲染 URL 时，响应级沙箱仍生效。允许内联脚本、样式及 data/blob 嵌入媒体，不开放外部或本地资源加载、网络请求、表单、弹窗和顶层跳转。外层页面保持原有脚本限制，原始文件与下载响应不变。源码仍经过转义、按需高亮，限制为开头 2 MiB，并支持 `#L<n>` 行号定位。
 
 `feishu.respondToOwnerOnly` 默认为 `true`。每条消息的发送者及卡片操作人的 Open ID 都会与 `feishu.userOpenId` 比较；非拥有者输入会在持久化事件、添加 reaction、下载图片、执行命令或启动 Agent 前被忽略。设为 `false` 可允许其他用户。开启后若未配置拥有者 Open ID，所有飞书消息和卡片操作都会被忽略；需先配置 `FEISHU_USER_OPEN_ID`，或临时关闭限制后通过私聊完成补全。
@@ -294,6 +300,8 @@ Fork 从未绑定过 Agent Bot 的任务前，Agent Bot 会先读取不含 Turns
 可能等待 App Server、飞书接口、进程控制或文件传输的命令，会在第一次潜在长耗时调用前先发送一句简短提示。范围包括创建与切换任务、Fork 与建群、切换 Provider、读取任务与 Turn、状态与 Goal 操作、修改标题、归档与解散群、停止任务、关闭任务占用进程和上传文件。普通 Prompt、Shell、Reset、App Server Release 和安全重启继续使用已有进度卡或专用启动提示，不重复发送通知。
 
 接收飞书富文本时，`code_block` 节点会转换为带语言标记的 Markdown 代码块，并保留原始缩进；`md` 节点会继续保留 Markdown 格式。引用消息或合并转发中的富文本也使用相同转换。富文本图片会下载到输入图片缓存，并以 `localImage` 传给 App Server。纯图片消息使用默认 Prompt `请查看这张图片`。ACP Runtime 不支持图片输入时会明确报错。
+
+思考 Preview 接收 `item/reasoning/summaryTextDelta`、`item/reasoning/textDelta` 和 `item/completed` 中的完整 reasoning 数组。可选的 `TurnViewState.reasoningItems` 独立保存完整摘要/正文及活动位置锚点，旧版 `reasoning:*:<summaryIndex>` 活动作为摘要回退。只有摘要 delta 继续进入原有卡片进度路径，正文和完成更新仅持久化、不触发卡片刷新。Preview 将首个明确的开头 Markdown 标题或独立加粗标题移到折叠栏，展开区只移除该标题，并直接呈现全部已有摘要/正文，不添加字段标签。带链接或图片的标题保留原有正文标记，避免丢失跳转或附件；无标题原文完整保留。标题识别只解析候选首行，不渲染全文。Preview 详情使用 `reasoning:<itemId>` 键和版本校验按需加载。不迁移数据库结构，也不自动回填远端历史。
 
 ## 任务、项目与外部 App Server 工作
 

@@ -77,6 +77,7 @@ const transport = consoleOnly ? "console" : requireServerFeishuTransport(config.
 const logger = createLogger(config);
 const store = new StateStore(config.storage.sqlitePath);
 let localFileViewer: LocalFileViewerServer | undefined;
+let loadTurnDetails: ((turnId: string) => Promise<unknown>) | undefined;
 if (config.fileViewer.enabled) {
   const viewer = new LocalFileViewerServer({
     host: config.fileViewer.host,
@@ -84,6 +85,7 @@ if (config.fileViewer.enabled) {
     publicBaseUrl: config.fileViewer.publicBaseUrl,
     stateDirectory: path.join(path.dirname(config.storage.sqlitePath), "file-viewer"),
     getTurnSnapshot: (turnId) => store.getTurnSnapshot(turnId),
+    loadTurnSnapshot: (turnId) => loadTurnDetails?.(turnId) ?? Promise.resolve(store.getTurnSnapshot(turnId)),
   });
   try {
     const address = await viewer.start();
@@ -226,6 +228,7 @@ const controller = new ProxySessionController(config, store, runtimes, outbound,
     logger.info({ agentName, changed }, "Stored Agent execution defaults.");
   },
 });
+loadTurnDetails = (turnId) => controller.loadTurnDetails(turnId);
 
 if (feishuOutbound) {
   feishuConnector = new FeishuConnector(

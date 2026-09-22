@@ -4,6 +4,15 @@ import type { RuntimeSession } from "../../src/acp/AcpSessionManager.js";
 import { CardRenderer } from "../../src/feishu/CardRenderer.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 
+test("keeps historical detail loading failures separate from execution failures", () => {
+  const input = { ...state(), status: "completed" as const, historyDetail: "summary" as const, historyDetailError: "history request timed out" };
+  const card = JSON.stringify(new CardRenderer().renderTurnDetails(input));
+  expect(card).toContain("历史执行详情读取失败");
+  expect(card).toContain("history request timed out");
+  expect(card).toContain("本轮执行状态未改变");
+  expect(input.status).toBe("completed");
+});
+
 function collectObjects(value: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(value)) return value.flatMap(collectObjects);
   if (typeof value !== "object" || value === null) return [];
@@ -1225,6 +1234,122 @@ describe("CardRenderer", () => {
     expect(cutoffHistory).toContain("SEGMENT_2_RESULT_1");
     expect(cutoffHistory).not.toContain("SEGMENT_3_RESULT_1");
     expect(cutoffHistory).not.toContain("SEGMENT_4_RESULT_1");
+  });
+
+  describe("grouped omission markers", () => {
+    function inputWithCommentaries(texts: string[]): TurnViewState {
+      const input = state();
+      input.status = "completed";
+      input.plan = [];
+      input.fileSummary = [];
+      input.activities = texts.flatMap((text, index) => {
+        const position = index + 1;
+        return [
+          { kind: "assistant" as const, id: `commentary:${position}`, text },
+          ...Array.from({ length: 6 }, (_value, toolIndex) => {
+            const toolPosition = toolIndex + 1;
+            const tool = {
+              ...input.completedTools[0]!,
+              id: `gap-${position}-tool-${toolPosition}`,
+              title: `Segment ${position} tool ${toolPosition}`,
+              command: `gap-${position}-tool-${toolPosition}`,
+              output: `RESULT_${position}_${toolPosition}\n${"result-data-".repeat(140)}`,
+            };
+            return { kind: "tool" as const, id: tool.id, tool };
+          }),
+        ];
+      });
+      return input;
+    }
+
+    function topLevelMarkdown(card: Record<string, unknown>): unknown[] {
+      const body = card.body as { elements: Array<Record<string, unknown>> };
+      return body.elements.filter((item) => item.tag === "markdown").map((item) => item.content);
+    }
+
+    test.each([
+      { kind: "assistant", text: "" },
+      { kind: "assistant", text: " " },
+      { kind: "assistant", text: "\n\t\r\n" },
+      { kind: "reasoning", text: "" },
+      { kind: "reasoning", text: " " },
+      { kind: "reasoning", text: "\n\t\r\n" },
+    ] as const)("does not leave adjacent generated gaps around blank $kind commentary ($text)", ({ kind, text }) => {
+      const input = inputWithCommentaries(["Commentary 1", text, "Commentary 3", "Commentary 4"]);
+      input.activities[7] = { kind, id: "commentary:2", text };
+      const original = structuredClone(input);
+      const renderer = new CardRenderer();
+      for (const status of ["running", "completed"] as const) {
+        const card = renderer.renderTurn({ ...input, status });
+        expect(topLevelMarkdown(card).slice(0, 4)).toEqual([
+          "Commentary 1", "…", "Commentary 3", "Commentary 4",
+        ]);
+        expect(Buffer.byteLength(JSON.stringify(card), "utf8")).toBeLessThanOrEqual(30 * 1024);
+        expect(collectObjects(card).filter((item) => typeof item.tag === "string").length).toBeLessThan(200);
+      }
+      const card = renderer.renderTurn(input);
+      const historyAction = collectObjects(card).find((item) => item.action === "activity_history");
+      expect(historyAction?.page).toEqual(expect.any(String));
+      const cards = [card, ...Array.from({ length: Number(historyAction?.page) + 1 }, (_value, page) =>
+        renderer.renderActivityHistory(input, page))];
+      const serialized = JSON.stringify(cards);
+      for (const activity of input.activities) {
+        if (activity.kind === "tool") {
+          expect(serialized).toContain(activity.tool.id);
+          expect(serialized).toContain(activity.tool.output!.split("\n")[0]);
+        }
+      }
+      const executionIds = (values: unknown) => collectObjects(values)
+        .filter((item) => item.tag === "collapsible_panel" && String(item.element_id).startsWith("turn_exec_"))
+        .map((item) => item.element_id).sort();
+      const populated = structuredClone(input);
+      populated.activities[7] = { kind, id: "commentary:2", text: "Commentary 2" };
+      const populatedCards = [renderer.renderTurn(populated), ...Array.from(
+        { length: Number(historyAction?.page) + 1 }, (_value, page) => renderer.renderActivityHistory(populated, page),
+      )];
+      expect(executionIds(cards)).toEqual(executionIds(populatedCards));
+      expect(input).toEqual(original);
+    });
+
+    test("pins three visible earlier commentaries instead of spending a slot on whitespace", () => {
+      const input = inputWithCommentaries([
+        "Commentary 1", "Commentary 2", "Commentary 3", " ", "Commentary 4", "Commentary 5",
+      ]);
+      const card = new CardRenderer().renderTurn(input);
+      expect(topLevelMarkdown(card).slice(0, 6)).toEqual([
+        "Commentary 2", "…", "Commentary 3", "…", "Commentary 4", "Commentary 5",
+      ]);
+    });
+
+    test("keeps literal assistant ellipses even when they appear between generated gaps", () => {
+      const input = inputWithCommentaries(["Commentary 1", "…", "Commentary 3", "Commentary 4"]);
+      const card = new CardRenderer().renderTurn(input);
+      expect(topLevelMarkdown(card).slice(0, 6)).toEqual([
+        "Commentary 1", "…", "…", "…", "Commentary 3", "Commentary 4",
+      ]);
+    });
+
+    test.each(["assistant", "reasoning", "user"] as const)("does not merge literal %s text into the truncation marker", (kind) => {
+      const input = inputWithCommentaries([]);
+      input.activitiesTruncated = true;
+      input.activities = [
+        { kind: "assistant", id: "commentary:blank", text: " \n" },
+        { kind, id: "commentary:literal", text: "…" },
+      ];
+      const card = new CardRenderer().renderTurn(input);
+      expect(topLevelMarkdown(card).slice(0, 2)).toEqual([
+        "…", kind === "user" ? "**🙋 …**" : "…",
+      ]);
+    });
+
+    test("preserves a leading truncation marker and separate gaps across visible commentary", () => {
+      const input = inputWithCommentaries(["Commentary 1", " ", "Commentary 3", "Commentary 4"]);
+      input.activitiesTruncated = true;
+      const card = new CardRenderer().renderTurn(input);
+      expect(topLevelMarkdown(card).slice(0, 5)).toEqual([
+        "…", "Commentary 1", "…", "Commentary 3", "Commentary 4",
+      ]);
+    });
   });
 
   test("keeps a single tool before the latest commentary when the rendered card has room", () => {

@@ -1,8 +1,9 @@
-import type { AgentEvent, ToolState } from "../runtime/types.js";
+import type { AgentEvent, RemoteTurnDetails, ToolState } from "../runtime/types.js";
 import { appendGeneratedImageMarkdown } from "../utils/generatedImageMarkdown.js";
 import type { MessageReplyTarget } from "../feishu/types.js";
 import { formatStorageSize } from "../utils/formatStorageSize.js";
-import type { FileSummary, TurnActivity, TurnViewState } from "./turnViewTypes.js";
+import type { FileSummary, TurnActivity, TurnReasoningItem, TurnViewState } from "./turnViewTypes.js";
+import { turnReasoningItems } from "./turnReasoning.js";
 
 const MAX_TEXT = 6_000;
 const MAX_COMPLETED_TOOLS = 20;
@@ -19,6 +20,7 @@ export function createTurnViewState(
   prompt?: string,
   agentLabel?: string,
   model?: string,
+  promptImagePaths?: string[],
 ): TurnViewState {
   return {
     sessionId,
@@ -27,9 +29,11 @@ export function createTurnViewState(
     model,
     taskTitle,
     prompt,
+    ...(promptImagePaths?.length ? { promptImagePaths: [...new Set(promptImagePaths)] } : {}),
     projectCwd,
     replyTarget,
     status: "starting",
+    historyDetail: "full",
     startedAt,
     assistantText: "",
     plan: [],
@@ -43,6 +47,59 @@ export function createTurnViewState(
     completedTools: [],
     failedTools: [],
     fileSummary: [],
+  };
+}
+
+export function hydrateTurnViewState(summary: TurnViewState, details: RemoteTurnDetails): TurnViewState {
+  let state: TurnViewState = {
+    ...summary,
+    ...createTurnViewState(summary.sessionId, summary.turnId, details.startedAt ?? summary.startedAt,
+      summary.taskTitle, summary.replyTarget, summary.projectCwd, summary.prompt,
+      summary.agentLabel, summary.model, summary.promptImagePaths),
+    historyDetail: "full",
+    historyDetailError: undefined,
+  };
+  let hasPrompt = false;
+  const identity = { sessionId: state.sessionId, turnId: state.turnId };
+  for (const item of details.items) {
+    if (item.kind === "message") {
+      if (item.role === "user") {
+        if (!hasPrompt) {
+          state = { ...state, prompt: item.text, promptImagePaths: item.localImagePaths };
+          hasPrompt = true;
+        } else {
+          state = { ...state, activities: [...state.activities, {
+            kind: "user", id: item.id, text: item.text, localImagePaths: item.localImagePaths,
+          }] };
+        }
+      } else {
+        state = reduceTurnEvent(state, { ...identity, type: "progress", activityId: `commentary:${item.id}`, text: item.text });
+      }
+    } else if (item.kind === "tool") {
+      state = reduceToolUpdate(state, item.tool, undefined, true);
+    } else if (item.kind === "reasoning") {
+      for (const [summaryIndex, text] of item.summary.entries()) {
+        state = reduceTurnEvent(state, { ...identity, type: "progress", text,
+          activityId: `reasoning:${item.id}:${summaryIndex}`, reasoning: { itemId: item.id, summaryIndex } });
+      }
+      state = reduceTurnEvent(state, { ...identity, type: "reasoning_completed", itemId: item.id,
+        summary: item.summary, content: item.content });
+    } else {
+      state = reduceTurnEvent(state, { ...identity, type: "plan_updated", steps: item.steps });
+    }
+  }
+  const completedAt = details.completedAt ?? (details.durationMs === undefined || details.startedAt === undefined
+    ? undefined : details.startedAt + details.durationMs);
+  return {
+    ...state,
+    status: details.status,
+    completedAt,
+    durationMs: details.durationMs ?? (completedAt === undefined || details.startedAt === undefined
+      ? undefined : Math.max(0, completedAt - details.startedAt)),
+    activeTool: undefined,
+    approval: undefined,
+    finalResponse: details.finalResponse,
+    error: details.error,
   };
 }
 
@@ -173,7 +230,27 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
         activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
       };
     }
+    case "reasoning_delta":
+      return updateReasoningItem(state, event.itemId, (item) => {
+        if (item.completed) return item;
+        const content = [...item.content];
+        content[event.contentIndex] = (content[event.contentIndex] ?? "") + event.text;
+        return { ...item, content };
+      });
+    case "reasoning_completed":
+      return updateReasoningItem(state, event.itemId, (item) => ({
+        ...item, summary: [...event.summary], content: [...event.content], completed: true,
+      }));
     case "progress": {
+      const previewState = event.reasoning
+        ? updateReasoningItem(state, event.reasoning.itemId, (item) => {
+          if (item.completed) return item;
+          const summary = [...item.summary];
+          summary[event.reasoning!.summaryIndex] = event.append
+            ? (summary[event.reasoning!.summaryIndex] ?? "") + event.text : event.text;
+          return { ...item, summary };
+        })
+        : state;
       const activities = state.activities ?? [];
       const warning = event.severity === "warning";
       const activityUpdate = upsertReasoningActivity(
@@ -186,6 +263,7 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
       return {
         ...state,
         progressText: bound(event.text),
+        ...(previewState.reasoningItems ? { reasoningItems: previewState.reasoningItems } : {}),
         activities: activityUpdate.activities,
         activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
       };
@@ -258,15 +336,18 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnVi
   }
 }
 
-export function appendSteerMessage(state: TurnViewState, id: string, text: string): TurnViewState {
+export function appendSteerMessage(state: TurnViewState, id: string, text: string, localImagePaths?: string[]): TurnViewState {
   const normalized = text.trim();
-  if (!normalized) return state;
+  if (!normalized && !localImagePaths?.length) return state;
   const activities = state.activities ?? [];
   const index = activities.findIndex((activity) => activity.id === id);
+  const previous = activities[index];
+  const images = localImagePaths ?? (previous?.kind === "user" ? previous.localImagePaths : undefined);
   const activityUpdate = upsertActivity(activities, index, {
     kind: "user",
     id,
     text: bound(normalized),
+    ...(images?.length ? { localImagePaths: [...new Set(images)] } : {}),
   });
   return {
     ...state,
@@ -312,8 +393,8 @@ function appendBoundedOutput(previous: string | undefined, delta: string): strin
   return `…${combined.slice(-(MAX_TEXT - 1))}`;
 }
 
-function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: string): TurnViewState {
-  tool = withToolTiming(state, tool);
+function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: string, historical = false): TurnViewState {
+  if (!historical) tool = withToolTiming(state, tool);
   const nextFullOutput = fullOutput ?? tool.output;
   const fullToolOutputs = nextFullOutput === undefined
     ? state.fullToolOutputs
@@ -409,6 +490,23 @@ function legacyToolStatuses(state: TurnViewState): Record<string, ToolState["sta
   }
   if (state.activeTool) statuses[state.activeTool.id] = state.activeTool.status;
   return statuses;
+}
+
+function updateReasoningItem(
+  state: TurnViewState,
+  itemId: string,
+  update: (item: TurnReasoningItem) => TurnReasoningItem,
+): TurnViewState {
+  const items = [...(state.reasoningItems ?? [])];
+  const index = items.findIndex((item) => item.itemId === itemId);
+  const item = index >= 0 ? items[index]! : turnReasoningItems(state).find((item) => item.itemId === itemId) ?? {
+    itemId, afterActivityId: state.activities.at(-1)?.id, summary: [], content: [],
+  };
+  const next = update(item);
+  if (next === item) return state;
+  if (index >= 0) items[index] = next;
+  else items.push(next);
+  return { ...state, reasoningItems: items };
 }
 
 function upsertReasoningActivity(
