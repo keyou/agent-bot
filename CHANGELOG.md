@@ -8,6 +8,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Use the leading content title as the Turn Preview reasoning header and show expanded text directly without redundant Summary/Content labels, preserving lazy loading, live updates, and existing thinking cards.
 
+- In `/mute` groups, enrich ordinary @-mention requests with bounded recent same-group/topic text and images, with per-task deduplication and explicit read-failure messages. Stop extraction and pagination at the first message already submitted to the current Agent conversation.
+
 - Add SwitchGroup to each sessions-card task to create a group bound to the same task, retaining history/settings and source bindings without forking or interrupting active work.
 
 - Add Turns to each sessions-card task, with task-scoped history pagination and read-only browsing of non-current or unbound external tasks without switching or resuming them.

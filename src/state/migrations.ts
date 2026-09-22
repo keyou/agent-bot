@@ -207,4 +207,14 @@ export const migrations = [
   );
   CREATE INDEX IF NOT EXISTS idx_update_notices_status ON update_notices(status);
   `,
+  `
+  CREATE TABLE IF NOT EXISTS recent_context_receipts (
+    prompt_message_id TEXT NOT NULL,
+    local_session_id TEXT NOT NULL,
+    remote_session_id TEXT NOT NULL,
+    context_key TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    PRIMARY KEY (local_session_id, remote_session_id, context_key, message_id)
+  );
+  `,
 ] as const;

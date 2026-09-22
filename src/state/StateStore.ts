@@ -1880,6 +1880,37 @@ export class StateStore {
       .run(contextKey, eventType, JSON.stringify(payload), new Date().toISOString());
   }
 
+  recentSubmittedMessageIds(localSessionId: string, remoteSessionId: string, contextKey: string): Set<string> {
+    const rows = this.db.prepare(`SELECT b.message_id
+      FROM (SELECT turn_id FROM turn_runtime_origins
+        WHERE local_session_id = ? AND remote_session_id = ? ORDER BY created_at DESC LIMIT 200) o
+      JOIN message_turn_bindings b ON b.turn_id = o.turn_id
+      JOIN turn_snapshots t ON t.turn_id = o.turn_id
+      WHERE b.local_session_id = ? AND t.context_key = ?
+      ORDER BY b.created_at DESC LIMIT 200`)
+      .all(localSessionId, remoteSessionId, localSessionId, contextKey) as Array<{ message_id: string }>;
+    return new Set(rows.map((row) => row.message_id));
+  }
+
+  recentContextMessageIds(localSessionId: string, remoteSessionId: string, contextKey: string, includeQueued = true): Set<string> {
+    const rows = this.db.prepare(`SELECT message_id FROM recent_context_receipts r
+      WHERE local_session_id = ? AND remote_session_id = ? AND context_key = ?
+        AND (EXISTS (SELECT 1 FROM message_turn_bindings b WHERE b.message_id = r.prompt_message_id AND b.local_session_id = r.local_session_id)
+          OR (? AND EXISTS (SELECT 1 FROM queued_prompts q WHERE q.message_id = r.prompt_message_id AND q.local_session_id = r.local_session_id)))`)
+      .all(localSessionId, remoteSessionId, contextKey, includeQueued ? 1 : 0) as Array<{ message_id: string }>;
+    return new Set(rows.map((row) => row.message_id));
+  }
+
+  rememberRecentContextMessages(localSessionId: string, remoteSessionId: string, contextKey: string, promptMessageId: string, messageIds: string[]): void {
+    const insert = this.db.prepare("INSERT INTO recent_context_receipts (local_session_id, remote_session_id, context_key, prompt_message_id, message_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(local_session_id, remote_session_id, context_key, message_id) DO UPDATE SET prompt_message_id = excluded.prompt_message_id");
+    this.db.transaction(() => {
+      for (const id of new Set(messageIds)) insert.run(localSessionId, remoteSessionId, contextKey, promptMessageId, id);
+      this.db.prepare(`DELETE FROM recent_context_receipts WHERE local_session_id = ? AND remote_session_id = ? AND context_key = ? AND rowid NOT IN (
+        SELECT rowid FROM recent_context_receipts WHERE local_session_id = ? AND remote_session_id = ? AND context_key = ? ORDER BY rowid DESC LIMIT 200
+      )`).run(localSessionId, remoteSessionId, contextKey, localSessionId, remoteSessionId, contextKey);
+    })();
+  }
+
   hasInjectedTopicRoot(localSessionId: string, rootMessageId: string): boolean {
     return Boolean(this.db.prepare(`
       SELECT 1

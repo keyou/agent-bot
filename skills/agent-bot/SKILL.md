@@ -161,7 +161,7 @@ agentbot task shell "<command>"
 
 Paths are resolved from the selected task's working directory; `~` means the operating-system user's home directory. `file` sends the file to the task's Feishu conversation. `shell` runs in the task directory.
 
-For group mention-only mode:
+For group mention-only mode (ordinary @ Prompts also receive bounded recent text/images from the current group or topic; scan newest to oldest and stop at the first message already submitted to the current task/branch, without reading older pages; requires Feishu history/group-message access; `/mute off` disables enrichment):
 
 ```powershell
 agentbot task mute on|off

@@ -510,6 +510,7 @@ function fixture(
       images: [],
       files: [],
     })),
+    readRecentMessages: vi.fn(async () => []),
     readReferencedMessage: vi.fn(async () => ({
       text: "[消息类型：文本]\nquoted message",
       messageType: "text",
@@ -3348,6 +3349,167 @@ describe("ProxySessionController", () => {
       "chat_id:private",
       "chat_id:slash",
     ]));
+  });
+
+  describe("muted mention context", () => {
+    const recent = (messageId: string, images: string[] = [], text = messageId) => ({
+      messageId, createdAt: 1_000, senderId: "another-member", messageType: images.length ? "image" : "text", text,
+      images: images.map((imageKey) => ({ messageId, imageKey })), files: [],
+    });
+    const mention = (id = "mention", text = "排查上面的问题") => ({
+      messageId: id, contextKey: "chat_id:muted", chatType: "group" as const, chatId: "muted", mentionedBot: true as const, createdAt: 5_000, text,
+    });
+
+    test("stops at the newest previously submitted context and does not download older images", async () => {
+      const { controller, runtime, outbound, store } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValueOnce([recent("known", ["known-image"])]);
+      await controller.onMessage(mention());
+      vi.mocked(outbound.downloadImage!).mockClear();
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValueOnce([
+        recent("older", ["older-image"]), recent("known", ["known-image"]), recent("fresh", ["fresh-image"]),
+      ]);
+      await controller.onMessage(mention("next"));
+      expect(outbound.readRecentMessages).toHaveBeenLastCalledWith(expect.objectContaining({
+        beforeMessageId: "next", stopBeforeMessageIds: expect.arrayContaining(["known", "mention"]),
+      }));
+      expect(outbound.downloadImage).toHaveBeenCalledExactlyOnceWith("fresh", "fresh-image");
+      const sent = vi.mocked(runtime.steerTurn).mock.calls.at(-1)?.[2];
+      expect(sent).toEqual(expect.objectContaining({ localImagePaths: [path.join(process.cwd(), "fresh-image.png")] }));
+      if (typeof sent !== "object") throw new Error("expected multimodal prompt");
+      expect(sent.text).toContain("消息 fresh");
+      expect(sent.text).not.toContain("消息 older");
+      expect(sent.text).not.toContain("消息 known");
+    });
+
+    test("uses a directly submitted message from before mute was enabled as the stop boundary", async () => {
+      const { controller, runtime, outbound, store } = fixture();
+      await controller.onMessage(mention("prior-prompt", "先前请求"));
+      const session = store.getUserContext("chat_id:muted")!.currentSessionId!;
+      store.saveTurnSnapshot("turn_1", session, { status: "running" }, "chat_id:muted");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValueOnce([
+        recent("older", ["older-image"]), recent("prior-prompt"), recent("fresh"),
+      ]);
+      await controller.onMessage(mention("next"));
+      expect(outbound.readRecentMessages).toHaveBeenLastCalledWith(expect.objectContaining({ stopBeforeMessageIds: ["prior-prompt"] }));
+      expect(outbound.downloadImage).not.toHaveBeenCalled();
+      const sent = vi.mocked(runtime.steerTurn).mock.calls.at(-1)?.[2];
+      expect(sent).toContain("消息 fresh");
+      expect(sent).not.toContain("消息 older");
+    });
+
+    test("pending queued context is deduplicated but is not yet a conversation stop boundary", async () => {
+      const { controller, runtime, outbound, store } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValueOnce([recent("known")]);
+      await controller.onMessage(mention());
+      const session = store.getUserContext("chat_id:muted")!.currentSessionId!;
+      const remote = store.getSession(session)!.remoteSessionId!;
+      store.enqueuePrompt({ promptId: "queued", localSessionId: session, contextKey: "chat_id:muted", text: "queued", messageId: "queued-prompt" });
+      store.rememberRecentContextMessages(session, remote, "chat_id:muted", "queued-prompt", ["queued-image"]);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValueOnce([
+        recent("older", ["older-image"]), recent("known"), recent("gap"), recent("queued-image", ["queued-img"]), recent("fresh"),
+      ]);
+      await controller.onMessage(mention("next"));
+      const request = vi.mocked(outbound.readRecentMessages!).mock.calls.at(-1)?.[0];
+      expect(request?.stopBeforeMessageIds).toContain("known");
+      expect(request?.stopBeforeMessageIds).not.toContain("queued-image");
+      const sent = vi.mocked(runtime.steerTurn).mock.calls.at(-1)?.[2];
+      expect(sent).toContain("消息 gap");
+      expect(sent).toContain("消息 fresh");
+      expect(sent).not.toContain("消息 older");
+      expect(outbound.downloadImage).not.toHaveBeenCalled();
+    });
+
+    test("passes recent messages and actual images from other members only when muted and mentioned", async () => {
+      const { controller, runtime, outbound, store, presenter } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValue([recent("picture", ["img_recent"], "数据库卡住")]);
+      await controller.onMessage(mention());
+      expect(outbound.readRecentMessages).toHaveBeenCalledWith({ chatId: "muted", beforeMessageId: "mention", beforeTimestamp: 5_000 });
+      expect(runtime.startTurn).toHaveBeenCalledWith(expect.any(String), {
+        text: expect.stringContaining("数据库卡住"), localImagePaths: [path.join(process.cwd(), "img_recent.png")],
+      });
+      expect(runtime.startTurn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ text: expect.stringContaining("不代表当前用户授权") }));
+      expect(outbound.addReaction).toHaveBeenCalledBefore(vi.mocked(outbound.readRecentMessages!));
+      expect(presenter.startPendingTurn).toHaveBeenCalledWith(expect.any(String), "chat_id:muted", expect.anything(), undefined, "排查上面的问题", [path.join(process.cwd(), "img_recent.png")]);
+      await controller.onMessage(mention("second", "继续排查"));
+      expect(outbound.downloadImage).toHaveBeenCalledTimes(1);
+      expect(runtime.steerTurn).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), "继续排查");
+    });
+
+    test("keeps mute-off, unmentioned, private-chat and slash-command behavior unchanged", async () => {
+      const { controller, outbound, store } = fixture();
+      await controller.onMessage(mention());
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      await controller.onMessage({ ...mention("unmentioned"), mentionedBot: undefined });
+      await controller.onMessage({ ...mention("private"), chatType: "p2p" });
+      await controller.onMessage(mention("command", "/help"));
+      expect(outbound.readRecentMessages).not.toHaveBeenCalled();
+    });
+
+    test("reads only the topic, keeps root injection once and skips explicitly quoted images", async () => {
+      const { controller, runtime, outbound, store } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValue([recent("root"), recent("quoted", ["quoted"]), recent("reply", ["reply-image"])]);
+      const input = { ...mention(), contextKey: "chat_id:muted:thread_id:topic", threadContext: true as const, threadId: "topic", rootMessageId: "root", parentMessageId: "quoted" };
+      await controller.onMessage(input);
+      expect(outbound.readRecentMessages).toHaveBeenCalledWith(expect.objectContaining({ chatId: "muted", threadId: "topic" }));
+      expect(outbound.readReferencedMessage).toHaveBeenCalledTimes(2);
+      expect(outbound.downloadImage).toHaveBeenCalledTimes(1);
+      expect(outbound.downloadImage).toHaveBeenCalledWith("reply", "reply-image");
+      expect(runtime.startTurn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ text: expect.stringContaining("话题根消息") }));
+      await controller.onMessage({ ...input, messageId: "next", parentMessageId: undefined });
+      expect(outbound.readReferencedMessage).toHaveBeenCalledTimes(2);
+      expect(outbound.downloadImage).toHaveBeenCalledTimes(1);
+    });
+
+    test("caps additional images at six and message text at a bounded size", async () => {
+      const { controller, runtime, outbound, store } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValue(Array.from({ length: 20 }, (_, i) => recent(`m${i}`, [`img${i}`], "x".repeat(3_000))));
+      await controller.onMessage(mention());
+      expect(outbound.downloadImage).toHaveBeenCalledTimes(6);
+      const sent = vi.mocked(runtime.startTurn).mock.calls.at(-1)?.[1];
+      expect(typeof sent).toBe("object");
+      if (typeof sent !== "object") throw new Error("expected multimodal prompt");
+      expect(sent.localImagePaths).toHaveLength(6);
+      expect(sent.text.length).toBeLessThan(20_000);
+      expect(sent.text).toContain("未附带");
+      expect(outbound.downloadImage).toHaveBeenCalledWith("m19", "img19");
+    });
+
+    test.each(["list", "image"])("reports %s failure without submitting or deduplicating the missing context", async (failure) => {
+      const { controller, runtime, outbound, store } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValue([recent("picture", ["img_recent"])]);
+      if (failure === "list") vi.mocked(outbound.readRecentMessages!).mockRejectedValueOnce(new Error("permission denied"));
+      else vi.mocked(outbound.downloadImage!).mockRejectedValueOnce(new Error("image denied"));
+      await controller.onMessage(mention());
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+      expect(outbound.sendText).toHaveBeenCalledWith("chat_id:muted", expect.stringContaining("无法补充近期群聊上下文"));
+      await controller.onMessage(mention("retry"));
+      expect(runtime.startTurn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ localImagePaths: [path.join(process.cwd(), "img_recent.png")] }));
+    });
+
+    test("deduplicates concurrent mentions after successful submission", async () => {
+      const { controller, runtime, outbound, store } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.readRecentMessages!).mockResolvedValue([recent("picture", ["img_recent"])]);
+      await Promise.all([controller.onMessage(mention()), controller.onMessage(mention("second", "第二个问题"))]);
+      expect(outbound.downloadImage).toHaveBeenCalledTimes(1);
+      expect(runtime.startTurn).toHaveBeenCalledTimes(1);
+      expect(runtime.steerTurn).toHaveBeenCalledTimes(1);
+    });
   });
 
   test("mutes a whole group until the bot is mentioned and supports /mute off", async () => {

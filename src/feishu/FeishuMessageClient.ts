@@ -15,7 +15,10 @@ import {
   type MergedForwardMessageItem,
   type ReferencedMessageContent,
 } from "./MergedForwardMessage.js";
+import { RECENT_CONTEXT_LIMIT, RECENT_CONTEXT_MAX_PAGES, RECENT_CONTEXT_PAGE_SIZE, recentMessagePageSchema, scanRecentContextMessages, selectRecentContextMessages } from "./RecentMessageContext.js";
 import type {
+  RecentMessageRequest,
+  RecentContextMessage,
   CreatedGroup,
   CreateGroupInput,
   FeishuOutbound,
@@ -249,6 +252,47 @@ export class FeishuMessageClient implements FeishuOutbound {
   async readMergedForward(messageId: string): Promise<MergedForwardContent> {
     const items = await this.readMessageItems(messageId, "read merged forward");
     return renderMergedForwardPrompt(messageId, items);
+  }
+
+  async readRecentMessages(request: RecentMessageRequest): Promise<RecentContextMessage[]> {
+    const operation = "read recent group context";
+    try {
+      const token = await this.getTenantAccessToken();
+      const items: NonNullable<NonNullable<ReturnType<typeof recentMessagePageSchema.parse>["data"]>["items"]> = [];
+      let pageToken: string | undefined;
+      let selected: RecentContextMessage[] = [];
+      let reachedKnownMessage = false;
+      for (let page = 0; page < RECENT_CONTEXT_MAX_PAGES; page++) {
+        const url = new URL("https://open.feishu.cn/open-apis/im/v1/messages");
+        url.searchParams.set("container_id_type", request.threadId ? "thread" : "chat");
+        url.searchParams.set("container_id", request.threadId ?? request.chatId);
+        url.searchParams.set("sort_type", "ByCreateTimeDesc");
+        url.searchParams.set("page_size", String(RECENT_CONTEXT_PAGE_SIZE));
+        if (pageToken) url.searchParams.set("page_token", pageToken);
+        if (!request.threadId && request.beforeTimestamp) {
+          url.searchParams.set("end_time", String(Math.ceil(request.beforeTimestamp / 1000)));
+        }
+        const response = await fetch(url, {
+          headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000),
+        });
+        const payload = recentMessagePageSchema.parse(await response.json());
+        if (!response.ok || payload.code !== 0) {
+          throw new FeishuApiError(payload.msg || "无法读取近期群消息；请检查飞书历史消息及群消息读取权限。", payload.code, { code: payload.code, msg: payload.msg ?? "" }, operation, response.status);
+        }
+        items.push(...(payload.data?.items ?? []));
+        if (request.beforeTimestamp || items.some((item) => item.message_id === request.beforeMessageId)) {
+          const scanned = scanRecentContextMessages(items, request);
+          selected = scanned.messages;
+          reachedKnownMessage = scanned.reachedKnownMessage;
+        }
+        const nextToken = payload.data?.page_token;
+        if (reachedKnownMessage || selected.length >= RECENT_CONTEXT_LIMIT || !payload.data?.has_more || !nextToken || nextToken === pageToken) break;
+        pageToken = nextToken;
+      }
+      return selectRecentContextMessages(items, request);
+    } catch (error) {
+      throw normalizeTransportError(error, operation);
+    }
   }
 
   async readReferencedMessage(messageId: string): Promise<ReferencedMessageContent> {

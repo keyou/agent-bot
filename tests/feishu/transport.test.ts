@@ -205,6 +205,7 @@ test("dispatches direct Feishu SDK message events", async () => {
   await larkSdkMock.handlers["im.message.receive_v1"]({
     message: {
       message_id: "om_1",
+      create_time: "1790067600123",
       chat_id: "oc_1",
       message_type: "text",
       content: JSON.stringify({ text: "/help" }),
@@ -218,6 +219,7 @@ test("dispatches direct Feishu SDK message events", async () => {
 
   expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_1",
+    createdAt: 1790067600123,
     contextKey: "chat_id:oc_1",
     chatId: "oc_1",
     chatType: "p2p",

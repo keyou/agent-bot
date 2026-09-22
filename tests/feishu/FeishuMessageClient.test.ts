@@ -16,6 +16,76 @@ afterEach(() => {
 });
 
 describe("FeishuMessageClient", () => {
+  test.each([1, 2])("stops pagination when a known message is encountered on page %i", async (boundaryPage) => {
+    const row = (id: string, time: number, msg_type = "text") => ({
+      message_id: id, chat_id: "chat", thread_id: "topic", create_time: String(time), msg_type,
+      sender: { id: "member", sender_type: "user" }, body: { content: JSON.stringify({ text: id }) },
+    });
+    const fetchMock = vi.fn().mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }));
+    const boundary = [row("known", 2_000, "file"), row("older", 1_000)];
+    fetchMock.mockResolvedValueOnce(response({ code: 0, data: { has_more: true, page_token: "next",
+      items: [row("mention", 4_000), row("recent", 3_000), ...(boundaryPage === 1 ? boundary : [])],
+    } }));
+    if (boundaryPage === 2) fetchMock.mockResolvedValueOnce(response({ code: 0, data: { has_more: true, page_token: "older-page", items: boundary } }));
+    globalThis.fetch = fetchMock;
+    const result = await new FeishuMessageClient(config(), logger()).readRecentMessages({
+      chatId: "chat", threadId: "topic", beforeMessageId: "mention", beforeTimestamp: 4_000, stopBeforeMessageIds: ["known"],
+    });
+    expect(result.map((message) => message.messageId)).toEqual(["recent"]);
+    expect(fetchMock).toHaveBeenCalledTimes(boundaryPage + 1);
+    for (const call of fetchMock.mock.calls.slice(1)) expect(String(call[0])).not.toContain("known");
+  });
+
+
+  test("reads only bounded thread pages, filters newer replies, and preserves image references", async () => {
+    const row = (id: string, time: number, msg_type = "text") => ({
+      message_id: id, thread_id: "topic", chat_id: "chat", create_time: String(time), msg_type,
+      sender: { id: "member", sender_type: "user" }, body: { content: JSON.stringify(msg_type === "image" ? { image_key: "img" } : { text: id }) },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, data: { has_more: true, page_token: "next", items: [row("newer", 4_000), row("mention", 3_000), row("image", 2_000, "image")] } }))
+      .mockResolvedValueOnce(response({ code: 0, data: { has_more: true, page_token: "ignored", items: [row("older", 1_000)] } }));
+    globalThis.fetch = fetchMock;
+    const client = new FeishuMessageClient(config(), logger());
+    const result = await client.readRecentMessages({ chatId: "chat", threadId: "topic", beforeMessageId: "mention", beforeTimestamp: 3_000 });
+    expect(result.map((message) => message.messageId)).toEqual(["older", "image"]);
+    expect(result[1]?.images).toEqual([{ messageId: "image", imageKey: "img" }]);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    for (const call of fetchMock.mock.calls.slice(1)) {
+      const url = new URL(String(call[0]));
+      expect(url.searchParams.get("container_id_type")).toBe("thread");
+      expect(url.searchParams.get("container_id")).toBe("topic");
+      expect(url.searchParams.get("page_size")).toBe("30");
+      expect(url.searchParams.get("sort_type")).toBe("ByCreateTimeDesc");
+      expect(url.searchParams.has("end_time")).toBe(false);
+    }
+    expect(new URL(String(fetchMock.mock.calls[2]?.[0])).searchParams.get("page_token")).toBe("next");
+  });
+
+  test("bounds ordinary-group reads to the incoming message time", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, data: { items: [] } }));
+    globalThis.fetch = fetchMock;
+    const client = new FeishuMessageClient(config(), logger());
+    await expect(client.readRecentMessages({ chatId: "chat", beforeMessageId: "mention", beforeTimestamp: 12_345 })).resolves.toEqual([]);
+    const url = new URL(String(fetchMock.mock.calls[1]?.[0]));
+    expect(url.searchParams.get("container_id_type")).toBe("chat");
+    expect(url.searchParams.get("end_time")).toBe("13");
+  });
+
+  test("reports context permission errors without retrying a different conversation", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 99991672, msg: "permission denied" }));
+    globalThis.fetch = fetchMock;
+    await expect(new FeishuMessageClient(config(), logger()).readRecentMessages({ chatId: "chat", threadId: "topic", beforeMessageId: "mention", beforeTimestamp: 3_000 }))
+      .rejects.toThrow("permission denied");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+
   test("creates a private Feishu group and invites the current user", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))

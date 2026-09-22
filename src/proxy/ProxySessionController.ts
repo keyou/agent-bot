@@ -26,6 +26,7 @@ import type {
   IncomingMessage,
   MessageReplyTarget,
   ReferencedMessageContent,
+  RecentContextMessage,
 } from "../feishu/types.js";
 import {
   type AppServerReleaseCardView,
@@ -49,6 +50,7 @@ import {
   parseTaskNameFromGroupName,
 } from "../feishu/GroupNameFormatter.js";
 import { normalizeFeishuPostText } from "../feishu/InboundText.js";
+import { RECENT_CONTEXT_LIMIT, RECENT_CONTEXT_IMAGE_LIMIT, RECENT_CONTEXT_TEXT_LIMIT, recentContextPrompt } from "../feishu/RecentMessageContext.js";
 import { allowsFeishuUser } from "../feishu/ownerAccess.js";
 import { classifyFileContent } from "../local-files/LocalFileViewerServer.js";
 import { errorLogValue } from "../logging/errorLogValue.js";
@@ -920,11 +922,14 @@ export class ProxySessionController {
           let executableImagePaths = localImagePaths;
           let executableMessage = message;
           let injectedRootMessageId: string | undefined;
+          let recentContextIds: string[] = [];
           if (command.type === "prompt") {
             await this.ensureThreadFork(message);
             const prepared = await this.prepareTopicRootPrompt(message, command.text, localImagePaths);
-            executableCommand = { ...command, text: prepared.text };
-            executableImagePaths = prepared.localImagePaths;
+            const recent = await this.prepareMutedGroupContext(message, prepared.text, prepared.localImagePaths);
+            executableCommand = { ...command, text: recent.text };
+            executableImagePaths = recent.localImagePaths;
+            recentContextIds = recent.messageIds;
             executableMessage = { ...message, displayText: prepared.displayPrompt };
             injectedRootMessageId = prepared.injectedRootMessageId;
           }
@@ -937,6 +942,12 @@ export class ProxySessionController {
             message.userId,
             executableMessage,
           );
+          if (command.type === "prompt" && message.chatType === "group" && message.mentionedBot
+            && this.store.chatRequiresMention(baseChatContextKey(message.contextKey))) {
+            const current = this.currentSession(message.contextKey);
+            if (current) this.store.rememberRecentContextMessages(current.localSessionId, current.remoteSessionId ?? "", message.contextKey, message.messageId,
+              [...recentContextIds, message.messageId, ...[referencedMessageId, injectedRootMessageId].filter((id): id is string => Boolean(id))]);
+          }
           if (injectedRootMessageId) {
             const current = this.currentSession(message.contextKey);
             if (current) {
@@ -2981,6 +2992,70 @@ export class ProxySessionController {
       if (this.threadInitializations.get(message.contextKey) === initialization) {
         this.threadInitializations.delete(message.contextKey);
       }
+    }
+  }
+
+  private async prepareMutedGroupContext(
+    message: IncomingMessage,
+    text: string,
+    localImagePaths?: string[],
+  ): Promise<{ text: string; localImagePaths?: string[]; messageIds: string[] }> {
+    if (message.chatType !== "group" || !message.chatId || message.mentionedBot !== true
+      || !this.store.chatRequiresMention(baseChatContextKey(message.contextKey))) {
+      return { text, localImagePaths, messageIds: [] };
+    }
+    if (message.threadContext && !message.threadId) throw new Error("无法识别当前话题，已停止补充上下文以避免读取其他话题。");
+    try {
+      const current = this.currentSession(message.contextKey);
+      const stopIds = current ? new Set([
+        ...this.store.recentContextMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey, false),
+        ...this.store.recentSubmittedMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey),
+      ]) : new Set<string>();
+      const messages = await this.outbound.readRecentMessages(message.contextKey, {
+        chatId: message.chatId,
+        ...(message.threadId ? { threadId: message.threadId } : {}),
+        beforeMessageId: message.messageId,
+        beforeTimestamp: message.createdAt,
+        ...(stopIds.size ? { stopBeforeMessageIds: [...stopIds] } : {}),
+      });
+      const seen = current ? this.store.recentContextMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey) : new Set<string>();
+      seen.add(message.messageId);
+      if (message.parentMessageId) seen.add(message.parentMessageId);
+      if (message.threadContext && message.rootMessageId) seen.add(message.rootMessageId);
+      const selected: RecentContextMessage[] = [];
+      const imagePaths = [...(localImagePaths ?? [])];
+      const imageKeys = new Set<string>();
+      let remaining = RECENT_CONTEXT_TEXT_LIMIT;
+      let imageCount = 0;
+      for (const item of messages.slice(-RECENT_CONTEXT_LIMIT).reverse()) {
+        if (stopIds.has(item.messageId) || remaining <= 0) break;
+        if (seen.has(item.messageId)) continue;
+        seen.add(item.messageId);
+        const limit = Math.min(2_000, remaining);
+        let body = item.text.length > limit ? `${item.text.slice(0, limit)}\n[消息文本已截断]` : item.text;
+        remaining -= Math.min(item.text.length, limit);
+        for (const [index, image] of item.images.entries()) {
+          if (imageKeys.has(image.imageKey)) continue;
+          imageKeys.add(image.imageKey);
+          if (imageCount >= RECENT_CONTEXT_IMAGE_LIMIT) {
+            body += `\n[图片 ${index + 1} 未附带：已达到近期图片上限]`;
+            continue;
+          }
+          const imagePath = await this.outbound.downloadImage(message.contextKey, image.messageId, image.imageKey);
+          imagePaths.push(imagePath);
+          imageCount++;
+          body += `\n[图片 ${index + 1} 已附带：${imagePath}]`;
+        }
+        selected.unshift({ ...item, text: body });
+      }
+      return {
+        text: recentContextPrompt(text, selected),
+        ...(imagePaths.length ? { localImagePaths: [...new Set(imagePaths)] } : {}),
+        messageIds: selected.map((item) => item.messageId),
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`无法补充近期群聊上下文（包括图片）：${detail}。请检查飞书历史消息/群消息读取权限及机器人是否在群内，或附图重试。`);
     }
   }
 
@@ -7545,7 +7620,7 @@ export class ProxySessionController {
     await this.outbound.sendText(
       contextKey,
       enabled
-        ? "已开启当前群的静音模式。之后只有 @ 机器人的消息会被处理；发送 @机器人 /mute off 可恢复自动响应。"
+        ? "已开启当前群的静音模式。之后只有 @ 机器人的消息会被处理；普通提问会补充当前群/话题近期文字和图片（最多 20 条、6 张图片）。发送 @机器人 /mute off 可恢复自动响应并关闭自动补充。"
         : "已关闭当前群的静音模式。机器人将恢复自动响应群消息。",
     );
   }

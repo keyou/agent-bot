@@ -7,6 +7,8 @@ import type {
   MergedForwardContent,
   MessageReplyTarget,
   ReferencedMessageContent,
+  RecentContextMessage,
+  RecentMessageRequest,
 } from "../feishu/types.js";
 
 export interface TurnPresenter {
@@ -212,6 +214,12 @@ export class OutboundRouter {
     const read = outbound.readMergedForward;
     if (!read) throw new Error("当前消息通道不支持读取合并转发消息。");
     return read.call(outbound, messageId);
+  }
+
+  async readRecentMessages(contextKey: string, request: RecentMessageRequest): Promise<RecentContextMessage[]> {
+    const outbound = this.route(contextKey).outbound;
+    if (!outbound.readRecentMessages) throw new Error("当前消息通道不支持读取近期群消息。");
+    return outbound.readRecentMessages(request);
   }
 
   async readReferencedMessage(contextKey: string, messageId: string): Promise<ReferencedMessageContent> {

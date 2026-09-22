@@ -1,9 +1,13 @@
 import type { MergedForwardContent, ReferencedMessageContent } from "./MergedForwardMessage.js";
+import type { RecentContextMessage, RecentMessageRequest } from "./RecentMessageContext.js";
+
+export type { RecentContextMessage, RecentMessageRequest } from "./RecentMessageContext.js";
 
 export type { MergedForwardContent, ReferencedMessageContent } from "./MergedForwardMessage.js";
 
 export interface IncomingMessage {
   messageId: string;
+  createdAt?: number;
   contextKey: string;
   chatId?: string;
   chatType?: "p2p" | "group";
@@ -68,6 +72,7 @@ export interface FeishuOutbound {
   downloadImage?(messageId: string, imageKey: string): Promise<string>;
   downloadFile?(messageId: string, fileKey: string, fileName: string): Promise<string>;
   readMergedForward?(messageId: string): Promise<MergedForwardContent>;
+  readRecentMessages?(request: RecentMessageRequest): Promise<RecentContextMessage[]>;
   readReferencedMessage?(messageId: string): Promise<ReferencedMessageContent>;
   sendText(contextKey: string, text: string): Promise<string | undefined>;
   sendFile?(contextKey: string, filePath: string): Promise<string | undefined>;

@@ -18,6 +18,67 @@ afterEach(() => {
 });
 
 describe("StateStore runtime metadata", () => {
+  test("reads submitted message boundaries without full snapshots and isolates task, branch and topic", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-boundary-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    const seed = (message: string, turn: string, task: string, remote: string, context: string) => {
+      store.saveTurnRuntimeOrigin(turn, task, "codex", remote);
+      store.saveTurnSnapshot(turn, task, { status: "running", fullToolOutputs: { large: "x".repeat(10_000) } }, context);
+      store.bindMessageToTurn(message, task, turn);
+    };
+    seed("current", "turn-current", "task", "remote", "topic");
+    seed("old-branch", "turn-old", "task", "old-remote", "topic");
+    seed("other-topic", "turn-topic", "task", "remote", "other-topic");
+    seed("other-task", "turn-task", "other-task", "remote", "topic");
+    store.enqueuePrompt({ promptId: "queued", localSessionId: "task", contextKey: "topic", text: "waiting", messageId: "not-submitted" });
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect([...store.recentSubmittedMessageIds("task", "remote", "topic")]).toEqual(["current"]);
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
+    for (let i = 0; i < 205; i++) store.bindMessageToTurn(`bound-${i}`, "task", "turn-current");
+    expect(store.recentSubmittedMessageIds("task", "remote", "topic").size).toBe(200);
+  });
+
+
+  test("persists bounded recent-context receipts scoped to task, remote branch and conversation", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-context-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "state.sqlite");
+    const store = new StateStore(file);
+    store.bindMessageToTurn("prompt", "task", "turn");
+    store.rememberRecentContextMessages("task", "remote", "topic", "prompt", ["a", "a", "b"]);
+    expect([...store.recentContextMessageIds("task", "remote", "topic")].sort()).toEqual(["a", "b"]);
+    expect(store.recentContextMessageIds("other-task", "remote", "topic").size).toBe(0);
+    expect(store.recentContextMessageIds("task", "reset-remote", "topic").size).toBe(0);
+    expect(store.recentContextMessageIds("task", "remote", "other-topic").size).toBe(0);
+    store.enqueuePrompt({ promptId: "queued", localSessionId: "task", contextKey: "topic", text: "context", messageId: "queued-message" });
+    store.rememberRecentContextMessages("task", "remote", "topic", "queued-message", ["queued-image"]);
+    expect(store.recentContextMessageIds("task", "remote", "topic").has("queued-image")).toBe(true);
+    expect(store.recentContextMessageIds("task", "remote", "topic", false).has("queued-image")).toBe(false);
+    expect(store.recentContextMessageIds("task", "remote", "topic", false).has("a")).toBe(true);
+    store.cancelQueuedPrompt("queued", "task");
+    expect(store.recentContextMessageIds("task", "remote", "topic").has("queued-image")).toBe(false);
+    store.rememberRecentContextMessages("task", "remote", "topic", "prompt", ["queued-image"]);
+    expect(store.recentContextMessageIds("task", "remote", "topic").has("queued-image")).toBe(true);
+    store.close();
+    const reopened = new StateStore(file);
+    stores.push(reopened);
+    expect(reopened.recentContextMessageIds("task", "remote", "topic").has("a")).toBe(true);
+    reopened.rememberRecentContextMessages("task", "remote", "topic", "prompt", Array.from({ length: 220 }, (_, i) => `m${i}`));
+    const recent = reopened.recentContextMessageIds("task", "remote", "topic");
+    expect(recent.size).toBe(200);
+    expect(recent.has("m19")).toBe(false);
+    expect(recent.has("m20")).toBe(true);
+    expect(recent.has("m219")).toBe(true);
+    expect(recent.has("a")).toBe(false);
+  });
+
+
   test("exports only dialogue from the selected completed branch and inherited ancestry", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);
