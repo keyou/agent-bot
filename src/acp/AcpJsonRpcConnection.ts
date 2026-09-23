@@ -1,3 +1,4 @@
+import { ProtocolLineWarning } from "../utils/ProtocolLineWarning.js";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -26,6 +27,7 @@ export interface AcpJsonRpcConnectionEvents {
 }
 
 export class AcpJsonRpcConnection extends EventEmitter {
+  private readonly invalidLineWarning = new ProtocolLineWarning();
   private nextId = 1;
   private readonly pending = new Map<string | number, PendingRequest>();
   private readonly handlers = new Map<string, ClientMethodHandler>();
@@ -129,7 +131,7 @@ export class AcpJsonRpcConnection extends EventEmitter {
     try {
       message = JSON.parse(line) as JsonRpcMessage;
     } catch (error) {
-      this.logger.warn({ line, error }, "Ignoring non-JSON ACP stdout line.");
+      this.invalidLineWarning.warn(this.logger, line, "Ignoring non-JSON ACP stdout line.");
       return;
     }
 

@@ -1,3 +1,4 @@
+import { ProtocolLineWarning } from "../utils/ProtocolLineWarning.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 import type { Logger } from "pino";
@@ -42,6 +43,7 @@ export class AppServerRequestError extends Error {
 }
 
 export class AppServerConnection {
+  private readonly invalidLineWarning = new ProtocolLineWarning();
   private nextId = 1;
   private closed = false;
   private readonly pending = new Map<AppServerRequestId, PendingRequest>();
@@ -108,7 +110,7 @@ export class AppServerConnection {
       try {
         message = JSON.parse(line) as AppServerMessage;
       } catch (error) {
-        this.logger.warn({ line, error }, "Ignoring non-JSON App Server stdout line.");
+        this.invalidLineWarning.warn(this.logger, line, "Ignoring non-JSON App Server stdout line.");
         return;
       }
       this.handleMessage(message);
