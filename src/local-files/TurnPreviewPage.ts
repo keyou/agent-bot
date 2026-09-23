@@ -62,7 +62,7 @@ const PREVIEW_LABELS = {
     statuses: {
       starting: "正在启动",
       running: "正在处理",
-      tool_running: "正在执行工具",
+      tool_running: "正在处理",
       waiting_for_approval: "等待确认",
       completed: "已完成",
       cancelled: "已停止",
@@ -103,7 +103,7 @@ const PREVIEW_LABELS = {
     statuses: {
       starting: "Starting",
       running: "Processing",
-      tool_running: "Running tool",
+      tool_running: "Processing",
       waiting_for_approval: "Waiting for approval",
       completed: "Completed",
       cancelled: "Stopped",
@@ -1094,8 +1094,8 @@ function renderMetadata(state: TurnViewState, language: TurnPreviewLanguage): st
   const elapsed = `<span>${escapeHtml(labels.elapsed)}<strong${isTerminal(state.status) ? "" : ` data-live-elapsed data-started-at="${state.startedAt}"`}>${completedAt === undefined && isTerminal(state.status) ? escapeHtml(labels.unknown) : formatDuration((completedAt ?? Date.now()) - state.startedAt)}</strong></span>`;
   return [
     elapsed,
+    state.modelProvider?.trim() ? `<span title="Provider">${escapeHtml(state.modelProvider.trim())}</span>` : "",
     state.model?.trim() ? `<span title="${escapeAttribute(labels.model)}">${escapeHtml(state.model.trim())}</span>` : "",
-    state.modelProvider?.trim() ? `<span title="Provider">Provider: ${escapeHtml(state.modelProvider.trim())}</span>` : "",
     state.totalTokens === undefined ? "" : state.cachedInputTokens === undefined
       ? `<span title="${escapeAttribute(labels.turnTokens)}">${formatTokenCount(state.totalTokens)} tokens</span>`
       : `<span title="${escapeAttribute(labels.nonCachedTokens)}: ${formatNumber(state.totalTokens)} tokens">${escapeHtml(labels.nonCachedTokens)} ${formatTokenCount(state.totalTokens)} tokens</span>`,

@@ -480,6 +480,23 @@ describe("Turn Preview", () => {
     expect(renderTurnPreviewSnapshot(input).content).not.toContain('class="file-link"');
   });
 
+  test.each(["zh", "en"] as const)("uses a generic processing header while tools run in %s", (language) => {
+    const label = language === "zh" ? "正在处理" : "Processing";
+    for (const status of ["running", "tool_running"] as const) {
+      const input = { ...state({ status: "running", completedAt: undefined }), status };
+      const snapshot = renderTurnPreviewSnapshot(input, undefined, language);
+      expect(snapshot.status).toBe(status);
+      expect(snapshot.statusLabel).toBe(label);
+      expect(snapshot.terminal).toBe(false);
+      expect(snapshot.content).toContain(language === "zh" ? 'aria-label="进行中"' : 'aria-label="In progress"');
+      const { document } = parseHTML(renderTurnPreviewPage({
+        state: input, eventsUrl: "/events", scriptPath: "/client.js", language,
+      }));
+      expect(document.querySelector("#turn-status")?.textContent).toBe(label);
+      expect(document.querySelector("#turn-status")?.classList.contains(status)).toBe(true);
+    }
+  });
+
   test("localizes UI labels without changing command content", () => {
     const input = state({ output: "command output" });
     input.totalTokens = 42;
@@ -546,10 +563,22 @@ describe("Turn Preview", () => {
   test.each(["zh", "en"] as const)("renders and escapes Provider metadata only when known in %s", (language) => {
     const input = { ...state(), modelProvider: ' custom <img src=x onerror="alert(1)"> & provider ' };
     const snapshot = renderTurnPreviewSnapshot(input, undefined, language);
-    expect(snapshot.metadata).toContain('title="Provider">Provider: custom &lt;img src=x onerror=&quot;alert(1)&quot;&gt; &amp; provider</span>');
+    expect(snapshot.metadata).toContain('title="Provider">custom &lt;img src=x onerror=&quot;alert(1)&quot;&gt; &amp; provider</span>');
     expect(snapshot.metadata).not.toContain("<img");
     for (const modelProvider of [undefined, "", "   "]) {
       expect(renderTurnPreviewSnapshot({ ...input, modelProvider }, undefined, language).metadata).not.toContain("Provider");
+    }
+  });
+
+  test.each(["zh", "en"] as const)("shows the Provider before the model without a visible prefix in %s", (language) => {
+    for (const status of ["running", "completed"] as const) {
+      const input = { ...state(), status, modelProvider: " traex_bridge ", model: " gpt-6-astra " };
+      const { metadata } = renderTurnPreviewSnapshot(input, undefined, language);
+      const { document } = parseHTML("<div>" + metadata + "</div>");
+      const fields = Array.from(document.querySelectorAll("span"), (span) => span.textContent);
+      expect(fields.slice(1, 3)).toEqual(["traex_bridge", "gpt-6-astra"]);
+      expect(document.querySelector("[title=Provider]")?.textContent).toBe("traex_bridge");
+      expect(metadata).not.toContain("Provider:");
     }
   });
 

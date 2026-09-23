@@ -800,7 +800,7 @@ describe("LocalFileViewerServer", () => {
     expect(page).toContain("实时更新");
     expect(page).toContain('title="总计: 3,563 tokens"');
     expect(page).not.toContain("缓存命中");
-    expect(page).toContain('title="Provider">Provider: azure</span>');
+    expect(page).toContain('title="Provider">azure</span>');
     expect(page).not.toContain("检查 <preview> & SSE");
     expect(page).not.toContain('class="file-link"');
     const filesDetailUrl = new URL(previewUrl!);
@@ -828,7 +828,8 @@ describe("LocalFileViewerServer", () => {
       }));
       const initial = JSON.parse(await events.next("update")) as { content: string; metadata: string; terminal: boolean };
       expect(initial.metadata).not.toContain("缓存命中");
-      expect(initial.metadata).toContain("Provider: azure");
+      expect(initial.metadata).toContain('title="Provider">azure</span>');
+      expect(initial.metadata).not.toContain("Provider:");
       expect(initial.content).toContain("正在检查入口。");
       expect(initial.terminal).toBe(false);
       expect(initial.content).toContain(`src="${imageUrl!.replaceAll("&", "&amp;")}"`);
@@ -866,7 +867,8 @@ describe("LocalFileViewerServer", () => {
       const update = JSON.parse(await events.next("update")) as { content: string; metadata: string; terminal: boolean };
       expect(update.metadata).toContain('title="总计: 7,126 tokens"');
       expect(update.metadata).not.toContain("缓存命中");
-      expect(update.metadata).toContain("Provider: azure");
+      expect(update.metadata).toContain('title="Provider">azure</span>');
+      expect(update.metadata).not.toContain("Provider:");
       expect(update.content).toContain("npm test");
       expect(update.content).not.toContain("all passed");
       const toolDetailUrl = new URL(previewUrl!);

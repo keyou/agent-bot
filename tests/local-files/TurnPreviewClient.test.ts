@@ -78,6 +78,27 @@ function startClient(initial = initialState(), lazy = false) {
 }
 
 describe("Turn Preview incremental client", () => {
+  test.each(["update", "patch"] as const)("keeps a generic processing header across tool transitions via %s", (event) => {
+    const initial = initialState();
+    const client = startClient(initial);
+    const header = client.element("#turn-status");
+    expect(header.textContent).toBe("正在处理");
+    for (const status of ["tool_running", "running", "tool_running", "completed"] as const) {
+      const next = { ...initial, status };
+      if (event === "update") {
+        client.update(next);
+      } else {
+        const patch = renderTurnPreviewPatch(next, new Set(), new Set(), localFileUrl, "zh");
+        client.listeners.get("patch")!({ data: JSON.stringify(patch) });
+      }
+      client.flushFrames();
+      expect(client.element("#turn-status")).toBe(header);
+      expect(header.textContent).toBe(status === "completed" ? "已完成" : "正在处理");
+      expect(header.classList.contains(status)).toBe(true);
+    }
+    expect(client.close).toHaveBeenCalled();
+  });
+
   test("journal patches retain unchanged blocks, images and disclosures and append final sections once", async () => {
     const state = initialState();
     state.activities.unshift({ kind: "assistant", id: "commentary:old", text: "Old commentary" });
@@ -342,9 +363,12 @@ describe("Turn Preview incremental client", () => {
     expect(client.element("#turn-metadata").textContent).toContain("非缓存 3 tokens");
     expect(client.element("#turn-metadata").textContent).toContain("总计 103 tokens");
     expect(client.element("#turn-metadata").textContent).not.toContain("缓存命中");
-    client.update({ ...next, modelProvider: "azure" });
+    client.update({ ...next, modelProvider: "azure", model: "gpt-test" });
     client.flushFrames();
-    expect(client.element("#turn-metadata").textContent).toContain("Provider: azure");
+    const metadata = client.element("#turn-metadata");
+    expect(metadata.textContent).not.toContain("Provider:");
+    expect(Array.from(metadata.querySelectorAll("span"), (span) => span.textContent).slice(1, 3))
+      .toEqual(["azure", "gpt-test"]);
     expect(content.innerHTML).toBe(before);
     expect(client.element("details")).toBe(details);
     expect(details.hasAttribute("open")).toBe(true);
