@@ -42,8 +42,6 @@ const COMMAND_INITIALISMS: Partial<Record<CommandName, string>> = {
   nosteer: "ns",
 };
 
-const DISABLED_COMMAND_NAMES = new Set(["mode", "modes"]);
-
 export class CommandRouter {
   parse(text: string): Command {
     const trimmed = text.trim();
@@ -162,7 +160,6 @@ export class CommandRouter {
 function resolveCommandName(rawCommand: string): CommandName {
   const input = rawCommand.slice(1).toLowerCase();
   if (!input) throw unknownCommand(rawCommand);
-  if (DISABLED_COMMAND_NAMES.has(input)) throw unknownCommand(rawCommand);
 
   const exact = COMMAND_NAMES.find((command) => command === input);
   if (exact) return exact;

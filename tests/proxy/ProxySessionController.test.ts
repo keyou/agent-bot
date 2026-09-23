@@ -10076,11 +10076,11 @@ describe("ProxySessionController", () => {
     expect(reset).toMatchObject({ lastTurnId: "turn_old", lastTurnStatus: "completed" });
   });
 
-  test("opens the unified settings card on the Model tab", async () => {
+  test.each(["/model", "/mode", "/MODE"])("opens the unified settings card on the Model tab via %s", async (command) => {
     const { controller, runtime, outbound, store } = fixture();
     await controller.onMessage(message("/new"));
 
-    await controller.onMessage(message("/model"));
+    await controller.onMessage(message(command));
 
     expect(runtime.listModels).toHaveBeenCalled();
     expect(outbound.sendInteractiveCard).toHaveBeenCalled();

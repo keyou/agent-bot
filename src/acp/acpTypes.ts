@@ -63,7 +63,6 @@ export interface AcpInitializeResult {
 
 export interface AcpSessionNewResult {
   sessionId: string;
-  modes?: JsonValue;
   configOptions?: JsonValue;
 }
 

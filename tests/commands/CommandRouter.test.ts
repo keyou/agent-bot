@@ -306,8 +306,6 @@ describe("CommandRouter", () => {
     expect(() => router.parse("/ask explain this")).toThrow("未知命令：/ask");
     expect(() => router.parse("/detach")).toThrow("未知命令：/detach");
     expect(() => router.parse("/close")).toThrow("未知命令：/close");
-    expect(() => router.parse("/mode plan")).toThrow("未知命令：/mode");
-    expect(() => router.parse("/modes")).toThrow("未知命令：/modes");
     expect(() => router.parse("/reset")).toThrow("未知命令：/reset");
     expect(() => router.parse("/use codex D:\\dev\\project")).toThrow("未知命令：/use");
   });
@@ -317,7 +315,16 @@ describe("CommandRouter", () => {
       "未知命令：/does-not-exist。发送 /help 查看可用命令。",
     );
     expect(() => router.parse("   /UNKNOWN")).toThrow("未知命令：/UNKNOWN");
+    expect(() => router.parse("/modes")).toThrow("未知命令：/modes");
     expect(() => router.parse("/")).toThrow("未知命令：/");
+  });
+
+  test.each(["/mo", "/mod", "/mode", "/model", "/MODE", "  /MoDe  "])("resolves %s through normal model prefix matching", (input) => {
+    expect(router.parse(input)).toEqual({ type: "model" });
+  });
+
+  test.each(["/mo", "/mod", "/mode", "/model", "/MODE"])("applies model argument validation to %s", (input) => {
+    expect(() => router.parse(`${input} plan`)).toThrow("/model 不接受参数，请在设置卡片中完成选择。");
   });
 
   test("resolves unique command prefixes and preserves their arguments", () => {
@@ -356,7 +363,7 @@ describe("CommandRouter", () => {
   test("prefers exact commands and rejects ambiguous prefixes", () => {
     expect(router.parse("/new title")).toEqual({ type: "new", title: "title", cwd: undefined });
     expect(router.parse("/fork 2")).toEqual({ type: "fork", sessionId: "2" });
-    expect(router.parse("/mo")).toEqual({ type: "model" });
+    expect(() => router.parse("/m")).toThrow("命令前缀 /m 不唯一，可匹配：/model、/mute");
     expect(() => router.parse("/s")).toThrow(
       "命令前缀 /s 不唯一，可匹配：/sessions、/status、/stop、/switch",
     );

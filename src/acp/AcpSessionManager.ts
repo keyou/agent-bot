@@ -18,7 +18,6 @@ export interface RuntimeSession {
   acpSessionId: string;
   managed: ManagedAcpProcess;
   running: boolean;
-  modes?: JsonValue;
   configOptions?: JsonValue;
   availableCommands?: JsonValue;
   onUpdate: (session: RuntimeSession, update: Record<string, JsonValue>) => void;
@@ -81,7 +80,6 @@ export class AcpSessionManager {
       acpSessionId: newSessionResult.sessionId,
       managed,
       running: false,
-      modes: newSessionResult.modes,
       configOptions: newSessionResult.configOptions,
       onUpdate: input.onUpdate,
       onPermissionRequest: input.onPermissionRequest,
@@ -145,14 +143,6 @@ export class AcpSessionManager {
     this.processStart = undefined;
     this.processVersion = undefined;
     this.processManager.stopAll();
-  }
-
-  async setMode(localSessionId: string, modeId: string): Promise<void> {
-    const session = this.requireSession(localSessionId);
-    await session.managed.connection.request("session/set_mode", {
-      sessionId: session.acpSessionId,
-      modeId,
-    });
   }
 
   async setConfigOption(localSessionId: string, configId: string, value: string): Promise<JsonValue> {
@@ -240,13 +230,6 @@ export class AcpSessionManager {
     const updateType = update.sessionUpdate;
     if (updateType === "config_option_update" && "configOptions" in update) {
       session.configOptions = update.configOptions;
-    }
-
-    if (updateType === "current_mode_update" && session.modes && isObject(session.modes)) {
-      session.modes = {
-        ...session.modes,
-        currentModeId: update.modeId,
-      };
     }
 
     if (updateType === "available_commands_update" && "availableCommands" in update) {

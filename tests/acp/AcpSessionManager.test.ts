@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import type { Logger } from "pino";
 import { describe, expect, test, vi } from "vitest";
 import type { AcpProcessManager, ManagedAcpProcess } from "../../src/acp/AcpProcessManager.js";
@@ -5,6 +6,41 @@ import { AcpSessionManager } from "../../src/acp/AcpSessionManager.js";
 import type { AgentConfig } from "../../src/config/schema.js";
 
 describe("AcpSessionManager", () => {
+  test("ignores unused mode metadata while preserving config and prompt handling", async () => {
+    const connection = Object.assign(new EventEmitter(), {
+      request: vi.fn()
+        .mockResolvedValueOnce({})
+        .mockResolvedValueOnce({ sessionId: "acp_1", modes: { currentModeId: "plan" }, configOptions: [] })
+        .mockResolvedValueOnce({ stopReason: "end_turn" }),
+      registerHandler: vi.fn(),
+    });
+    const managed = { connection } as unknown as ManagedAcpProcess;
+    const processManager = { get: vi.fn(), start: vi.fn(() => managed) } as unknown as AcpProcessManager;
+    const logger = { debug: vi.fn(), info: vi.fn() } as unknown as Logger;
+    const agent = { kind: "acp", title: "Test", command: "test", args: [], env: {} } satisfies AgentConfig;
+    const manager = new AcpSessionManager("test", agent, processManager, logger);
+    const onUpdate = vi.fn();
+    const session = await manager.create({
+      localSessionId: "local_1", agentName: "test", cwd: process.cwd(), onUpdate,
+      onPermissionRequest: vi.fn(async () => ({ outcome: "cancelled" })),
+    });
+    expect(session).not.toHaveProperty("modes");
+    expect(session.configOptions).toEqual([]);
+    const modeUpdate = { sessionUpdate: "current_mode_update", modeId: "code" };
+    connection.emit("notification", "session/update", { sessionId: "acp_1", update: modeUpdate });
+    expect(session).not.toHaveProperty("modes");
+    expect(onUpdate).toHaveBeenCalledWith(session, modeUpdate);
+    const configOptions = [{ id: "test", value: "enabled" }];
+    connection.emit("notification", "session/update", {
+      sessionId: "acp_1", update: { sessionUpdate: "config_option_update", configOptions },
+    });
+    expect(session.configOptions).toEqual(configOptions);
+    await expect(manager.prompt("local_1", "hello")).resolves.toEqual({ stopReason: "end_turn" });
+    expect(connection.request).toHaveBeenLastCalledWith("session/prompt", {
+      sessionId: "acp_1", prompt: [{ type: "text", text: "hello" }],
+    });
+  });
+
   test("uses one long-lived process for all tasks belonging to the same Agent", async () => {
     let nextSession = 1;
     const request = vi.fn(async (method: string) => {
