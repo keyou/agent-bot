@@ -517,7 +517,7 @@ describe("Turn Preview", () => {
     expect(page).toContain("Live updates");
   });
 
-  test.each(["zh", "en"] as const)("renders current-turn total and cache tokens with exact values in %s", (language) => {
+  test.each(["zh", "en"] as const)("renders current-turn totals without cache-hit tokens in %s", (language) => {
     const mapped = mapCodexNotification("thread/tokenUsage/updated", {
       threadId: "thread", turnId: "turn", tokenUsage: {
         last: { inputTokens: 3_558, outputTokens: 5, totalTokens: 3_563, cachedInputTokens: 3_555 },
@@ -531,14 +531,26 @@ describe("Turn Preview", () => {
       const snapshot = renderTurnPreviewSnapshot({ ...input, status }, undefined, language);
       expect(snapshot.metadata).toContain(`title="${labels[0]}: 8 tokens">${labels[0]} 8 tokens</span>`);
       expect(snapshot.metadata).toContain(`title="${labels[1]}: 3,563 tokens">${labels[1]} 3.6K tokens</span>`);
-      expect(snapshot.metadata).toContain(`title="${labels[2]}: 3,555 tokens">${labels[2]} 3.6K tokens</span>`);
+      expect(snapshot.metadata).not.toContain(labels[2]);
+      expect(snapshot.metadata).not.toContain("3,555");
+      expect(input.cachedInputTokens).toBe(3_555);
       expect(snapshot.metadata).not.toContain("13,663");
     }
     expect(renderTurnPreviewSnapshot({ ...input, cachedInputTokens: 0 }, undefined, language).metadata)
-      .toContain(`${labels[2]} 0 tokens</span>`);
+      .not.toContain(labels[2]);
     const legacy = renderTurnPreviewSnapshot({ ...state(), totalTokens: 8 }, undefined, language).metadata;
     expect(legacy).not.toContain(labels[1]);
     expect(legacy).not.toContain(labels[2]);
+  });
+
+  test.each(["zh", "en"] as const)("renders and escapes Provider metadata only when known in %s", (language) => {
+    const input = { ...state(), modelProvider: ' custom <img src=x onerror="alert(1)"> & provider ' };
+    const snapshot = renderTurnPreviewSnapshot(input, undefined, language);
+    expect(snapshot.metadata).toContain('title="Provider">Provider: custom &lt;img src=x onerror=&quot;alert(1)&quot;&gt; &amp; provider</span>');
+    expect(snapshot.metadata).not.toContain("<img");
+    for (const modelProvider of [undefined, "", "   "]) {
+      expect(renderTurnPreviewSnapshot({ ...input, modelProvider }, undefined, language).metadata).not.toContain("Provider");
+    }
   });
 
   test("detects the preferred browser language from Accept-Language", () => {

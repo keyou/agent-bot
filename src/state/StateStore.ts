@@ -1,4 +1,7 @@
 import fs from "node:fs";
+import { TurnPreviewJournal } from "./TurnPreviewJournal.js";
+import { compactTurnView } from "../presentation/TurnStateReducer.js";
+import type { TurnViewState } from "../presentation/turnViewTypes.js";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { migrations } from "./migrations.js";
@@ -260,8 +263,10 @@ interface TurnAttemptRow {
 
 export class StateStore {
   private readonly db: Database.Database;
+  readonly previews: TurnPreviewJournal;
 
-  constructor(sqlitePath: string) {
+  constructor(sqlitePath: string, onPreviewError?: (error: unknown) => void) {
+    this.previews = new TurnPreviewJournal(path.join(path.dirname(sqlitePath), "turn-previews"), onPreviewError);
     fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
     this.db = new Database(sqlitePath);
     this.db.pragma("journal_mode = WAL");
@@ -406,6 +411,7 @@ export class StateStore {
   }
 
   close(): void {
+    this.previews.close();
     this.db.close();
   }
 
@@ -1031,6 +1037,7 @@ export class StateStore {
   }
 
   saveTurnSnapshot(turnId: string, localSessionId: string, snapshot: unknown, contextKey?: string): void {
+    if ((snapshot as TurnViewState)?.previewJournal) snapshot = compactTurnView(snapshot as TurnViewState);
     const now = new Date().toISOString();
     this.db
       .prepare(
@@ -1042,6 +1049,9 @@ export class StateStore {
           context_key = coalesce(excluded.context_key, turn_snapshots.context_key),
           snapshot_json = excluded.snapshot_json,
           updated_at = excluded.updated_at
+        WHERE turn_snapshots.snapshot_json != excluded.snapshot_json
+          OR turn_snapshots.local_session_id != excluded.local_session_id
+          OR (excluded.context_key IS NOT NULL AND turn_snapshots.context_key IS NOT excluded.context_key)
         `,
       )
       .run(turnId, localSessionId, contextKey ?? null, JSON.stringify(snapshot), now);
@@ -1108,7 +1118,9 @@ export class StateStore {
     for (const id of branch.reverse()) {
       const row = read.get(id) as { prompt: string | null; answer: string | null; followups: string };
       const messages: ConversationTurn["messages"] = [];
-      for (const text of [row.prompt, ...(JSON.parse(row.followups) as string[])]) {
+      const preview = this.previews.has(id) ? this.previews.load(id, false) : undefined;
+      const followups = preview ? preview.activities.flatMap((a) => a.kind === "user" ? [a.text] : []) : JSON.parse(row.followups) as string[];
+      for (const text of [row.prompt, ...followups]) {
         if (text?.trim()) messages.push({ role: "user", text });
       }
       if (row.answer?.trim()) messages.push({ role: "assistant", text: row.answer });

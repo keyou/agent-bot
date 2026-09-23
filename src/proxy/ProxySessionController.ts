@@ -1510,6 +1510,7 @@ export class ProxySessionController {
         scopedRecord.cwd,
         this.agentLabel(scopedRecord.agentName),
         scopedRecord.model,
+        scopedRecord.modelProvider,
       );
       const promptMessageId = await this.outbound.withReplyTarget(
         responseContextKey,
@@ -1797,7 +1798,7 @@ export class ProxySessionController {
         await loaded.runtime.setReasoningEffort(record.localSessionId, nextEffort);
       }
       this.store.updateRuntimeSession(record.localSessionId, { model: nextValue, reasoningEffort: nextEffort });
-      this.outbound.updateSessionModel(record.localSessionId, nextValue);
+      this.outbound.updateSessionModel(record.localSessionId, nextValue, loaded.session.modelProvider);
     } else if (setting === "thinking" && nextValue) {
       const models = await loaded.runtime.listModels(loaded.session.modelProvider, loaded.session.model);
       const currentModel = models.find((candidate) => candidate.id === loaded.session.model)
@@ -2235,6 +2236,7 @@ export class ProxySessionController {
         session.cwd,
         this.agentLabel(session.agentName),
         session.model,
+        session.modelProvider,
       );
       if (!session.lastTurnId) continue;
       void this.outbound.resumeDelivery(session.localSessionId, turnContextKey, session.lastTurnId).catch((error: unknown) => {
@@ -2322,6 +2324,7 @@ export class ProxySessionController {
           session.cwd,
           this.agentLabel(session.agentName),
           session.model,
+          session.modelProvider,
         );
       }
       try {
@@ -2451,6 +2454,7 @@ export class ProxySessionController {
       session.cwd,
       this.agentLabel(session.agentName),
       session.model,
+      session.modelProvider,
     );
     if (announce) {
       await this.outbound.withReplyTarget(contextKey, replyTarget, () =>
@@ -2733,6 +2737,7 @@ export class ProxySessionController {
         record.cwd,
         this.agentLabel(record.agentName),
         record.model,
+        record.modelProvider,
       );
       await this.outbound.startPendingTurn(
         record.localSessionId,
@@ -3159,6 +3164,7 @@ export class ProxySessionController {
       source.cwd,
       this.agentLabel(source.agentName),
       source.model,
+      source.modelProvider,
     );
 
     try {
@@ -3520,7 +3526,8 @@ export class ProxySessionController {
         forked.title ?? plan.forkTitle,
         plan.cwd,
         this.agentLabel(plan.agentName),
-        plan.model,
+        forked.model ?? plan.model,
+        forked.modelProvider ?? plan.modelProvider,
       );
       this.store.audit(contextKey, "session_forked", {
         sourceLocalSessionId: plan.source?.localSessionId,
@@ -3919,10 +3926,8 @@ export class ProxySessionController {
       while (true) {
         let pendingTurnId: string | undefined;
         try {
-          this.outbound.updateSessionModel(
-            loaded.record.localSessionId,
-            loaded.runtime.getSession(loaded.record.localSessionId)?.model ?? loaded.session.model,
-          );
+          const session = loaded.runtime.getSession(loaded.record.localSessionId) ?? loaded.session;
+          this.outbound.updateSessionModel(loaded.record.localSessionId, session.model, session.modelProvider);
           pendingTurnId = await this.outbound.startPendingTurn(
             loaded.record.localSessionId,
             loaded.record.contextKey,
@@ -4046,6 +4051,7 @@ export class ProxySessionController {
       sessionCwd,
       this.agentLabel(agentName),
       resolvedExecutionSettings.model,
+      resolvedExecutionSettings.modelProvider,
     );
     const runtime = this.runtimes.forAgent(agentName);
     try {
@@ -4063,7 +4069,7 @@ export class ProxySessionController {
         permissionMode: resolvedExecutionSettings.permissionMode ?? "auto",
       });
       this.persistRuntimeSession(record, session, session.activeTurnId ? "running" : "ready");
-      this.outbound.updateSessionModel(localSessionId, session.model);
+      this.outbound.updateSessionModel(localSessionId, session.model, session.modelProvider);
       const saved = this.store.getSession(localSessionId) ?? record;
       if (announce) {
         const task = initialTitle ? `${initialTitle}（${session.remoteSessionId}）` : session.remoteSessionId;
@@ -4199,7 +4205,7 @@ export class ProxySessionController {
         // A live Turn keeps its original delivery route. The new group's next Turn
         // establishes its own route through startPendingTurn.
         if (task.status !== "running" && !runtime.getSession(task.localSessionId)?.activeTurnId) {
-          this.outbound.registerSession(task.localSessionId, group.contextKey, task.title, task.cwd, this.agentLabel(agentName), task.model);
+          this.outbound.registerSession(task.localSessionId, group.contextKey, task.title, task.cwd, this.agentLabel(agentName), task.model, task.modelProvider);
         }
         this.store.audit(sourceContextKey, "session_switch_group", {
           localSessionId: task.localSessionId, remoteSessionId, groupContextKey: group.contextKey,
@@ -4535,6 +4541,7 @@ export class ProxySessionController {
       record.cwd,
       this.agentLabel(record.agentName),
       record.model,
+      record.modelProvider,
     );
     const loading = (async (): Promise<LoadedSession> => {
       if (record.lastTurnId) {
@@ -5277,7 +5284,8 @@ export class ProxySessionController {
       forked.title ?? current.title,
       current.cwd,
       this.agentLabel(current.agentName),
-      current.model,
+      forked.model ?? current.model,
+      forked.modelProvider ?? current.modelProvider,
     );
     this.store.audit(contextKey, "session_reset_to_turn", {
       localSessionId: current.localSessionId,
@@ -5565,7 +5573,7 @@ export class ProxySessionController {
       }
     };
     const session = await loaded.runtime.setExecutionSettings(loaded.record.localSessionId, settings, persist);
-    this.outbound.updateSessionModel(loaded.record.localSessionId, session.model);
+    this.outbound.updateSessionModel(loaded.record.localSessionId, session.model, session.modelProvider);
     return session;
   }
 
@@ -5636,7 +5644,7 @@ export class ProxySessionController {
       await loaded.runtime.setReasoningEffort(loaded.record.localSessionId, nextEffort);
     }
     this.store.updateRuntimeSession(loaded.record.localSessionId, { model, reasoningEffort: nextEffort });
-    this.outbound.updateSessionModel(loaded.record.localSessionId, model);
+    this.outbound.updateSessionModel(loaded.record.localSessionId, model, loaded.session.modelProvider);
     await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
     const effortMessage = nextEffort && nextEffort !== currentEffort
       ? `，思考强度已自动调整为 ${nextEffort}`
@@ -6152,6 +6160,7 @@ export class ProxySessionController {
     const existing = this.turnDetailHydrations.get(turnId);
     if (existing) return existing;
     const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(turnId));
+    if (snapshot?.previewJournal && this.store.previews.has(turnId)) return this.store.previews.load(turnId);
     if (!snapshot || !needsHistoricalDetails(snapshot)) return snapshot;
     const hydration = this.hydrateTurnDetails(snapshot);
     this.turnDetailHydrations.set(turnId, hydration);
@@ -6184,6 +6193,11 @@ export class ProxySessionController {
     }
     const latest = turnViewSnapshot(this.store.getTurnSnapshot(snapshot.turnId));
     if (!latest || !needsHistoricalDetails(latest)) return latest;
+    if (updated.historyDetail === "full") {
+      this.store.previews.seed(updated);
+      this.store.previews.flush(updated.turnId, true);
+      updated = { ...updated, previewJournal: true };
+    }
     this.store.saveTurnSnapshot(snapshot.turnId, snapshot.sessionId, updated);
     return updated;
   }
@@ -7007,6 +7021,7 @@ export class ProxySessionController {
         existing.cwd,
         this.agentLabel(existing.agentName),
         existing.model,
+        existing.modelProvider,
       );
       await this.outbound.sendText(contextKey, `已切换到任务：${existing.title ?? existing.remoteSessionId ?? taskId}`);
       return;
@@ -7041,6 +7056,7 @@ export class ProxySessionController {
       remote.cwd,
       this.agentLabel(agentName),
       remote.model,
+      remote.modelProvider,
     );
     await this.outbound.sendText(
       contextKey,

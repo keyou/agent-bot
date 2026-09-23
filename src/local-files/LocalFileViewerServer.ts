@@ -1,3 +1,4 @@
+import { TurnPreviewProjection, type TurnPreviewJournal } from "../state/TurnPreviewJournal.js";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -17,6 +18,8 @@ import {
   isTurnPreviewState,
   detectTurnPreviewLanguage,
   renderTurnPreviewPage,
+  renderTurnPreviewPatch,
+  renderToolFooter,
   renderTurnPreviewDetail,
   renderTurnPreviewSnapshot,
   TURN_PREVIEW_CLIENT_SCRIPT,
@@ -234,6 +237,7 @@ export interface LocalFileViewerServerOptions {
   port: number;
   publicBaseUrl?: string;
   stateDirectory: string;
+  previewJournal?: TurnPreviewJournal;
   getTurnSnapshot?: (turnId: string) => unknown;
   loadTurnSnapshot?: (turnId: string) => Promise<unknown>;
   turnPreviewPollIntervalMs?: number;
@@ -396,8 +400,17 @@ export class LocalFileViewerServer {
         this.sendHtml(response, 403, errorPage("Turn 链接无效", "签名校验失败，Agent Bot 已拒绝该请求。"), request.method === "HEAD");
         return;
       }
-      let snapshot = this.options.getTurnSnapshot?.(turnId);
-      if (isTurnPreviewState(snapshot) && this.options.loadTurnSnapshot && request.method !== "HEAD"
+      const journal = this.options.previewJournal;
+      const recorded = journal?.has(turnId);
+      if (recorded && requestUrl.searchParams.get("events") === "1") {
+        this.serveJournalEvents(request, response, turnId, journal!);
+        return;
+      }
+      const detailKey = requestUrl.searchParams.get("detail");
+      let snapshot = recorded
+        ? journal!.load(turnId, detailKey ?? false)
+        : this.options.getTurnSnapshot?.(turnId);
+      if (!recorded && isTurnPreviewState(snapshot) && this.options.loadTurnSnapshot && request.method !== "HEAD"
         && requestUrl.searchParams.get("events") !== "1" && !requestUrl.searchParams.has("detail")) {
         const saved = snapshot;
         try {
@@ -411,12 +424,23 @@ export class LocalFileViewerServer {
         return;
       }
       if (requestUrl.searchParams.has("detail")) {
-        const detail = renderTurnPreviewDetail(snapshot, requestUrl.searchParams.get("detail") ?? "", (filePath) => this.createFileUrl(filePath), detectTurnPreviewLanguage(request.headers["accept-language"]));
+        const language = detectTurnPreviewLanguage(request.headers["accept-language"]);
+        const key = requestUrl.searchParams.get("detail") ?? "";
+        const tool = snapshot.activities.find((a) => a.kind === "tool" && `tool:${a.id}` === key);
+        const after = requestUrl.searchParams.get("detailAfter");
+        const outputAppend = recorded && after && tool?.kind === "tool" && tool.tool.kind === "command" && !tool.tool.error
+          && !/repl/i.test(tool.tool.title) && snapshot.previewCursor !== undefined
+          ? journal!.outputAppend(turnId, tool.id, Number(after), snapshot.previewCursor) : undefined;
+        const detail = outputAppend !== undefined && tool?.kind === "tool"
+          && (snapshot.fullToolOutputs?.[tool.id]?.length ?? 0) > outputAppend.length
+          ? { key, revision: String(tool.tool.previewRevision), content: "", outputAppend,
+              footer: renderToolFooter(tool.tool, snapshot.fullToolOutputs?.[tool.id]?.length ?? 0, language) }
+          : renderTurnPreviewDetail(snapshot, key, (filePath) => this.createFileUrl(filePath), language);
         setSecurityHeaders(response);
         response.statusCode = detail ? 200 : 404;
         response.setHeader("Cache-Control", "no-store");
         response.setHeader("Content-Type", "application/json; charset=utf-8");
-        response.end(request.method === "HEAD" ? undefined : JSON.stringify(detail ?? { error: "Turn detail not found." }));
+        response.end(request.method === "HEAD" ? undefined : JSON.stringify(detail ? { ...detail, cursor: snapshot.previewCursor } : { error: "Turn detail not found." }));
         return;
       }
       if (requestUrl.searchParams.get("events") === "1") {
@@ -425,6 +449,7 @@ export class LocalFileViewerServer {
       }
       const eventsUrl = new URL(this.createTurnPreviewUrl(turnId)!);
       eventsUrl.searchParams.set("events", "1");
+      if (snapshot.previewCursor !== undefined) eventsUrl.searchParams.set("after", String(snapshot.previewCursor));
       const language = detectTurnPreviewLanguage(request.headers["accept-language"]);
       const html = renderTurnPreviewPage({
         state: snapshot,
@@ -710,6 +735,74 @@ export class LocalFileViewerServer {
     };
     request.once("aborted", cleanup);
     response.once("close", cleanup);
+  }
+
+  private serveJournalEvents(request: IncomingMessage, response: ServerResponse, turnId: string, journal: TurnPreviewJournal): void {
+    journal.flush(turnId);
+    setSecurityHeaders(response);
+    response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no" });
+    if (request.method === "HEAD") { response.end(); return; }
+    response.flushHeaders();
+    const language = detectTurnPreviewLanguage(request.headers["accept-language"]);
+    const projection = new TurnPreviewProjection(false);
+    let offset = 0;
+    let closed = false;
+    let initial = true;
+    const cursor = request.headers["last-event-id"] ?? new URL(request.url!, "http://localhost").searchParams.get("after");
+    if (typeof cursor === "string" && /^\d+$/u.test(cursor) && Number.isSafeInteger(Number(cursor)) && Number(cursor) > 0
+      && Number(cursor) <= fs.statSync(journal.file(turnId)).size) {
+      while (offset < Number(cursor)) {
+        const batch = journal.read(turnId, offset, 256 * 1024, Number(cursor));
+        for (const record of batch.records) projection.apply(record, ++projection.revision);
+        if (batch.offset === offset) break;
+        offset = batch.offset;
+      }
+      initial = offset !== Number(cursor);
+    }
+    let waitingDrain = false;
+    const poll = () => {
+      if (closed || waitingDrain) return;
+      try {
+        projection.changed.clear();
+        projection.removed.clear();
+        const batch = journal.read(turnId, offset);
+        if (!batch.records.length) {
+          const state = projection.state;
+          if (state && ["completed", "cancelled", "failed"].includes(state.status)) {
+            const update = renderTurnPreviewPatch(state, new Set(), new Set(), (file) => this.createFileUrl(file), language);
+            response.write(`id: ${offset}\nevent: patch\ndata: ${JSON.stringify(update)}\n\n`);
+            cleanup(); response.end();
+          }
+          return;
+        }
+        offset = batch.offset;
+        for (const record of batch.records) projection.apply(record, ++projection.revision);
+        const state = projection.state;
+        if (!state) return;
+        const render = initial
+          ? renderTurnPreviewSnapshot(state, (file) => this.createFileUrl(file), language, { deferDetails: true })
+          : renderTurnPreviewPatch(state, projection.changed, projection.removed, (file) => this.createFileUrl(file), language);
+        // A terminal record can share a batch with later metadata. Drain the captured prefix first.
+        render.terminal = render.terminal && batch.end;
+        waitingDrain = !response.write(`id: ${offset}\nevent: ${initial ? "update" : "patch"}\ndata: ${JSON.stringify(render)}\n\n`);
+        initial = false;
+        if (render.terminal) { cleanup(); response.end(); }
+        else if (!batch.end) setImmediate(poll);
+      } catch (error) {
+        writeServerSentEvent(response, "unavailable", JSON.stringify({ message: "Turn preview could not be read." }));
+        cleanup();
+        response.end();
+      }
+    };
+    const poller = setInterval(poll, Math.max(50, this.options.turnPreviewPollIntervalMs ?? 1_000));
+    poller.unref();
+    const keepAlive = setInterval(() => { if (!closed && !waitingDrain) response.write(": keep-alive\n\n"); }, 15_000);
+    keepAlive.unref();
+    const cleanup = () => { closed = true; clearInterval(poller); clearInterval(keepAlive); };
+    response.on("drain", () => { waitingDrain = false; poll(); });
+    response.once("close", cleanup);
+    request.once("aborted", cleanup);
+    poll();
   }
 
   private serveTurnEvents(request: IncomingMessage, response: ServerResponse, turnId: string): void {

@@ -7,6 +7,7 @@ import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import {
   renderTurnPreviewPage,
   renderTurnPreviewSnapshot,
+  renderTurnPreviewPatch,
   renderTurnPreviewDetail,
   TURN_PREVIEW_CLIENT_SCRIPT,
 } from "../../src/local-files/TurnPreviewPage.js";
@@ -77,6 +78,51 @@ function startClient(initial = initialState(), lazy = false) {
 }
 
 describe("Turn Preview incremental client", () => {
+  test("journal patches retain unchanged blocks, images and disclosures and append final sections once", async () => {
+    const state = initialState();
+    state.activities.unshift({ kind: "assistant", id: "commentary:old", text: "Old commentary" });
+    const client = startClient(state, true);
+    client.toggle(".tool-step", true);
+    await client.settle();
+    const old = client.element('[data-activity="commentary:old"]');
+    const image = client.element(".tool-image img");
+    const next = structuredClone(state);
+    next.activities.push({ kind: "assistant", id: "commentary:new", text: "New commentary" });
+    next.fileSummary = [{ path: "changed.ts" }];
+    next.finalResponse = "Final answer";
+    next.status = "completed";
+    const patch = renderTurnPreviewPatch(next, new Set(["commentary:new"]), new Set(), localFileUrl, "zh");
+    client.listeners.get("patch")!({ data: JSON.stringify(patch) });
+    expect(client.element('[data-activity="commentary:old"]')).toBe(old);
+    expect(client.element(".tool-image img")).toBe(image);
+    expect(client.element(".tool-step").hasAttribute("open")).toBe(true);
+    expect(client.element('[data-preview-key="result"]').textContent).toContain("Final answer");
+    expect(client.element(".files-summary")).toBeDefined();
+    client.listeners.get("patch")!({ data: JSON.stringify(patch) });
+    expect(client.document.querySelectorAll('[data-activity="commentary:new"]')).toHaveLength(1);
+    expect(client.document.querySelectorAll('[data-preview-key="result"]')).toHaveLength(1);
+    expect(client.close).toHaveBeenCalled();
+  });
+
+
+  test("appends streamed output without replacing the loaded command/image DOM", async () => {
+    const state = initialState();
+    state.activities = [{ kind: "tool", id: "cmd", tool: { id: "cmd", kind: "command", title: "run", command: "run", status: "running", output: "first", previewRevision: 1 } }];
+    const client = startClient(state, true);
+    client.toggle(".tool-step", true);
+    await client.settle();
+    const output = client.element(".tool-output");
+    const command = client.element(".command-block");
+    client.fetchDetail.mockResolvedValueOnce({ ok: true, status: 200,
+      json: async () => ({ key: "tool:cmd", revision: "2", content: "", outputAppend: "\nsecond", footer: "metadata" }) });
+    const next = structuredClone(state);
+    if (next.activities[0]?.kind === "tool") next.activities[0].tool.previewRevision = 2;
+    client.listeners.get("patch")!({ data: JSON.stringify(renderTurnPreviewPatch(next, new Set(["cmd"]), new Set(), localFileUrl, "zh")) });
+    await client.settle();
+    expect(client.element(".tool-output")).toBe(output);
+    expect(client.element(".command-block")).toBe(command);
+    expect(output.textContent).toBe("first\nsecond");
+  });
 
   test("lazy loads reasoning and keeps its expansion and tool images across streamed updates", async () => {
     const input = initialState();
@@ -280,17 +326,30 @@ describe("Turn Preview incremental client", () => {
     client.update(input);
     client.flushFrames();
     const content = client.element("#turn-content");
+    const details = client.element("details");
+    details.setAttribute("open", "");
     const before = content.innerHTML;
     const insert = vi.spyOn(content, "insertBefore");
     const images = client.element(".tool-image img");
     const imageAttributes = vi.spyOn(images, "setAttribute");
     client.scrollTo.mockClear();
-    client.update({ ...input, totalTokens: 3, totalTokensIncludingCache: 103, cachedInputTokens: 100 });
+    const next = { ...input, totalTokens: 3, totalTokensIncludingCache: 103, cachedInputTokens: 100 };
+    client.update(next);
     client.flushFrames();
     expect(content.innerHTML).toBe(before);
     expect(insert).not.toHaveBeenCalled();
     expect(imageAttributes).not.toHaveBeenCalled();
-    expect(client.element("#turn-metadata").textContent).toContain("缓存命中 100 tokens");
+    expect(client.element("#turn-metadata").textContent).toContain("非缓存 3 tokens");
+    expect(client.element("#turn-metadata").textContent).toContain("总计 103 tokens");
+    expect(client.element("#turn-metadata").textContent).not.toContain("缓存命中");
+    client.update({ ...next, modelProvider: "azure" });
+    client.flushFrames();
+    expect(client.element("#turn-metadata").textContent).toContain("Provider: azure");
+    expect(content.innerHTML).toBe(before);
+    expect(client.element("details")).toBe(details);
+    expect(details.hasAttribute("open")).toBe(true);
+    expect(insert).not.toHaveBeenCalled();
+    expect(imageAttributes).not.toHaveBeenCalled();
     expect(client.scrollTo).not.toHaveBeenCalled();
   });
 

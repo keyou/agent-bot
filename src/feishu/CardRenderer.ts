@@ -1684,13 +1684,13 @@ function renderTurnElements(
   const pages = activityPages(allActivities);
   const visibleActivities = pages.at(-1) ?? [];
   if (state.plan.length > 0) elements.push(planPanel(state.plan));
-  if (pages.length > 1) {
+  if (pages.length > 1 || (state.previewJournal && state.activitiesTruncated)) {
     elements.push(taskActionRow([{
-      text: `查看历史思考（共 ${pages.length} 页）`,
+      text: state.activitiesTruncated ? "查看历史思考" : `查看历史思考（共 ${pages.length} 页）`,
       value: {
         action: "activity_history",
         turnId: state.turnId,
-        page: String(pages.length - 2),
+        page: String(state.activitiesTruncated ? Number.MAX_SAFE_INTEGER : pages.length - 2),
       },
     }]));
   }
@@ -1753,13 +1753,13 @@ function renderGroupedTurnElements(
     fullActivityText: true,
   });
   if (state.plan.length > 0) elements.push(planPanel(state.plan));
-  if (historyPages.length > 0) {
+  if (historyPages.length > 0 || (state.previewJournal && state.activitiesTruncated)) {
     elements.push(taskActionRow([{
-      text: `查看历史思考（共 ${historyPages.length + 1} 页）`,
+      text: state.activitiesTruncated ? "查看历史思考" : `查看历史思考（共 ${historyPages.length + 1} 页）`,
       value: {
         action: "activity_history",
         turnId: state.turnId,
-        page: String(historyPages.length - 1),
+        page: String(state.activitiesTruncated ? Number.MAX_SAFE_INTEGER : historyPages.length - 1),
       },
     }]));
   }

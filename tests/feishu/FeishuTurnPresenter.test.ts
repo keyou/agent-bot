@@ -502,21 +502,28 @@ describe("FeishuTurnPresenter", () => {
       .toContain("正在连接 TraeX…");
   });
 
-  test("updates pending model snapshots without relabeling running or completed turns", async () => {
+  test("updates pending model and Provider snapshots without relabeling running or completed turns", async () => {
     const { outbound } = createFixture();
     const store = new MemoryStore();
     const presenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
-    presenter.registerSession("s1", "chat_id:c1", undefined, undefined, "Codex", "old-model");
+    presenter.registerSession("s1", "chat_id:c1", undefined, undefined, "Codex", "old-model", "openai");
     const pendingId = await presenter.startPendingTurn("s1", "chat_id:c1");
+    expect(store.getTurnSnapshot(pendingId!)).toMatchObject({ model: "old-model", modelProvider: "openai" });
     presenter.updateSessionModel("s1", "new-model");
-    expect(store.getTurnSnapshot(pendingId!)).toMatchObject({ model: "new-model" });
+    presenter.updateSessionModel("s1", undefined, "azure");
+    expect(store.getTurnSnapshot(pendingId!)).toMatchObject({ model: "new-model", modelProvider: "azure" });
     await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
-    presenter.updateSessionModel("s1", "next-model");
-    expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "new-model" });
+    presenter.updateSessionModel("s1", "next-model", "other");
+    expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "new-model", modelProvider: "azure" });
     await presenter.onEvent(completed());
     const nextPendingId = await presenter.startPendingTurn("s1", "chat_id:c1");
-    expect(store.getTurnSnapshot(nextPendingId!)).toMatchObject({ model: "next-model" });
-    expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "new-model", status: "completed" });
+    expect(store.getTurnSnapshot(nextPendingId!)).toMatchObject({ model: "next-model", modelProvider: "other" });
+    expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "new-model", modelProvider: "azure", status: "completed" });
+    await presenter.failPendingTurn("s1", "test cleanup");
+    presenter.unregisterSession("s1");
+    presenter.registerSession("s1", "chat_id:c1");
+    const unknownId = await presenter.startPendingTurn("s1", "chat_id:c1");
+    expect(store.getTurnSnapshot(unknownId!)).toMatchObject({ model: undefined, modelProvider: undefined });
     await presenter.failPendingTurn("s1", "test cleanup");
   });
 

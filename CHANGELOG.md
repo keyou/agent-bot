@@ -6,6 +6,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Record and display each Turn's Provider alongside its model without relabeling historical Turns; simplify Preview token metadata while retaining underlying cache accounting.
+
+- Eliminate per-event full Turn snapshot writes: append complete execution records to Profile-local hash-sharded JSONL, coalesce bounded SQLite card snapshots, and stream incremental Preview updates without truncating tool details or changing final-delivery ledgers. Bound and rate-limit invalid protocol-line diagnostics.
+
 - Use the leading content title as the Turn Preview reasoning header and show expanded text directly without redundant Summary/Content labels, preserving lazy loading, live updates, and existing thinking cards.
 
 - In `/mute` groups, enrich ordinary @-mention requests with bounded recent same-group/topic text and images, with per-task deduplication and explicit read-failure messages. Stop extraction and pagination at the first message already submitted to the current Agent conversation.

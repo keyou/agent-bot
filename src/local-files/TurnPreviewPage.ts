@@ -54,7 +54,6 @@ const PREVIEW_LABELS = {
     tools: "个工具",
     turnTokens: "本轮",
     totalTokens: "总计",
-    cachedTokens: "缓存命中",
     nonCachedTokens: "非缓存",
     compactionTokens: "压缩",
     compactionAfterTokens: "压缩后",
@@ -96,7 +95,6 @@ const PREVIEW_LABELS = {
     tools: "tools",
     turnTokens: "Turn",
     totalTokens: "Total",
-    cachedTokens: "Cache hit",
     nonCachedTokens: "Non-cached",
     compactionTokens: "Compaction",
     compactionAfterTokens: "After compaction",
@@ -315,6 +313,7 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
       const url = new URL(eventsUrl, window.location.href);
       url.searchParams.delete("events");
       url.searchParams.set("detail", details.dataset.detailKey);
+      if (state.cursor !== undefined) url.searchParams.set("detailAfter", String(state.cursor));
       const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
       if (!response.ok) throw new Error("Detail HTTP " + response.status);
       const result = await response.json();
@@ -322,7 +321,14 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
       if (state.pending !== request || !details.open || !details.isConnected) return;
       if (details.dataset.detailRevision !== revision && result.revision !== details.dataset.detailRevision) return;
       const positions = Array.from(target.querySelectorAll("[data-scroll-id]"), (item) => [item, item.scrollLeft, item.scrollTop]);
-      patchMarkup(target, result.content);
+      if (typeof result.outputAppend === "string") {
+        const output = target.querySelector(".tool-output:not(.error-output)");
+        if (!output) throw new Error("Output delta without a loaded body");
+        output.append(document.createTextNode(result.outputAppend));
+        const footer = target.querySelector(".tool-footer");
+        if (footer && result.footer) patchMarkup(footer, result.footer);
+      } else patchMarkup(target, result.content);
+      state.cursor = result.cursor;
       window.agentBotDiagrams?.scan();
       for (const [item, left, top] of positions) { if (item.isConnected) { item.scrollLeft = left; item.scrollTop = top; } }
       state.loadedRevision = result.revision;
@@ -331,6 +337,7 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
       updateElapsed();
     } catch {
       if (state.pending !== request || !details.open || !details.isConnected) return;
+      state.cursor = undefined;
       state.failedRevision = revision;
       message.textContent = labels.loadFailed;
       const button = document.createElement("button");
@@ -398,8 +405,60 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
     });
   };
 
+  const applyPatch = (update) => {
+    const template = document.createElement("template");
+    template.innerHTML = update.content;
+    const incoming = template.content;
+    const timeline = content.querySelector('[data-preview-key="timeline"]');
+    const nextTimeline = incoming.querySelector('[data-preview-key="timeline"]');
+    for (const id of update.removed || []) {
+      for (const node of timeline.children) if (node.dataset.activity === id || node.dataset.activityId === id) node.remove();
+    }
+    for (const node of Array.from(nextTimeline.children)) {
+      const id = node.dataset.activity || node.dataset.activityId;
+      if (!id) continue;
+      timeline.querySelector(".empty")?.remove();
+      const current = Array.from(timeline.children).find((item) => (item.dataset.activity || item.dataset.activityId) === id);
+      if (current) patchNode(current, node);
+      else {
+        const nextId = update.before?.[id];
+        const anchor = Array.from(timeline.children).find((child) => (child.dataset.activity || child.dataset.activityId) === nextId);
+        timeline.insertBefore(node, anchor || null);
+      }
+    }
+    timeline.hidden = !timeline.children.length;
+    const incomingKeys = new Set(Array.from(incoming.children, (node) => node.dataset.previewKey));
+    for (const node of Array.from(incoming.children)) {
+      const key = nodeKey(node);
+      if (node.dataset.previewKey === "timeline" || !key) continue;
+      const current = Array.from(content.children).find((item) => nodeKey(item) === key);
+      if (current) patchNode(current, node);
+      else {
+        const result = content.querySelector('[data-preview-key="result"]');
+        content.insertBefore(node, node.dataset.activityId === "turn:files-summary" ? result : null);
+      }
+    }
+    for (const key of ["approval", "error", "plan", "result"]) {
+      if (!incomingKeys.has(key)) content.querySelector('[data-preview-key="' + key + '"]')?.remove();
+    }
+    patchMarkup(metadata, update.metadata);
+    status.textContent = update.statusLabel;
+    status.className = "status " + update.status;
+    window.agentBotDiagrams.scan();
+    refreshDetails();
+    updateElapsed();
+  };
   if (terminalAtLoad || typeof EventSource !== "function") return;
   source = new EventSource(eventsUrl);
+  source.addEventListener("patch", (event) => {
+    try {
+      const update = JSON.parse(event.data);
+      applyPatch(update);
+      live.textContent = update.terminal ? "" : labels.live;
+      live.className = update.terminal ? "live terminal" : "live connected";
+      if (update.terminal) { source.close(); clearInterval(clock); }
+    } catch { live.textContent = labels.waitingForUpdates; }
+  });
   source.addEventListener("update", (event) => {
     try {
       const update = JSON.parse(event.data);
@@ -479,6 +538,22 @@ export function renderTurnPreviewPage(input: {
   <script src="${escapeAttribute(input.scriptPath)}" defer></script>
 </body>
 </html>`;
+}
+
+export function renderTurnPreviewPatch(
+  state: TurnViewState, changed: Set<string>, removed: Set<string>,
+  localFileUrl: (filePath: string) => string | undefined, language: TurnPreviewLanguage,
+): TurnPreviewSnapshot & { removed: string[]; before: Record<string, string> } {
+  const partial = { ...state,
+    activities: state.activities.filter((a) => changed.has(a.id)),
+    reasoningItems: state.reasoningItems?.filter((r) => changed.has(`reasoning:${r.itemId}`)),
+  };
+  const order = [
+    ...(state.reasoningItems ?? []).filter((r) => !r.afterActivityId).map((r) => `reasoning:${r.itemId}`),
+    ...state.activities.flatMap((a) => [a.id, ...(state.reasoningItems ?? []).filter((r) => r.afterActivityId === a.id).map((r) => `reasoning:${r.itemId}`)]),
+  ];
+  const before = Object.fromEntries(order.flatMap((id, i) => changed.has(id) && order[i + 1] ? [[id, order[i + 1]]] : []));
+  return { ...renderTurnPreviewSnapshot(partial, localFileUrl, language, { deferDetails: true }), removed: [...removed], before };
 }
 
 export function renderTurnPreviewSnapshot(
@@ -634,6 +709,7 @@ function renderReasoningBody(
 }
 
 function reasoningRevision(item: TurnReasoningItem, cwd?: string): string {
+  if (item.previewRevision !== undefined) return String(item.previewRevision);
   return createHash("sha256").update(JSON.stringify([item.summary, item.content, cwd])).digest("hex").slice(0, 24);
 }
 
@@ -747,13 +823,18 @@ function renderToolBody(
       ? `<ul class="files" aria-label="${escapeAttribute(labels.files)}">${tool.files.map((file) => renderFileEntry(file, localFileUrl, projectCwd)).join("")}</ul>`
       : "",
   ].filter(Boolean).join("");
+  const footer = renderToolFooter(tool, (displayOutput?.length ?? 0) + (displayError?.length ?? 0), language);
+  return `<div class="tool-body"><div class="tool-content" data-scroll-id="${escapeAttribute(`${activityId}:content`)}" tabindex="0">${detailParts || `<div class="muted">${escapeHtml(labels.noToolDetails)}</div>`}</div><div class="tool-footer">${footer}</div></div>`;
+}
+
+export function renderToolFooter(tool: ToolState, characterCount: number, language: TurnPreviewLanguage): string {
+  const labels = previewLabels(language);
+  const status = `<span class="tool-state ${tool.status}">${escapeHtml(toolStatusLabel(tool.status, language))}</span>`;
   const startedAt = tool.startedAt === undefined ? undefined : new Date(tool.startedAt);
   const startTime = startedAt
     ? `<time datetime="${startedAt.toISOString()}" title="${escapeAttribute(labels.startingTime)}">${new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(startedAt)}</time>`
     : `<span title="${escapeAttribute(labels.startingTime)}">${escapeHtml(labels.unknown)}</span>`;
-  const characterCount = (displayOutput?.length ?? 0) + (displayError?.length ?? 0);
-  const footer = `<div class="tool-footer">${status}${startTime}${renderToolTiming(tool, "footer")}<span>${formatNumber(characterCount)} ${escapeHtml(labels.characters)}</span></div>`;
-  return `<div class="tool-body"><div class="tool-content" data-scroll-id="${escapeAttribute(`${activityId}:content`)}" tabindex="0">${detailParts || `<div class="muted">${escapeHtml(labels.noToolDetails)}</div>`}</div>${footer}</div>`;
+  return `${status}${startTime}${renderToolTiming(tool, "footer")}<span>${formatNumber(characterCount)} ${escapeHtml(labels.characters)}</span>`;
 }
 
 function toolTitle(tool: ToolState, command?: string, repl = false, language: TurnPreviewLanguage = "zh"): string {
@@ -946,6 +1027,7 @@ function lazyDetailBody(): string {
 }
 
 function toolDetailRevision(tool: ToolState, outputs?: Record<string, string>, errors?: Record<string, string>, cwd?: string): string {
+  if (tool.previewRevision !== undefined) return String(tool.previewRevision);
   return createHash("sha256").update(JSON.stringify([tool, outputs?.[tool.id], errors?.[tool.id], cwd])).digest("hex").slice(0, 24);
 }
 
@@ -957,6 +1039,7 @@ export interface TurnPreviewDetail {
   key: string;
   revision: string;
   content: string;
+  cursor?: number;
 }
 
 export function renderTurnPreviewDetail(
@@ -1012,11 +1095,11 @@ function renderMetadata(state: TurnViewState, language: TurnPreviewLanguage): st
   return [
     elapsed,
     state.model?.trim() ? `<span title="${escapeAttribute(labels.model)}">${escapeHtml(state.model.trim())}</span>` : "",
+    state.modelProvider?.trim() ? `<span title="Provider">Provider: ${escapeHtml(state.modelProvider.trim())}</span>` : "",
     state.totalTokens === undefined ? "" : state.cachedInputTokens === undefined
       ? `<span title="${escapeAttribute(labels.turnTokens)}">${formatTokenCount(state.totalTokens)} tokens</span>`
       : `<span title="${escapeAttribute(labels.nonCachedTokens)}: ${formatNumber(state.totalTokens)} tokens">${escapeHtml(labels.nonCachedTokens)} ${formatTokenCount(state.totalTokens)} tokens</span>`,
     state.totalTokensIncludingCache === undefined ? "" : `<span title="${escapeAttribute(labels.totalTokens)}: ${formatNumber(state.totalTokensIncludingCache)} tokens">${escapeHtml(labels.totalTokens)} ${formatTokenCount(state.totalTokensIncludingCache)} tokens</span>`,
-    state.cachedInputTokens === undefined ? "" : `<span title="${escapeAttribute(labels.cachedTokens)}: ${formatNumber(state.cachedInputTokens)} tokens">${escapeHtml(labels.cachedTokens)} ${formatTokenCount(state.cachedInputTokens)} tokens</span>`,
     state.contextCompactionAfterTokens === undefined ? "" : state.contextCompactionBeforeTokens === undefined
       ? `<span title="${escapeAttribute(labels.compactionAfterTokens)}">${formatTokenCount(state.contextCompactionAfterTokens)} tokens</span>`
       : `<span title="${escapeAttribute(labels.compactionTokens)}">${formatTokenCount(state.contextCompactionBeforeTokens)} → ${formatTokenCount(state.contextCompactionAfterTokens)} tokens</span>`,

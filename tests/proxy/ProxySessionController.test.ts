@@ -15,6 +15,7 @@ import type { FeishuOutbound, IncomingMessage } from "../../src/feishu/types.js"
 import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import { OutboundRouter } from "../../src/presentation/OutboundRouter.js";
+import { createTurnViewState } from "../../src/presentation/TurnStateReducer.js";
 import { ProxySessionController } from "../../src/proxy/ProxySessionController.js";
 import { AgentRuntimeRegistry } from "../../src/runtime/AgentRuntimeRegistry.js";
 import type { AgentRuntime, RemoteSessionSummary, RemoteTurnPage, RuntimeEvent, RuntimeGoal, RuntimeSession } from "../../src/runtime/types.js";
@@ -9350,9 +9351,10 @@ describe("ProxySessionController", () => {
   });
 
   test("handles model, permissions, details, and approval actions", async () => {
-    const { controller, runtime, presenter } = fixture();
+    const { controller, runtime, presenter, store } = fixture();
     await controller.onMessage(message("start"));
     const sessionId = (runtime.startTurn as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    store.saveTurnSnapshot("turn_1", sessionId, createTurnViewState(sessionId, "turn_1", Date.now()), "chat_id:c1");
     await controller.onCardAction({
       actionId: "model-setting",
       contextKey: "chat_id:c1",
@@ -10257,7 +10259,7 @@ describe("ProxySessionController", () => {
   });
 
   test.each(["model-card", "model-cli", "provider-card", "provider-cli"])(
-    "persists the execution model in the next Preview after %s changes",
+    "persists the execution model and Provider in the next Preview after %s changes",
     async (entry) => {
       const { controller, runtime, store, presenter, outbound } = fixture();
       const actualPresenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
@@ -10285,12 +10287,13 @@ describe("ProxySessionController", () => {
             : { action: "settings_provider_select", sessionId: id, provider: "azure" },
         });
       }
-      expect(presenter.updateSessionModel).toHaveBeenLastCalledWith(id, "gpt-next");
+      const modelProvider = entry.startsWith("provider") ? "azure" : runtime.getSession(id)?.modelProvider;
+      expect(presenter.updateSessionModel).toHaveBeenLastCalledWith(id, "gpt-next", modelProvider);
       await controller.onMessage(message("run with the selected model"));
-      await vi.waitFor(() => expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "gpt-next" }));
+      await vi.waitFor(() => expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "gpt-next", modelProvider }));
       expect(runtime.getSession(id)?.model).toBe("gpt-next");
       await actualPresenter.onEvent({ type: "turn_completed", sessionId: id, turnId: "turn_1", finalResponse: "done" });
-      expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "gpt-next", status: "completed" });
+      expect(store.getTurnSnapshot("turn_1")).toMatchObject({ model: "gpt-next", modelProvider, status: "completed" });
     },
   );
 
@@ -10299,10 +10302,11 @@ describe("ProxySessionController", () => {
     await controller.onMessage(message("/new"));
     const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
     runtime.getSession(id)!.model = "gpt-next";
+    runtime.getSession(id)!.modelProvider = "azure";
     vi.mocked(presenter.updateSessionModel).mockClear();
     vi.mocked(presenter.startPendingTurn).mockClear();
     await controller.onMessage(message("use current runtime settings"));
-    expect(presenter.updateSessionModel).toHaveBeenLastCalledWith(id, "gpt-next");
+    expect(presenter.updateSessionModel).toHaveBeenLastCalledWith(id, "gpt-next", "azure");
     expect(vi.mocked(presenter.updateSessionModel).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(presenter.startPendingTurn).mock.invocationCallOrder[0]!);
   });

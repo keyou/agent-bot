@@ -50,6 +50,13 @@ describe("TurnStateReducer", () => {
     expect(initial.activities).toEqual([]);
   });
 
+  test.each([undefined, "azure"])("preserves recorded Provider %s when hydrating history", (modelProvider) => {
+    const summary = createTurnViewState("s", "t", 123, undefined, undefined, undefined, undefined, "Codex", "model", undefined, modelProvider);
+    expect(summary.modelProvider).toBe(modelProvider);
+    const result = hydrateTurnViewState(summary, { turnId: "t", status: "completed", finalResponse: "", items: [] });
+    expect(result.modelProvider).toBe(modelProvider);
+  });
+
   test("does not convert imported placeholder times into historical duration", () => {
     const summary = { ...createTurnViewState("s", "t", 123), completedAt: 123 };
     const result = hydrateTurnViewState(summary, { turnId: "t", status: "completed", finalResponse: "", items: [] });

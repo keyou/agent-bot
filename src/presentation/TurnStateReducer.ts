@@ -21,12 +21,14 @@ export function createTurnViewState(
   agentLabel?: string,
   model?: string,
   promptImagePaths?: string[],
+  modelProvider?: string,
 ): TurnViewState {
   return {
     sessionId,
     turnId,
     agentLabel,
     model,
+    modelProvider,
     taskTitle,
     prompt,
     ...(promptImagePaths?.length ? { promptImagePaths: [...new Set(promptImagePaths)] } : {}),
@@ -55,7 +57,7 @@ export function hydrateTurnViewState(summary: TurnViewState, details: RemoteTurn
     ...summary,
     ...createTurnViewState(summary.sessionId, summary.turnId, details.startedAt ?? summary.startedAt,
       summary.taskTitle, summary.replyTarget, summary.projectCwd, summary.prompt,
-      summary.agentLabel, summary.model, summary.promptImagePaths),
+      summary.agentLabel, summary.model, summary.promptImagePaths, summary.modelProvider),
     historyDetail: "full",
     historyDetailError: undefined,
   };
@@ -77,6 +79,7 @@ export function hydrateTurnViewState(summary: TurnViewState, details: RemoteTurn
       }
     } else if (item.kind === "tool") {
       state = reduceToolUpdate(state, item.tool, undefined, true);
+      state.activities = state.activities.map((a) => a.kind === "tool" && a.id === item.tool.id ? { ...a, tool: item.tool } : a);
     } else if (item.kind === "reasoning") {
       for (const [summaryIndex, text] of item.summary.entries()) {
         state = reduceTurnEvent(state, { ...identity, type: "progress", text,
@@ -103,7 +106,30 @@ export function hydrateTurnViewState(summary: TurnViewState, details: RemoteTurn
   };
 }
 
-export function reduceTurnEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
+export function reduceTurnEvent(state: TurnViewState, event: AgentEvent, complete = false): TurnViewState {
+  if (event.sessionId !== state.sessionId || event.turnId !== state.turnId) return state;
+  const next = reduceEvent(state, event);
+  if (!complete) return next;
+  if (event.type === "turn_completed") next.finalResponse = event.finalResponse;
+  if (event.type === "agent_text_delta") next.assistantText = state.assistantText + event.text;
+  if (event.type === "plan_updated") next.plan = event.steps;
+  if (event.type === "progress") {
+    const id = event.activityId ?? "progress";
+    const old = state.activities.find((a) => a.id === id);
+    next.activities = next.activities.map((a) => a.id === id && a.kind !== "tool"
+      ? { ...a, text: (event.append && old && old.kind !== "tool" ? old.text : "") + event.text } : a);
+  }
+  if (event.type === "tool_started" || event.type === "tool_updated") {
+    next.activities = next.activities.map((a) => a.kind === "tool" && a.id === event.tool.id
+      ? { ...a, tool: { ...a.tool, ...event.tool } } : a);
+    const files = new Map(state.fileSummary.map((f) => [f.path, f]));
+    for (const file of event.tool.files ?? []) files.set(file.path, file);
+    next.fileSummary = [...files.values()];
+  }
+  return next;
+}
+
+function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
   if (event.sessionId !== state.sessionId || event.turnId !== state.turnId) return state;
 
   switch (event.type) {
@@ -670,4 +696,24 @@ function formatCompactionDuration(durationMs: number): string {
 
 function formatInteger(value: number): string {
   return normalizeTokenCount(value).toLocaleString("en-US");
+}
+
+/** Bound the hot card projection, never the journal or final-delivery payload. */
+export function compactTurnView(state: TurnViewState): TurnViewState {
+  const recent = state.activities.slice(-77);
+  const commentary = state.activities.slice(0, -77).filter((a) => a.kind === "assistant").slice(-3);
+  const retained = state.activities.length > 80 ? [...commentary, ...recent] : state.activities;
+  const activities = retained.map((a) => a.kind === "tool"
+    ? { ...a, tool: boundTool(a.tool) } : { ...a, text: bound(a.text) });
+  const ids = new Set(activities.filter((a) => a.kind === "tool").map((a) => a.id));
+  return { ...state, previewJournal: true, previewCursor: undefined, activities,
+    assistantText: bound(state.assistantText), progressText: state.progressText === undefined ? undefined : bound(state.progressText),
+    plan: state.plan.slice(0, 30).map((step) => ({ ...step, text: bound(step.text) })),
+    activeTool: state.activeTool ? boundTool(state.activeTool) : undefined,
+    completedTools: state.completedTools.slice(-20).map(boundTool), failedTools: state.failedTools.slice(-5).map(boundTool),
+    fileSummary: state.fileSummary.slice(-30),
+    activitiesTruncated: state.activitiesTruncated || state.activities.length > 80,
+    reasoningItems: [], fullToolOutputs: {}, fullToolErrors: {},
+    toolStatuses: Object.fromEntries(Object.entries(state.toolStatuses ?? {}).filter(([id]) => ids.has(id))),
+  };
 }

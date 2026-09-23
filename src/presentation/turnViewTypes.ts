@@ -23,6 +23,7 @@ export type TurnActivity =
   | { kind: "tool"; id: string; tool: ToolState };
 
 export interface TurnReasoningItem {
+  previewRevision?: number;
   itemId: string;
   afterActivityId?: string;
   summary: string[];
@@ -31,10 +32,15 @@ export interface TurnReasoningItem {
 }
 
 export interface TurnViewState {
+  /** Full execution content is stored in the append-only preview journal. */
+  previewJournal?: boolean;
+  /** Byte cursor for the on-demand preview, never needed for recovery. */
+  previewCursor?: number;
   sessionId: string;
   turnId: string;
   agentLabel?: string;
   model?: string;
+  modelProvider?: string;
   taskTitle?: string;
   prompt?: string;
   promptImagePaths?: string[];

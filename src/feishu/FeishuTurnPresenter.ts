@@ -1,7 +1,9 @@
+import type { TurnPreviewJournal } from "../state/TurnPreviewJournal.js";
 import type { AgentEvent } from "../runtime/types.js";
 import {
   appendSteerMessage as appendSteerMessageToState,
   createTurnViewState,
+  compactTurnView,
   reduceTurnEvent,
 } from "../presentation/TurnStateReducer.js";
 import { splitMarkdown } from "../presentation/splitMarkdown.js";
@@ -27,6 +29,7 @@ interface TurnDeliveryRecord {
 }
 
 export interface TurnPresentationStore {
+  previews?: TurnPreviewJournal;
   saveTurnSnapshot(turnId: string, localSessionId: string, snapshot: unknown, contextKey?: string): void;
   promotePendingTurn(
     pendingTurnId: string,
@@ -78,9 +81,12 @@ export class FeishuTurnPresenter {
   private readonly sessionCwds = new Map<string, string>();
   private readonly sessionAgentLabels = new Map<string, string>();
   private readonly sessionModels = new Map<string, string>();
+  private readonly sessionModelProviders = new Map<string, string>();
   private readonly entries = new Map<string, TurnEntry>();
   private readonly pendingEntries = new Map<string, TurnEntry>();
   private readonly renderer: CardRenderer;
+  private readonly dirty = new Map<string, { state: TurnViewState; contextKey?: string }>();
+  private persistTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly outbound: FeishuOutbound,
@@ -98,23 +104,26 @@ export class FeishuTurnPresenter {
     projectCwd?: string,
     agentLabel?: string,
     model?: string,
+    modelProvider?: string,
   ): void {
     this.sessionContexts.set(sessionId, contextKey);
     if (taskTitle) this.sessionTitles.set(sessionId, taskTitle);
     if (projectCwd) this.sessionCwds.set(sessionId, projectCwd);
     if (agentLabel) this.sessionAgentLabels.set(sessionId, agentLabel);
-    if (model) {
-      this.updateSessionModel(sessionId, model);
+    if (model || modelProvider) {
+      this.updateSessionModel(sessionId, model, modelProvider);
     }
   }
 
-  updateSessionModel(sessionId: string, model?: string): void {
-    if (!model) return;
-    this.sessionModels.set(sessionId, model);
+  updateSessionModel(sessionId: string, model?: string, modelProvider?: string): void {
+    if (model) this.sessionModels.set(sessionId, model);
+    if (modelProvider) this.sessionModelProviders.set(sessionId, modelProvider);
     const pending = this.pendingEntries.get(sessionId);
-    if (!pending || pending.state.model === model) return;
-    pending.state = { ...pending.state, model };
-    this.store.saveTurnSnapshot(pending.state.turnId, sessionId, pending.state, pending.contextKey);
+    const nextModel = this.sessionModels.get(sessionId);
+    const nextProvider = this.sessionModelProviders.get(sessionId);
+    if (!pending || (pending.state.model === nextModel && pending.state.modelProvider === nextProvider)) return;
+    pending.state = { ...pending.state, model: nextModel, modelProvider: nextProvider };
+    this.persist(pending.state.turnId, sessionId, pending.state, pending.contextKey);
     if (!pending.historySnapshot) pending.scheduler?.update(pending.state, "critical");
   }
 
@@ -123,7 +132,7 @@ export class FeishuTurnPresenter {
     for (const entry of this.entries.values()) {
       if (entry.state.sessionId !== sessionId || entry.state.taskTitle === taskTitle) continue;
       entry.state = { ...entry.state, taskTitle };
-      this.store.saveTurnSnapshot(entry.state.turnId, sessionId, entry.state, entry.contextKey);
+      this.persist(entry.state.turnId, sessionId, entry.state, entry.contextKey);
       if (!entry.historySnapshot) entry.scheduler?.update(entry.state, "critical");
     }
   }
@@ -134,6 +143,7 @@ export class FeishuTurnPresenter {
     this.sessionCwds.delete(sessionId);
     this.sessionAgentLabels.delete(sessionId);
     this.sessionModels.delete(sessionId);
+    this.sessionModelProviders.delete(sessionId);
   }
 
   async startPendingTurn(
@@ -150,7 +160,7 @@ export class FeishuTurnPresenter {
       const images = localImagePaths === undefined ? existing.state.promptImagePaths : [...new Set(localImagePaths)];
       if ((prompt && existing.state.prompt !== prompt) || JSON.stringify(images) !== JSON.stringify(existing.state.promptImagePaths)) {
         existing.state = { ...existing.state, ...(prompt ? { prompt } : {}), ...(images ? { promptImagePaths: images } : {}) };
-        this.store.saveTurnSnapshot(existing.state.turnId, sessionId, existing.state, existing.contextKey);
+        this.persist(existing.state.turnId, sessionId, existing.state, existing.contextKey);
         if (!existing.historySnapshot) existing.scheduler?.update(existing.state, "critical");
       }
       return existing.state.turnId;
@@ -168,11 +178,12 @@ export class FeishuTurnPresenter {
       this.sessionAgentLabels.get(sessionId),
       this.sessionModels.get(sessionId),
       localImagePaths,
+      this.sessionModelProviders.get(sessionId),
     );
     const entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
     this.entries.set(state.turnId, entry);
     this.pendingEntries.set(sessionId, entry);
-    this.store.saveTurnSnapshot(state.turnId, sessionId, state, contextKey);
+    this.persist(state.turnId, sessionId, state, contextKey);
     entry.initializing = this.initializeEntry(entry);
     try {
       await entry.initializing;
@@ -202,7 +213,7 @@ export class FeishuTurnPresenter {
       completedAt,
       durationMs: Math.max(0, completedAt - entry.state.startedAt),
     };
-    this.store.saveTurnSnapshot(entry.state.turnId, sessionId, entry.state, entry.contextKey);
+    this.persist(entry.state.turnId, sessionId, entry.state, entry.contextKey);
     await entry.initializing;
     try {
       await entry.scheduler?.flush(entry.state);
@@ -240,7 +251,7 @@ export class FeishuTurnPresenter {
       completedAt,
       durationMs: Math.max(0, completedAt - snapshot.startedAt),
     };
-    this.store.saveTurnSnapshot(turnId, sessionId, state, contextKey);
+    this.persist(turnId, sessionId, state, contextKey);
     const entry = this.entries.get(turnId);
     if (entry) {
       entry.state = state;
@@ -280,21 +291,26 @@ export class FeishuTurnPresenter {
               undefined,
               this.sessionAgentLabels.get(sessionId),
               this.sessionModels.get(sessionId),
+              undefined,
+              this.sessionModelProviders.get(sessionId),
             ),
             status: "running" as const,
           };
-      const state = appendSteerMessageToState(initial, activityId, text, localImagePaths);
+      this.store.previews?.seed(initial);
+      this.store.previews?.user(turnId, activityId, text, localImagePaths);
+      const state = this.cardState(appendSteerMessageToState(initial, activityId, text, localImagePaths));
       entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
       this.entries.set(turnId, entry);
-      this.store.saveTurnSnapshot(turnId, sessionId, state, contextKey);
+      this.persist(turnId, sessionId, state, contextKey);
       entry.initializing = this.initializeEntry(entry);
       await entry.initializing;
       return;
     }
 
     await entry.initializing;
-    entry.state = appendSteerMessageToState(entry.state, activityId, text, localImagePaths);
-    this.store.saveTurnSnapshot(turnId, sessionId, entry.state, entry.contextKey);
+    this.store.previews?.user(turnId, activityId, text, localImagePaths);
+    entry.state = this.cardState(appendSteerMessageToState(entry.state, activityId, text, localImagePaths));
+    this.persist(turnId, sessionId, entry.state, entry.contextKey);
     if (!entry.historySnapshot) entry.scheduler?.update(entry.state, "critical");
   }
 
@@ -317,19 +333,25 @@ export class FeishuTurnPresenter {
             pending.state.agentLabel,
             pending.state.model,
             pending.state.promptImagePaths,
+            pending.state.modelProvider,
           ),
           event,
         );
+        this.flushPersistence();
+        this.store.previews?.seed(state);
+        this.store.previews?.event(event);
+        this.store.previews?.flush(event.turnId, true);
+        this.store.previews?.release(pendingTurnId);
         this.store.promotePendingTurn(
           pendingTurnId,
           event.turnId,
           event.sessionId,
-          state,
+          this.cardState(state),
           pending.contextKey,
         );
         this.pendingEntries.delete(event.sessionId);
         this.entries.delete(pendingTurnId);
-        pending.state = state;
+        pending.state = this.cardState(state);
         this.entries.set(event.turnId, pending);
         existing = pending;
         eventApplied = true;
@@ -339,8 +361,12 @@ export class FeishuTurnPresenter {
     if (!entry) return;
 
     if (existing && !eventApplied) {
-      entry.state = reduceTurnEvent(entry.state, event);
-      this.store.saveTurnSnapshot(event.turnId, event.sessionId, entry.state, entry.contextKey);
+      this.store.previews?.seed(entry.state);
+      this.store.previews?.event(event);
+      const previousStatus = entry.state.status;
+      entry.state = this.cardState(reduceTurnEvent(entry.state, event));
+      if (isTerminalViewStatus(previousStatus) && !event.type.startsWith("turn_")) entry.state.status = previousStatus;
+      this.persist(event.turnId, event.sessionId, entry.state, entry.contextKey, true);
     }
 
     await entry.initializing;
@@ -367,7 +393,7 @@ export class FeishuTurnPresenter {
   }
 
   async showDetails(contextKey: string, turnId: string): Promise<void> {
-    const snapshot = this.store.getTurnSnapshot(turnId);
+    const snapshot = this.store.previews?.load(turnId) ?? this.store.getTurnSnapshot(turnId);
     if (!isTurnViewState(snapshot)) {
       await this.outbound.sendText(contextKey, "未找到这次执行的详情。可能已被清理。");
       return;
@@ -403,7 +429,7 @@ export class FeishuTurnPresenter {
       }
 
       if (!entry.historySnapshot) {
-        entry.historySnapshot = entry.state;
+        entry.historySnapshot = this.store.previews?.load(turnId) ?? entry.state;
         await entry.scheduler?.flush();
       }
       const card = this.renderActivityHistory(entry.historySnapshot, page);
@@ -412,7 +438,7 @@ export class FeishuTurnPresenter {
       return;
     }
 
-    const snapshot = this.store.getTurnSnapshot(turnId);
+    const snapshot = this.store.previews?.load(turnId) ?? this.store.getTurnSnapshot(turnId);
     if (!isTurnViewState(snapshot)) throw new Error("未找到这次执行的活动历史。");
     const card = page === "latest"
       ? this.renderTurn(snapshot)
@@ -430,12 +456,45 @@ export class FeishuTurnPresenter {
   }
 
   async flushAll(): Promise<void> {
+    this.store.previews?.flush(undefined, true);
+    this.flushPersistence();
     await Promise.all(
       [...this.entries.values()].map(async (entry) => {
         await entry.initializing;
         if (!entry.historySnapshot) await entry.scheduler?.flush();
       }),
     );
+  }
+
+  private cardState(state: TurnViewState): TurnViewState {
+    return this.store.previews ? { ...compactTurnView(state), toolStatuses: state.toolStatuses } : state;
+  }
+
+  private persist(turnId: string, sessionId: string, state: TurnViewState, contextKey?: string, event = false): void {
+    if (!this.store.previews) { this.store.saveTurnSnapshot(turnId, sessionId, state, contextKey); return; }
+    if (!event || isTerminalViewStatus(state.status)) this.store.previews.state(state);
+    const compact = compactTurnView(state);
+    this.dirty.set(turnId, { state: compact, contextKey });
+    if (!event || isTerminalViewStatus(state.status) || state.status === "waiting_for_approval") {
+      this.store.previews.flush(turnId, true);
+      this.flushPersistence();
+      if (isTerminalViewStatus(state.status)) this.store.previews.release(turnId);
+    } else if (!this.persistTimer) {
+      this.persistTimer = setTimeout(() => {
+        try { this.flushPersistence(); } catch (error) { this.options.onError?.(error); }
+      }, 750);
+      this.persistTimer.unref();
+    }
+  }
+
+  private flushPersistence(): void {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.persistTimer = undefined;
+    this.store.previews?.flush();
+    for (const [id, { state, contextKey }] of this.dirty) {
+      this.store.saveTurnSnapshot(id, state.sessionId, state, contextKey);
+      this.dirty.delete(id);
+    }
   }
 
   private createEntry(event: AgentEvent): TurnEntry | undefined {
@@ -455,14 +514,16 @@ export class FeishuTurnPresenter {
           undefined,
           this.sessionAgentLabels.get(event.sessionId),
           this.sessionModels.get(event.sessionId),
+          undefined,
+          this.sessionModelProviders.get(event.sessionId),
         );
-    const state = reduceTurnEvent(
-      initial,
-      event,
-    );
+    this.store.previews?.seed(initial);
+    this.store.previews?.event(event);
+    const state = this.cardState(reduceTurnEvent(initial, event));
     const entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
     this.entries.set(event.turnId, entry);
-    this.store.saveTurnSnapshot(event.turnId, event.sessionId, state, contextKey);
+    this.persist(event.turnId, event.sessionId, state, contextKey, true);
+    this.flushPersistence();
     entry.initializing = this.initializeEntry(entry);
     return entry;
   }
@@ -526,7 +587,9 @@ export class FeishuTurnPresenter {
   getTurnPreviewUrl(turnId: string): string | undefined {
     if (turnId.startsWith("pending_") || !this.options.turnPreviewUrl) return undefined;
     const state = this.entries.get(turnId)?.state ?? this.store.getTurnSnapshot(turnId);
-    return isTurnViewState(state) && state.turnId === turnId ? this.turnPreviewUrl(state) : undefined;
+    if (isTurnViewState(state) && state.turnId === turnId) return this.turnPreviewUrl(state);
+    return this.store.previews?.has(turnId)
+      ? this.options.turnPreviewUrl(turnId) : undefined;
   }
 
   private turnPreviewUrl(state: TurnViewState): string | undefined {

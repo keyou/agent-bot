@@ -77,7 +77,7 @@ const consoleOnly = process.env.AGENT_BOT_CONSOLE_ONLY === "1";
 const config = loadConfig();
 const transport = consoleOnly ? "console" : requireServerFeishuTransport(config.feishu);
 const logger = createLogger(config);
-const store = new StateStore(config.storage.sqlitePath);
+const store = new StateStore(config.storage.sqlitePath, (error) => logger.error({ error }, "Failed to persist Turn preview journal."));
 let localFileViewer: LocalFileViewerServer | undefined;
 let loadTurnDetails: ((turnId: string) => Promise<unknown>) | undefined;
 if (config.fileViewer.enabled) {
@@ -86,6 +86,7 @@ if (config.fileViewer.enabled) {
     port: config.fileViewer.port,
     publicBaseUrl: config.fileViewer.publicBaseUrl,
     stateDirectory: path.join(path.dirname(config.storage.sqlitePath), "file-viewer"),
+    previewJournal: store.previews,
     getTurnSnapshot: (turnId) => store.getTurnSnapshot(turnId),
     loadTurnSnapshot: (turnId) => loadTurnDetails?.(turnId) ?? Promise.resolve(store.getTurnSnapshot(turnId)),
   });

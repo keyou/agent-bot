@@ -1,3 +1,5 @@
+import { TurnPreviewJournal } from "../../src/state/TurnPreviewJournal.js";
+import { createTurnViewState } from "../../src/presentation/TurnStateReducer.js";
 import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -18,6 +20,58 @@ afterEach(async () => {
 });
 
 describe("LocalFileViewerServer", () => {
+  test("streams only changed journal blocks, resumes at a byte cursor and serves complete lazy details", async () => {
+    const directory = createTemporaryDirectory();
+    const journal = new TurnPreviewJournal(path.join(directory, "journal"));
+    const identity = { sessionId: "s", turnId: "t" };
+    journal.seed(createTurnViewState("s", "t", Date.now()));
+    journal.event({ ...identity, type: "progress", text: "old commentary", activityId: "commentary:old" });
+    const tool = { id: "cmd", kind: "command", title: "run", command: "run", status: "running" as const };
+    journal.event({ ...identity, type: "tool_started", tool });
+    const getSnapshot = vi.fn();
+    const server = new LocalFileViewerServer({ host: "127.0.0.1", port: 0, stateDirectory: directory,
+      previewJournal: journal, getTurnSnapshot: getSnapshot, turnPreviewPollIntervalMs: 50 });
+    servers.push(server);
+    await server.start();
+    const abort = new AbortController();
+    try {
+      const url = server.createTurnPreviewUrl("t")!;
+      const html = await (await fetch(url)).text();
+      const eventUrl = /data-events-url="([^"]+)"/u.exec(html)![1]!.replaceAll("&amp;", "&");
+      expect(new URL(eventUrl).searchParams.get("after")).toBeTruthy();
+      const events = createServerSentEventReader(await fetch(eventUrl, { signal: abort.signal }));
+      journal.event({ ...identity, type: "tool_output_delta", toolId: "cmd", delta: "complete output ".repeat(1000) });
+      journal.flush();
+      const update = JSON.parse(await events.next("patch"));
+      expect(update.content).toContain('data-activity-id="cmd"');
+      expect(update.content).not.toContain("old commentary");
+      expect(update.content).not.toContain("complete output");
+      const resumeUrl = new URL(eventUrl);
+      const lastEventId = resumeUrl.searchParams.get("after")!;
+      resumeUrl.searchParams.delete("after");
+      const second = createServerSentEventReader(await fetch(resumeUrl, { signal: abort.signal, headers: { "Last-Event-ID": lastEventId } }));
+      const resumed = JSON.parse(await second.next("patch"));
+      expect(resumed.content).toBe(update.content);
+      expect(resumed.content).not.toContain("old commentary");
+      const detailUrl = new URL(url); detailUrl.searchParams.set("detail", "tool:cmd");
+      const detail = await (await fetch(detailUrl)).json() as { content: string; revision: string; cursor: number };
+      expect(detail.content).toContain("complete output ".repeat(1000).trim());
+      expect(update.content).toContain(`data-detail-revision="${detail.revision}"`);
+      journal.event({ ...identity, type: "tool_output_delta", toolId: "cmd", delta: "new suffix" });
+      journal.flush();
+      await events.next("patch");
+      detailUrl.searchParams.set("detailAfter", String(detail.cursor));
+      const incremental = await (await fetch(detailUrl)).json() as { outputAppend: string; content: string };
+      expect(incremental.outputAppend).toBe("new suffix");
+      expect(incremental.content).toBe("");
+      expect(getSnapshot).not.toHaveBeenCalled();
+      journal.event({ ...identity, type: "turn_completed", finalResponse: "done" });
+      journal.flush();
+      expect(JSON.parse(await events.next("patch"))).toMatchObject({ terminal: true });
+      expect(await (await fetch(url)).text()).toContain("old commentary");
+    } finally { abort.abort(); journal.close(); }
+  });
+
   test("serves signed text previews with stable line anchors and raw content", async () => {
     const directory = createTemporaryDirectory();
     const filePath = path.join(directory, "example.ts");
@@ -689,6 +743,7 @@ describe("LocalFileViewerServer", () => {
       totalTokens: 8,
       totalTokensIncludingCache: 3_563,
       cachedInputTokens: 3_555,
+      modelProvider: "azure",
       status: "running",
       startedAt: Date.now() - 2_000,
       assistantText: "",
@@ -718,7 +773,8 @@ describe("LocalFileViewerServer", () => {
     expect(page).toContain("正在检查入口。");
     expect(page).toContain("实时更新");
     expect(page).toContain('title="总计: 3,563 tokens"');
-    expect(page).toContain('title="缓存命中: 3,555 tokens"');
+    expect(page).not.toContain("缓存命中");
+    expect(page).toContain('title="Provider">Provider: azure</span>');
     expect(page).not.toContain("检查 <preview> & SSE");
     expect(page).not.toContain('class="file-link"');
     const filesDetailUrl = new URL(previewUrl!);
@@ -745,7 +801,8 @@ describe("LocalFileViewerServer", () => {
         headers: { "Accept-Language": "zh-CN" },
       }));
       const initial = JSON.parse(await events.next("update")) as { content: string; metadata: string; terminal: boolean };
-      expect(initial.metadata).toContain('title="缓存命中: 3,555 tokens"');
+      expect(initial.metadata).not.toContain("缓存命中");
+      expect(initial.metadata).toContain("Provider: azure");
       expect(initial.content).toContain("正在检查入口。");
       expect(initial.terminal).toBe(false);
       expect(initial.content).toContain(`src="${imageUrl!.replaceAll("&", "&amp;")}"`);
@@ -782,7 +839,8 @@ describe("LocalFileViewerServer", () => {
       };
       const update = JSON.parse(await events.next("update")) as { content: string; metadata: string; terminal: boolean };
       expect(update.metadata).toContain('title="总计: 7,126 tokens"');
-      expect(update.metadata).toContain('title="缓存命中: 7,110 tokens"');
+      expect(update.metadata).not.toContain("缓存命中");
+      expect(update.metadata).toContain("Provider: azure");
       expect(update.content).toContain("npm test");
       expect(update.content).not.toContain("all passed");
       const toolDetailUrl = new URL(previewUrl!);

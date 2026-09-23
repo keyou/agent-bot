@@ -201,7 +201,9 @@ logging:
 
 `fileViewer` 为最终回答中的本地非图片文件和目录生成带签名的只读 HTTP 链接。默认 `host: "127.0.0.1"`，只能从运行 Agent Bot 的机器访问。设为 `0.0.0.0` 或 `::` 时，服务会监听所有网卡，并从非内部 IPv4 地址中按有线、Wi-Fi、其他物理网卡、VPN 的顺序自动选择链接地址；Docker、Hyper-V、VMware、VirtualBox、WSL、回环和链路本地地址会被排除，没有候选地址时回退到本机环回地址。`publicBaseUrl` 的优先级最高，用于域名、HTTPS 反向代理、NAT 或端口映射。`port: 0` 会在第一次启动时选择空闲端口，并保存到 `<data>/file-viewer/port`，以后重启继续使用，同一机器上的多个 Profile 不会争用固定端口。签名密钥保存在同目录的 `secret` 文件中。文件 URL 只能读取签发时对应的绝对路径；目录 URL 会列出其直接子项并允许继续向下浏览，但不提供向父目录跳转。文本身份由内容采样识别，页面显示带行号的开头 2 MiB；图片、PDF、音视频使用浏览器原生预览，其他二进制文件提供原始打开和下载入口。签名 URL 是持有者凭证，不应公开分享。
 
-同一服务也会为思考卡片生成带签名的 Turn Preview URL。预览直接渲染 SQLite 中持久化的 `TurnViewState` 时间线，不会重新扫描 Codex rollout 文件，也不会恢复或占用 App Server thread 的 writer。页面只展示 Agent Bot 已经可见的 Prompt、计划、Commentary/思考摘要、工具命令和完整保留的结果、文件摘要、错误与最终回答。命令默认展开，输出默认折叠；输出和错误在统一换行、去掉首尾空白后相同则合并展示。Shell 包装器复用思考卡片的清理逻辑。Provider 提供 `input` 或代码字段时，REPL 参数会格式化为可读代码。工具有已记录的时间时展示开始时间与耗时，仅执行中的工具实时计时。仅当页面保持 SSE 连接时，服务才轮询对应快照；状态变化时发送完整且可重复应用的快照，保留用户展开及折叠的状态和工具代码的滚动位置，并由 `EventSource` 在网络中断或 Worker 重启后自动重连。Turn 进入终态后，页面收到最后一份快照并关闭客户端流。该 URL 是当前 Profile 独立的持有者凭证，网络可达范围与 `fileViewer.host`、`publicBaseUrl` 配置完全相同。
+Turn Preview 的完整执行记录保存在 SQLite 所在目录的 `turn-previews/<哈希前两位>/<SHA256(turnId)>.jsonl`，各 Profile 隔离。按需创建两位哈希子目录（最多 256 个），读写统一使用这一种目录布局。日志只用于展示，不会重放或重新执行 Agent/工具。普通记录按 250 ms 或 256 KiB 合并追加；完成、失败、取消和安全关闭会刷新，关键状态执行 fsync。SQLite 只保留最近 80 条有界卡片活动、路由和恢复信息、Prompt、最终回答及投递 ledger；普通更新合并为约 750 ms 一次。完整工具输出、思考和历史活动不再写回大快照。累计工具输出采用带指纹的追加/替换记录，避免 `A`、`B`、最终 `AB` 重复成 `ABAB`。
+
+页面按字节游标分块读取日志，之后 SSE 只发送变化的活动摘要；没有打开页面时不运行 Preview 读取/渲染。折叠详情按需完整加载，小于 16 MiB 的详情投影最多缓存 4 个、空闲 60 秒释放。普通命令的流式输出按后缀传输；替换、REPL 结构化内容等回退为该工具的完整详情。终态页面停止订阅，重连使用 Last-Event-ID 游标接续。JSONL 不完整尾行读取时忽略，下次追加前截掉；完整行损坏或磁盘写失败会报错，不静默丢弃。旧快照继续支持，不在启动时迁移全库或 VACUUM；已有数据库/WAL 大小不会因此自动缩小。备份需包含数据库和 `turn-previews` 目录。签名 URL 仍是 Profile 级 bearer credential。
 
 Turn Preview 复用 highlight.js，在服务端高亮显式标注语言的 Markdown 代码块。支持常见语言集合，以及 PowerShell、Dockerfile、Windows batch 和 `zsh`、`pwsh` 别名。未标注、未知语言、解析失败或 UTF-8 源码超过 64 KiB 时回退到完整转义文本，不截断内容。32 项/1 MiB 的 LRU 缓存避免在 SSE 快照中重复高亮未变代码。配色仅作用于 Markdown 代码块并跟随系统浅色/深色偏好，Mermaid 渲染和工具日志保持不变。
 

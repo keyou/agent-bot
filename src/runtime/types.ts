@@ -42,6 +42,7 @@ export interface PlanStep {
 }
 
 export interface ToolState {
+  previewRevision?: number;
   id: string;
   title: string;
   kind: string;
