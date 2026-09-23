@@ -642,6 +642,32 @@ describe("LocalFileViewerServer", () => {
     expect(fs.readFileSync(path.join(directory, "port"), "utf8").trim()).toBe(String(firstAddress.port));
   });
 
+  test("loads an external Turn with no local snapshot only on signed page GET and renders retryable failures safely", async () => {
+    const directory = createTemporaryDirectory();
+    const load = vi.fn(async (id: string) => id === "external" ? createTurnViewState("source", id, 1) : undefined);
+    const server = new LocalFileViewerServer({ host: "127.0.0.1", port: 0, stateDirectory: directory,
+      getTurnSnapshot: () => undefined, loadTurnSnapshot: load });
+    await server.start(); servers.push(server);
+    const url = new URL(server.createTurnPreviewUrl("external")!);
+    await fetch(url, { method: "HEAD" });
+    const detail = new URL(url); detail.searchParams.set("detail", "tool:cmd");
+    expect((await fetch(detail)).status).toBe(404);
+    const events = new URL(url); events.searchParams.set("events", "1");
+    expect((await fetch(events)).status).toBe(404);
+    const forged = new URL(url); forged.searchParams.set("turn", "forged");
+    expect((await fetch(forged)).status).toBe(403);
+    expect(load).not.toHaveBeenCalled();
+    load.mockRejectedValueOnce(new Error("RPC <script>failed</script>"));
+    const failed = await fetch(url);
+    expect(failed.status).toBe(502);
+    const html = await failed.text();
+    expect(html).toContain("刷新页面重试");
+    expect(html).toContain("RPC &lt;script&gt;failed&lt;/script&gt;");
+    expect(html).not.toContain("<script>failed</script>");
+    expect((await fetch(url)).status).toBe(200);
+    expect((await fetch(server.createTurnPreviewUrl("unknown")!)).status).toBe(404);
+  });
+
   test("hydrates authenticated history pages and reports retryable failures without loading for HEAD or detail requests", async () => {
     const directory = createTemporaryDirectory();
     const snapshot: TurnViewState = { sessionId: "s", turnId: "historical", status: "completed", startedAt: 1,

@@ -56,7 +56,7 @@ import { classifyFileContent } from "../local-files/LocalFileViewerServer.js";
 import { errorLogValue } from "../logging/errorLogValue.js";
 import type { OutboundRouter } from "../presentation/OutboundRouter.js";
 import type { TurnActivity, TurnViewState } from "../presentation/turnViewTypes.js";
-import { hydrateTurnViewState } from "../presentation/TurnStateReducer.js";
+import { createTurnViewState, hydrateTurnViewState } from "../presentation/TurnStateReducer.js";
 import { buildTurnGraphRows } from "../presentation/turnGraph.js";
 import type { AgentRuntimeRegistry } from "../runtime/AgentRuntimeRegistry.js";
 import type {
@@ -93,6 +93,7 @@ import {
   type SessionRecord,
   type TurnAttemptRecord,
   type TurnAnchorRecord,
+  type TurnRuntimeOriginRecord,
 } from "../state/StateStore.js";
 import { createId } from "../utils/id.js";
 import { formatStorageSize } from "../utils/formatStorageSize.js";
@@ -6160,15 +6161,41 @@ export class ProxySessionController {
     const existing = this.turnDetailHydrations.get(turnId);
     if (existing) return existing;
     const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(turnId));
-    if (snapshot?.previewJournal && this.store.previews.has(turnId)) return this.store.previews.load(turnId);
-    if (!snapshot || !needsHistoricalDetails(snapshot)) return snapshot;
-    const hydration = this.hydrateTurnDetails(snapshot);
+    if ((!snapshot || snapshot.previewJournal) && this.store.previews.has(turnId)) return this.store.previews.load(turnId);
+    if (snapshot && !needsHistoricalDetails(snapshot)) return snapshot;
+    const origin = !snapshot ? this.store.getTurnRuntimeOrigin(turnId) : undefined;
+    if (!snapshot && (!origin || !this.runtimes.forAgent(origin.agentName).readRemoteTurn)) return undefined;
+    const hydration = snapshot ? this.hydrateTurnDetails(snapshot) : this.loadUnrecordedTurnPreview(origin!);
     this.turnDetailHydrations.set(turnId, hydration);
     try {
       return await hydration;
     } finally {
       if (this.turnDetailHydrations.get(turnId) === hydration) this.turnDetailHydrations.delete(turnId);
     }
+  }
+
+  private async loadUnrecordedTurnPreview(origin: TurnRuntimeOriginRecord): Promise<TurnViewState> {
+    const runtime = this.runtimes.forAgent(origin.agentName);
+    if (!runtime.readRemoteTurn) throw new Error("此 Agent 不支持读取历史执行详情。");
+    const details = await runtime.readRemoteTurn(origin.remoteSessionId, origin.turnId);
+    if (details.turnId !== origin.turnId) throw new Error("Agent 返回的轮次与请求不一致，请重试。");
+    let remote: RemoteSessionSummary | undefined;
+    try {
+      remote = await runtime.readRemoteSession?.(origin.remoteSessionId, "metadata");
+    } catch (error) {
+      this.logger.warn({ error, turnId: origin.turnId }, "Failed to read Preview task metadata; retaining full Turn details.");
+    }
+    // An Agent Bot turn may have arrived while the read-only request was in flight.
+    const latest = turnViewSnapshot(this.store.getTurnSnapshot(origin.turnId));
+    if (latest) return latest.previewJournal ? this.store.previews.load(origin.turnId) ?? latest : latest;
+    const state = hydrateTurnViewState(createTurnViewState(
+      origin.localSessionId, origin.turnId, details.startedAt ?? 0,
+      remote?.title, undefined, remote?.cwd, undefined, this.agentLabel(origin.agentName),
+    ), details);
+    // Viewing external work must not create a task, a chat binding or a pending final reply.
+    this.store.previews.seed(state);
+    this.store.previews.release(state.turnId);
+    return state;
   }
 
   private async hydrateTurnDetails(snapshot: TurnViewState): Promise<TurnViewState | undefined> {
@@ -7487,15 +7514,26 @@ export class ProxySessionController {
     const actions: TaskListCardAction[] = [
       statusRefreshAction(taskId, contextKey),
       ...taskActions,
-      ...this.statusPreviewActions(contextKey, activeTurnId ?? current?.lastTurnId),
+      ...this.statusPreviewActions(contextKey, activeTurnId ?? current?.lastTurnId, current?.remoteSessionId ? {
+        agentName: current.agentName, remoteSessionId: current.remoteSessionId, localSessionId: current.localSessionId,
+      } : undefined),
     ];
     const card = this.cardRenderer.renderSectionsCard(title, sections, actions);
     if (options.updateMessageId) await this.outbound.updateInteractiveCard(contextKey, options.updateMessageId, card);
     else await this.outbound.sendInteractiveCard(contextKey, card);
   }
 
-  private statusPreviewActions(contextKey: string, turnId?: string): TaskListCardAction[] {
-    if (!turnId) return [];
+  private statusPreviewActions(
+    contextKey: string,
+    turnId?: string,
+    source?: { agentName: string; remoteSessionId: string; localSessionId?: string },
+  ): TaskListCardAction[] {
+    if (!turnId || turnId.startsWith("pending_")) return [];
+    if (source && this.runtimes.forAgent(source.agentName).readRemoteTurn) {
+      this.store.saveTurnRuntimeOrigin(turnId,
+        source.localSessionId ?? remoteSessionReference(source.agentName, source.remoteSessionId),
+        source.agentName, source.remoteSessionId);
+    }
     const url = this.outbound.getTurnPreviewUrl(contextKey, turnId);
     return url ? [{ text: "Preview", value: {}, url }] : [];
   }
@@ -7556,7 +7594,7 @@ export class ProxySessionController {
         actionReference,
         contextKey,
       ),
-      ...this.statusPreviewActions(contextKey, remote.lastTurnId),
+      ...this.statusPreviewActions(contextKey, remote.lastTurnId, { agentName, remoteSessionId: remote.id }),
     ];
     const card = this.cardRenderer.renderSectionsCard(title, sections, actions);
     if (options.updateMessageId) await this.outbound.updateInteractiveCard(contextKey, options.updateMessageId, card);

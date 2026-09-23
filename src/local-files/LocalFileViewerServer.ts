@@ -410,13 +410,18 @@ export class LocalFileViewerServer {
       let snapshot = recorded
         ? journal!.load(turnId, detailKey ?? false)
         : this.options.getTurnSnapshot?.(turnId);
-      if (!recorded && isTurnPreviewState(snapshot) && this.options.loadTurnSnapshot && request.method !== "HEAD"
+      if (!recorded && this.options.loadTurnSnapshot && request.method !== "HEAD"
         && requestUrl.searchParams.get("events") !== "1" && !requestUrl.searchParams.has("detail")) {
         const saved = snapshot;
         try {
           snapshot = await this.options.loadTurnSnapshot(turnId);
         } catch (error) {
-          snapshot = { ...saved, historyDetailError: error instanceof Error ? error.message : String(error) };
+          const message = error instanceof Error ? error.message : String(error);
+          if (!isTurnPreviewState(saved)) {
+            this.sendHtml(response, 502, errorPage("历史执行详情读取失败", `${message} 刷新页面重试；任务状态未改变。`), false);
+            return;
+          }
+          snapshot = { ...saved, historyDetailError: message };
         }
       }
       if (!isTurnPreviewState(snapshot)) {

@@ -39,6 +39,7 @@ export interface TurnPresentationStore {
     contextKey?: string,
   ): void;
   getTurnSnapshot(turnId: string): unknown;
+  getTurnRuntimeOrigin?(turnId: string): { agentName: string; remoteSessionId: string } | undefined;
   getTurnContextKey?(turnId: string): string | undefined;
   saveTurnDelivery(turnId: string, patch: { progressMessageId?: string; lastCardHash?: string }): void;
   saveFinalDeliveryProgress(turnId: string, messageIds: string[]): void;
@@ -588,7 +589,7 @@ export class FeishuTurnPresenter {
     if (turnId.startsWith("pending_") || !this.options.turnPreviewUrl) return undefined;
     const state = this.entries.get(turnId)?.state ?? this.store.getTurnSnapshot(turnId);
     if (isTurnViewState(state) && state.turnId === turnId) return this.turnPreviewUrl(state);
-    return this.store.previews?.has(turnId)
+    return this.store.previews?.has(turnId) || this.store.getTurnRuntimeOrigin?.(turnId)
       ? this.options.turnPreviewUrl(turnId) : undefined;
   }
 

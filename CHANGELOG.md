@@ -8,6 +8,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Record and display each Turn's Provider alongside its model without relabeling historical Turns; simplify Preview token metadata while retaining underlying cache accounting.
 
+- Fix missing status-card Preview links for external tasks without local snapshots: load the selected historical Turn on demand, retain complete details in the Preview journal, and never bind, resume, or enqueue replies for the source task.
+
 - Eliminate per-event full Turn snapshot writes: append complete execution records to Profile-local hash-sharded JSONL, coalesce bounded SQLite card snapshots, and stream incremental Preview updates without truncating tool details or changing final-delivery ledgers. Bound and rate-limit invalid protocol-line diagnostics.
 
 - Use the leading content title as the Turn Preview reasoning header and show expanded text directly without redundant Summary/Content labels, preserving lazy loading, live updates, and existing thinking cards.

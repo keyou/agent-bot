@@ -42,6 +42,18 @@ function createFixture(delivered = false, renderer?: CardRenderer) {
 }
 
 describe("FeishuTurnPresenter", () => {
+  test("links known external Turn origins without inventing a snapshot and hides unknown or disabled previews", () => {
+    const { store, outbound } = createFixture();
+    const origins = { ...store, getTurnRuntimeOrigin: vi.fn((id: string) => id === "external" ? { agentName: "codex", remoteSessionId: "thread" } : undefined) };
+    const url = vi.fn((id: string) => `https://viewer.test/turn?turn=${id}`);
+    const presenter = new FeishuTurnPresenter(outbound, origins, undefined, { turnPreviewUrl: url });
+    expect(presenter.getTurnPreviewUrl("external")).toBe("https://viewer.test/turn?turn=external");
+    expect(presenter.getTurnPreviewUrl("unknown")).toBeUndefined();
+    expect(presenter.getTurnPreviewUrl("pending_external")).toBeUndefined();
+    expect(store.saveTurnSnapshot).not.toHaveBeenCalled();
+    expect(new FeishuTurnPresenter(outbound, origins).getTurnPreviewUrl("external")).toBeUndefined();
+  });
+
   test("provides the progress-card Preview URL only for available real Turn snapshots", async () => {
     const { outbound } = createFixture();
     const store = new MemoryStore();

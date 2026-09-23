@@ -10,6 +10,7 @@ import type {
 } from "../../src/codex/ThreadWriterProcess.js";
 import type { AppConfig } from "../../src/config/schema.js";
 import { generateGroupAvatarPng, resolveGroupAvatarProjectName } from "../../src/feishu/GroupAvatarGenerator.js";
+import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
 import { FeishuTurnPresenter } from "../../src/feishu/FeishuTurnPresenter.js";
 import type { FeishuOutbound, IncomingMessage } from "../../src/feishu/types.js";
 import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
@@ -8929,6 +8930,136 @@ describe("ProxySessionController", () => {
     expect(card).toContain("https://viewer.example/external_turn");
     expect(card).toContain(">Switch</font>");
     expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(currentId);
+  });
+
+  test.each(["unbound", "stored"] as const)("opens %s external history from status with the real Preview URL and no local snapshot", async (kind) => {
+    const { controller, outbound, presenter, runtime, remoteSessions, store } = fixture();
+    await controller.onMessage(message("current work"));
+    const currentId = store.getUserContext("chat_id:c1")!.currentSessionId;
+    const remote: RemoteSessionSummary = { id: "external_without_snapshot", cwd: process.cwd(), title: "External task", source: "vscode",
+      status: "not_loaded", model: "gpt-test", lastTurnId: "external_preview_turn", lastTurnStatus: "completed", finalResponse: "summary answer" };
+    remoteSessions.push(remote);
+    if (kind === "stored") {
+      store.createSession({ localSessionId: "stored_external", contextKey: "chat_id:other", agentName: "codex", cwd: remote.cwd, status: "ready" });
+      store.updateRuntimeSession("stored_external", { runtimeKind: "codex", remoteSessionId: remote.id, lastTurnId: remote.lastTurnId, lastTurnStatus: "completed" });
+    }
+    const originalSessions = store.listAllSessions();
+    const image = path.join(remote.cwd, "external.png");
+    const command = "echo " + "x".repeat(8000);
+    const output = "Full output " + "y".repeat(10000);
+    const read = runtime.readRemoteTurn = vi.fn(async () => ({
+      turnId: remote.lastTurnId!, status: "completed" as const, startedAt: 10, completedAt: 20, finalResponse: "Full external answer",
+      items: [
+        { kind: "message" as const, id: "u1", role: "user" as const, text: "External prompt", localImagePaths: [image] },
+        { kind: "tool" as const, tool: { id: "cmd", title: "Command", kind: "command", status: "completed" as const, command, output } },
+      ],
+    }));
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-external-preview-"));
+    tempDirs.push(directory);
+    const server = new LocalFileViewerServer({ host: "127.0.0.1", port: 0, stateDirectory: directory,
+      getTurnSnapshot: (id) => store.getTurnSnapshot(id), previewJournal: store.previews,
+      loadTurnSnapshot: (id) => controller.loadTurnDetails(id),
+    });
+    await server.start();
+    const actual = new FeishuTurnPresenter(outbound, store, undefined, { turnPreviewUrl: (id) => server.createTurnPreviewUrl(id) });
+    vi.mocked(presenter.getTurnPreviewUrl!).mockImplementation((id) => actual.getTurnPreviewUrl(id));
+    vi.mocked(runtime.resumeSession).mockClear();
+    vi.mocked(runtime.startTurn).mockClear();
+    vi.mocked(runtime.createSession).mockClear();
+    try {
+      expect(actual.getTurnPreviewUrl(remote.lastTurnId!)).toBeUndefined();
+      await controller.onMessage(message(`/status ${remote.id}`));
+      const card = JSON.stringify(vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1]);
+      const url = actual.getTurnPreviewUrl(remote.lastTurnId!)!;
+      expect(url).toContain("turn-preview/");
+      expect(card).toContain(JSON.stringify({ type: "open_url", default_url: url }));
+      expect(card).toContain(">Switch</font>");
+      expect(read).not.toHaveBeenCalled();
+      expect(store.getTurnSnapshot(remote.lastTurnId!)).toBeUndefined();
+      expect(store.previews.has(remote.lastTurnId!)).toBe(false);
+      expect(store.getTurnRuntimeOrigin(remote.lastTurnId!)).toMatchObject({ agentName: "codex", remoteSessionId: remote.id });
+      const response = await fetch(url);
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      expect(html).toContain("External prompt");
+      expect(html).toContain("Full external answer");
+      expect(read).toHaveBeenCalledExactlyOnceWith(remote.id, remote.lastTurnId);
+      const detail = new URL(url); detail.searchParams.set("detail", "tool:cmd");
+      const body = await (await fetch(detail)).json() as { content: string };
+      expect(body.content).toContain(output);
+      expect(body.content).toContain(command);
+      expect(store.previews.load(remote.lastTurnId!)?.promptImagePaths).toEqual([image]);
+      // Task metadata is current, not authoritative execution settings for a historical Turn.
+      expect(store.previews.load(remote.lastTurnId!)?.model).toBeUndefined();
+      await fetch(url);
+      expect(read).toHaveBeenCalledOnce();
+      expect(store.getTurnSnapshot(remote.lastTurnId!)).toBeUndefined();
+      expect(store.listUndeliveredCompletedTurns()).toEqual([]);
+      expect(store.getServerActivityState().pendingFinalDeliveries).toBe(0);
+      expect(store.listAllSessions()).toEqual(originalSessions);
+      expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(currentId);
+      expect(runtime.resumeSession).not.toHaveBeenCalled();
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+      expect(runtime.createSession).not.toHaveBeenCalled();
+    } finally { await server.close(); }
+  });
+
+  test("coalesces external Preview reads, retries errors and ignores unknown IDs", async () => {
+    const { controller, store, runtime } = fixture();
+    const read = runtime.readRemoteTurn = vi.fn();
+    expect(await controller.loadTurnDetails("unknown")).toBeUndefined();
+    expect(read).not.toHaveBeenCalled();
+    store.saveTurnRuntimeOrigin("external", "agent-runtime:codex:thread", "codex", "thread");
+    read.mockRejectedValueOnce(new Error("read failed"));
+    await expect(controller.loadTurnDetails("external")).rejects.toThrow("read failed");
+    expect(store.previews.has("external")).toBe(false);
+    expect(store.getTurnSnapshot("external")).toBeUndefined();
+    let complete!: (value: Awaited<ReturnType<NonNullable<AgentRuntime["readRemoteTurn"]>>>) => void;
+    read.mockImplementationOnce(() => new Promise((resolve) => { complete = resolve; }));
+    const first = controller.loadTurnDetails("external");
+    const second = controller.loadTurnDetails("external");
+    complete({ turnId: "external", status: "failed", error: "Agent failure", finalResponse: "", items: [] });
+    expect(await first).toMatchObject({ turnId: "external", status: "failed", error: "Agent failure" });
+    expect(await second).toEqual(await first);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(store.previews.has("external")).toBe(true);
+    expect(store.listAllSessions()).toEqual([]);
+    expect(store.listUndeliveredCompletedTurns()).toEqual([]);
+  });
+
+  test("rejects a mismatched external Turn without caching it", async () => {
+    const { controller, store, runtime } = fixture();
+    store.saveTurnRuntimeOrigin("external", "agent-runtime:codex:thread", "codex", "thread");
+    runtime.readRemoteTurn = vi.fn(async () => ({ turnId: "other", status: "completed" as const, finalResponse: "wrong turn", items: [] }));
+    await expect(controller.loadTurnDetails("external")).rejects.toThrow("轮次与请求不一致");
+    expect(store.previews.has("external")).toBe(false);
+    expect(store.previews.has("other")).toBe(false);
+    expect(store.listAllSessions()).toEqual([]);
+    expect(store.listUndeliveredCompletedTurns()).toEqual([]);
+  });
+
+  test("retains full external Turn details when task metadata cannot be read", async () => {
+    const { controller, store, runtime } = fixture();
+    store.saveTurnRuntimeOrigin("external", "agent-runtime:codex:thread", "codex", "thread");
+    runtime.readRemoteTurn = vi.fn(async () => ({ turnId: "external", status: "completed" as const, finalResponse: "full answer", items: [] }));
+    vi.mocked(runtime.readRemoteSession!).mockRejectedValue(new Error("metadata unavailable"));
+    expect(await controller.loadTurnDetails("external")).toMatchObject({ turnId: "external", status: "completed", finalResponse: "full answer" });
+    expect(store.previews.load("external")?.finalResponse).toBe("full answer");
+    expect(store.getTurnSnapshot("external")).toBeUndefined();
+    expect(store.listUndeliveredCompletedTurns()).toEqual([]);
+  });
+
+  test("does not replace a live snapshot that arrives during an external Preview read", async () => {
+    const { controller, store, runtime } = fixture();
+    store.saveTurnRuntimeOrigin("external", "s1", "codex", "thread");
+    const live = { ...createTurnViewState("s1", "external", 10), prompt: "Live task" };
+    runtime.readRemoteTurn = vi.fn(async () => {
+      store.saveTurnSnapshot("external", "s1", live);
+      return { turnId: "external", status: "completed" as const, finalResponse: "stale answer", items: [] };
+    });
+    expect(await controller.loadTurnDetails("external")).toEqual(JSON.parse(JSON.stringify(live)));
+    expect(store.previews.has("external")).toBe(false);
+    expect(store.getTurnSnapshot("external")).toEqual(JSON.parse(JSON.stringify(live)));
   });
 
   test("shows Stop on the current running task status card", async () => {
