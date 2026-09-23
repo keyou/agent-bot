@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.4] - 2026-09-23
+
 ### 中文
 
 - 群名删除自动前缀或改成其他格式后，仍同步当前任务标题；可识别的原格式继续提取标题，不影响话题、历史任务或新建群命名。
