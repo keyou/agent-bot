@@ -110,11 +110,15 @@ These commands export only user Prompts and final answers through the latest com
 
 Feishu `/sessions [keyword]` lists and searches tasks across projects and all Providers, not just the App Server's current Provider. Switching Provider does not hide existing tasks; listing still uses paged metadata and the latest Turn summary only.
 
+Feishu group renames update only the group's currently bound task title, not topic or historical tasks. Users may remove generated prefixes or use another format: recognized configured names or matching Agent prefixes yield the task title, otherwise the normalized complete group name is used. A renamed prefix does not change the task's Agent. New-group naming rules are unchanged.
+
 Fork creation stores source-task and branch-Turn references without synchronizing the full local Turn list. The Feishu Turn card reuses local records and loads only the summary pages needed for the requested page, not the entire history. `task turns` loads the first page if necessary and returns available local records. This does not change the Agent's inherited context. Retry listing Turns after a temporary history-read failure; unsupported summary pagination never falls back to downloading full history.
 
 If a TraeX task stops producing output, check its progress card for a pending plan-mode confirmation. `Approve Plan` / `Enter Plan Mode`, `Reject`, and `Cancel Request` require the user's explicit choice, even with automatic permissions. Preview displays the plan but cannot approve it. Cancelling a request does not itself stop the task; waiting turns still block safe restart. Never approve, stop, or force-restart merely to clear that wait. Notifications dropped by an older running version are not automatically replayed after upgrading.
 
 ## Change Settings
+
+Feishu slash commands accept unique prefixes: `/mo`, `/mod`, and `/mode` open the `/model` settings card and do not accept arguments. This is model selection, not an Agent mode switch. CLI `task model [model]` keeps its documented argument behavior.
 
 ```powershell
 agentbot task agent [name]

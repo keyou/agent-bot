@@ -274,6 +274,10 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 | `/mute [on\|off]`                            | Require @ mentions in the current group |
 | `/help`                                       | Show command help                    |
 
+Slash commands accept unique prefixes: `/mo`, `/mod`, and `/mode` all open the `/model` settings card. Arguments follow the matched command's rules; ambiguous prefixes require more characters, and unknown commands are never sent to the Agent as Prompts.
+
+Renaming a Feishu group updates its currently bound task title, even when you remove the generated prefixes or use a different format. Recognized configured names or matching Agent prefixes still supply just the task title; otherwise the complete new group name is used with normal title whitespace and length normalization. This does not switch the task's Agent, rename topic or historical tasks, or change the naming format for new groups. Empty names and groups without an open current task are ignored.
+
 Private chats, group timelines, and topics keep separate current tasks. A new topic remains unbound while you use commands such as `/help`, `/status`, or `/sessions`; those commands do not create a hidden fork. Its first ordinary message forks from the mapped source turn, or starts a fresh task when no source turn can be identified. `/new` starts a fresh topic task, while `/sessions` can bind an existing task. Commands that require a current task explain how to bind one instead of operating on the parent conversation. Ordinary messages sent while a task is running add instructions to that turn; use `/queue` when the message should run afterward as a separate turn.
 
 `/release` sends a card for releasing the shared App Server used by the current task's Agent so its tasks can be opened in Codex Desktop. The card lists blocking task names and keeps them updated. Agent Bot never releases automatically: click **Release** when idle, or **Release Now** to interrupt active work and clear queued Prompts. **Cancel** cancels the pending release. Releasing does not archive or delete task history, but it affects every task loaded by that shared App Server.
@@ -348,7 +352,9 @@ Local images in Turn Preview Prompts, Commentary, and results load through signe
 
 Attached images from initial and appended user messages are saved with the Turn snapshot and displayed through signed file URLs, including SSE updates and reopening after a restart. Missing cached files show an unavailable placeholder. Older snapshots that never recorded attachment paths cannot restore those images automatically.
 
-Turn Preview shows the model and Provider recorded for each Turn. Changing settings affects subsequent Turns, not the running Turn or earlier Turns. Older snapshots without a recorded Provider leave it hidden rather than using the task's current settings.
+The Turn Preview header shows **Processing** during both normal processing and tool execution; tool details and other status labels are unchanged.
+
+Turn Preview shows the Provider before the model recorded for each Turn, without a visible Provider prefix. Changing settings affects subsequent Turns, not the running Turn or earlier Turns. Older snapshots without a recorded Provider leave it hidden rather than using the task's current settings.
 
 When reported by the Agent, Turn Preview shows this Turn's total tokens (input plus output, including cached input) alongside the existing non-cached count. The separate cache-hit token count is hidden; underlying token accounting is unchanged. Values update live, use compact units, and show exact counts on hover. Duplicate usage notifications are not counted twice. Missing breakdowns and older snapshots are not estimated or backfilled from task history; Feishu card token counts keep their existing calculation.
 

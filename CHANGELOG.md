@@ -6,6 +6,20 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 中文
+
+- 群名删除自动前缀或改成其他格式后，仍同步当前任务标题；可识别的原格式继续提取标题，不影响话题、历史任务或新建群命名。
+- 移除旧 `/mode` 命令拦截及无调用方的 ACP 模式逻辑，`/mode` 按唯一前缀规则打开 `/model` 设置卡片。
+- Turn Preview 工具执行期间统一显示“正在处理”，其他状态和工具详情保持不变。
+- Turn Preview 顶部将 Provider 放在模型前面，移除可见的 `Provider:` 前缀。
+
+### English
+
+- Allow group renames without generated prefixes or a matching name format to update the current task title, while retaining title extraction for recognized names.
+- Remove obsolete mode-command interception and unused ACP mode handling so `/mode` resolves to `/model` through normal unique-prefix matching.
+- Keep the Turn Preview header at Processing during tool execution without changing tool details or other status labels.
+- Show the recorded Provider before the model in Turn Preview metadata without a visible Provider prefix.
+
 ## [0.1.24-alpha.3] - 2026-09-23
 
 ### 中文
