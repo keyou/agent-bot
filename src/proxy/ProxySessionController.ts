@@ -6039,10 +6039,12 @@ export class ProxySessionController {
     const legacyTitle = legacy && record.agentName.toLowerCase() === legacy.agentName.toLowerCase()
       ? legacy.title
       : undefined;
-    if (isDefaultGroupNameFormat(nameFormat) && isLegacyGroupPrefixOnly(event.afterName)) return;
-    const title = normalizeTaskTitle(isDefaultGroupNameFormat(nameFormat)
+    const defaultFormat = isDefaultGroupNameFormat(nameFormat);
+    let parsedTitle = defaultFormat
       ? legacyTitle ?? templateTitle
-      : templateTitle ?? legacyTitle);
+      : templateTitle ?? legacyTitle;
+    if (defaultFormat && isLegacyGroupPrefixOnly(event.afterName)) parsedTitle = undefined;
+    const title = normalizeTaskTitle(parsedTitle) ?? normalizeTaskTitle(event.afterName);
     if (!title || title === record.title) return;
 
     const loaded = await this.loadSession(record);

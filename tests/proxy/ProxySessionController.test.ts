@@ -6129,7 +6129,12 @@ describe("ProxySessionController", () => {
     expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "已将当前任务标题修改为：修复会话列表时间");
   });
 
-  test("renames the current task from a custom group name format", async () => {
+  test.each([
+    ["No project · codex · custom title", "custom title"],
+    ["custom title", "custom title"],
+    ["完全自定义的群名 🧪", "完全自定义的群名 🧪"],
+    ["No project · different-agent · custom title", "No project · different-agent · custom title"],
+  ])("renames a task with a custom group format from %s", async (afterName, expectedTitle) => {
     const { controller, runtime, store, config } = fixture();
     config.feishu.groupNameFormat = {
       project: "Project {project} · {agent} · {taskname}",
@@ -6142,11 +6147,11 @@ describe("ProxySessionController", () => {
     await controller.onChatUpdated({
       chatId: "rename_custom_group",
       beforeName: "No project · codex · old title",
-      afterName: "No project · codex · custom title",
+      afterName,
     });
 
-    expect(runtime.setTitle).toHaveBeenCalledWith(sessionId, "custom title");
-    expect(store.getSession(sessionId)?.title).toBe("custom title");
+    expect(runtime.setTitle).toHaveBeenCalledWith(sessionId, expectedTitle);
+    expect(store.getSession(sessionId)?.title).toBe(expectedTitle);
   });
 
   test("renames the group-bound current task when the Feishu group name changes", async () => {
@@ -6182,22 +6187,53 @@ describe("ProxySessionController", () => {
     expect(store.getSession(sessionId)?.title).toBe("legacy title");
   });
 
-  test("ignores a group name containing only agent and project prefixes", async () => {
-    const { controller, runtime, store } = fixture();
-    await controller.onMessage(groupMessage("rename_prefix_only", "current title"));
-    const sessionId = store.getUserContext("chat_id:rename_prefix_only")!.currentSessionId!;
+  test.each([
+    ["新的任务名", "新的任务名"],
+    ["  新的   任务名  ", "新的 任务名"],
+    ["[项目] 新的任务名", "[项目] 新的任务名"],
+    ["[acp] 新的任务名", "[acp] 新的任务名"],
+    ["[codex]", "[codex]"],
+    ["[codex] [项目]", "[codex] [项目]"],
+    ["[其他] [项目]", "[其他] [项目]"],
+    ["[Codex] 保留前缀", "保留前缀"],
+    ["[Codex] [项目] 保留前缀", "保留前缀"],
+  ])("renames a task from group name %s without requiring a format", async (afterName, expectedTitle) => {
+    const { controller, runtime, store, presenter, outbound } = fixture();
+    await controller.onMessage(groupMessage("rename_freeform", "current title"));
+    const sessionId = store.getUserContext("chat_id:rename_freeform")!.currentSessionId!;
+    const sentMessageCount = vi.mocked(outbound.sendText).mock.calls.length;
 
     await controller.onChatUpdated({
-      chatId: "rename_prefix_only",
-      beforeName: "[codex] [dev\\agent-bot] current title",
-      afterName: "[codex] [dev\\agent-bot]",
+      chatId: "rename_freeform",
+      beforeName: "[codex] [项目] current title",
+      afterName,
     });
 
-    expect(runtime.setTitle).not.toHaveBeenCalled();
-    expect(store.getSession(sessionId)?.title).toBe("current title");
+    expect(runtime.setTitle).toHaveBeenCalledWith(sessionId, expectedTitle);
+    expect(store.getSession(sessionId)?.title).toBe(expectedTitle);
+    expect(store.getSession(sessionId)?.agentName).toBe("codex");
+    expect(presenter.updateSessionTitle).toHaveBeenCalledWith(sessionId, expectedTitle);
+    expect(outbound.sendText).toHaveBeenCalledTimes(sentMessageCount);
   });
 
-  test("ignores group names that do not match the current task agent or have no bound task", async () => {
+  test.each([false, true])("renames a project-bound task after removing its group name prefixes (custom format: %s)", async (customFormat) => {
+    const { controller, runtime, store, config } = fixture();
+    if (customFormat) config.feishu.groupNameFormat = {
+      project: "{agent} · {project} · {taskname}",
+      projectless: "{agent} · {taskname}",
+      dateFormat: "MM-dd",
+    };
+    await controller.onMessage(groupMessage("rename_project", `/new old title --dir "${process.cwd()}"`));
+    const sessionId = store.getUserContext("chat_id:rename_project")!.currentSessionId!;
+
+    await controller.onChatUpdated({ chatId: "rename_project", afterName: "无前缀新标题" });
+
+    expect(runtime.setTitle).toHaveBeenCalledWith(sessionId, "无前缀新标题");
+    expect(store.getSession(sessionId)?.title).toBe("无前缀新标题");
+    expect(store.getSession(sessionId)?.cwd).toBe(process.cwd());
+  });
+
+  test("ignores group renames with no bound task, a closed task, an empty title or an unchanged title", async () => {
     const { controller, runtime, store } = fixture();
     await controller.onMessage(groupMessage("rename_guard", "current title"));
     const sessionId = store.getUserContext("chat_id:rename_guard")!.currentSessionId!;
@@ -6205,26 +6241,42 @@ describe("ProxySessionController", () => {
     await controller.onChatUpdated({
       chatId: "rename_guard",
       beforeName: "[codex] current title",
-      afterName: "[acp] should not apply",
-    });
-    await controller.onChatUpdated({
-      chatId: "rename_guard",
-      beforeName: "[acp] should not apply",
-      afterName: "missing agent prefix",
+      afterName: "   ",
     });
     await controller.onChatUpdated({
       chatId: "empty_group",
       beforeName: "[codex] old",
-      afterName: "[codex] no task",
+      afterName: "no task",
     });
     await controller.onChatUpdated({
       chatId: "rename_guard",
       beforeName: "[codex] anything",
-      afterName: "[codex] current title",
+      afterName: "current title",
     });
+    await controller.onChatUpdated({ chatId: "rename_guard", afterName: "[codex] current title" });
+    store.createSession({ localSessionId: "closed-rename", contextKey: "chat_id:rename_guard", agentName: "codex", cwd: process.cwd(), status: "closed" });
+    store.setCurrentSession("chat_id:rename_guard", "closed-rename");
+    await controller.onChatUpdated({ chatId: "rename_guard", afterName: "closed task name" });
 
     expect(runtime.setTitle).not.toHaveBeenCalled();
     expect(store.getSession(sessionId)?.title).toBe("current title");
+  });
+
+  test("group renames without prefixes affect only the current group task, not topics or history", async () => {
+    const { controller, runtime, store } = fixture();
+    await controller.onMessage(groupMessage("rename_scope", "/new old task"));
+    const oldId = store.getUserContext("chat_id:rename_scope")!.currentSessionId!;
+    await controller.onMessage(groupMessage("rename_scope", "/new current task"));
+    const currentId = store.getUserContext("chat_id:rename_scope")!.currentSessionId!;
+    await controller.onMessage(threadMessage("rename_scope", "group", "topic", "root", "/new topic task"));
+    const topicId = store.getUserContext("chat_id:rename_scope:thread_id:topic")!.currentSessionId!;
+
+    await controller.onChatUpdated({ chatId: "rename_scope", afterName: "新群名" });
+
+    expect(runtime.setTitle).toHaveBeenCalledExactlyOnceWith(currentId, "新群名");
+    expect(store.getSession(currentId)?.title).toBe("新群名");
+    expect(store.getSession(oldId)?.title).toBe("old task");
+    expect(store.getSession(topicId)?.title).toBe("topic task");
   });
 
   test("rejects title changes when there is no current task", async () => {
