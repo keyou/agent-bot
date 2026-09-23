@@ -6,6 +6,22 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.3] - 2026-09-23
+
+### 中文
+
+- Turn Preview 改用按 Profile 隔离的追加执行日志，合并数据库卡片快照写入；实时更新只传输变化内容，折叠块按需加载完整详情，保留旧历史和最终回复投递保护。备份时需同时保留数据库与 turn-previews 目录。
+- 修复外部任务没有本地快照时状态卡片缺少 Preview 的问题；首次打开仅按需读取所选轮次并缓存，失败可重试，不绑定、恢复或接管源任务。
+- 每轮记录并显示模型与 Provider，切换只影响后续轮次；精简 Token 元数据展示，底层缓存统计不变。
+- Preview 保留完整思考摘要与内容，直接以内容标题作为折叠标题；修复等待提示、连续省略标记和展开滚动条造成的布局位移。
+- Preview 增加 Mermaid 图表、常见语言代码高亮、用户消息附件图片及移动端图表适配；局部更新保留展开状态、滚动位置和未变化图片。
+- /mute 群被 @ 时补充近期同群或同话题的文字、图片，到首条已提交当前会话的消息即停止；保留范围限制、去重和读取失败提示。
+- 任务卡片增加 SwitchGroup、Turns 与状态 Preview；支持同任务新群绑定及只读轮次浏览，不 fork、不打断或切换源任务。
+- 新增 /update，展示中文优先的正式版和 Alpha 更新介绍，所有者可选择准确版本更新，复用安全激活与回滚，不自动安装、不允许降级。
+- 对非 JSON 协议输出限制诊断长度并限流，避免重复写入大段日志。
+
+### English
+
 - Record and display each Turn's Provider alongside its model without relabeling historical Turns; simplify Preview token metadata while retaining underlying cache accounting.
 
 - Fix missing status-card Preview links for external tasks without local snapshots: load the selected historical Turn on demand, retain complete details in the Preview journal, and never bind, resume, or enqueue replies for the source task.
