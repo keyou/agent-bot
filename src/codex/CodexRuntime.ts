@@ -138,6 +138,10 @@ export class CodexRuntime implements AgentRuntime {
     return this.sessions.get(localSessionId);
   }
 
+  forgetSession(localSessionId: string): void {
+    this.sessions.delete(localSessionId);
+  }
+
   getProcessInfo(): AgentProcessInfo {
     return this.provider.getProcessInfo?.() ?? {};
   }
@@ -294,7 +298,9 @@ export class CodexRuntime implements AgentRuntime {
         return listed;
       }
     }));
-    const activeThreads = await this.localActivityDetector?.activeThreads(sessions.map((session) => session.id));
+    const activeThreads = await this.localActivityDetector?.activeThreads(
+      sessions.filter((session) => session.status === "not_loaded").map((session) => session.id),
+    );
     return {
       sessions: activeThreads
         ? sessions.map((session) => markLocallyDetectedActive(session, activeThreads))
@@ -499,7 +505,8 @@ export class CodexRuntime implements AgentRuntime {
     remoteSessionId: string,
     summary: RemoteSessionSummary,
   ): Promise<RemoteSessionSummary> {
-    const activeThreads = await this.localActivityDetector?.activeThreads([remoteSessionId]);
+    const activeThreads = summary.status === "not_loaded"
+      ? await this.localActivityDetector?.activeThreads([remoteSessionId]) : undefined;
     const activeSummary = activeThreads ? markLocallyDetectedActive(summary, activeThreads) : summary;
     const settings = await this.localActivityDetector?.threadSettings([remoteSessionId]);
     return {
@@ -571,24 +578,22 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async inspectRemoteSessionActivity(remoteSessionId: string): Promise<RemoteSessionActivity> {
-    const [response, activeThreads] = await Promise.all([
-      (await this.client()).request<ThreadReadResponse>(
-        "thread/read",
-        { threadId: remoteSessionId, includeTurns: false },
-        SYNC_REQUEST_TIMEOUT_MS,
-      ),
-      this.localActivityDetector?.activeThreads([remoteSessionId]),
-    ]);
+    const response = await (await this.client()).request<ThreadReadResponse>(
+      "thread/read", { threadId: remoteSessionId, includeTurns: false }, SYNC_REQUEST_TIMEOUT_MS,
+    );
+    const status = remoteThreadStatus(response.thread.status?.type);
+    const activeThreads = status === "not_loaded"
+      ? await this.localActivityDetector?.activeThreads([remoteSessionId]) : undefined;
     const runtimeSession = [...this.sessions.values()]
       .find((session) => session.remoteSessionId === remoteSessionId);
     const detectedTurnId = activeThreads?.get(remoteSessionId);
-    const active = remoteThreadStatus(response.thread.status?.type) === "active"
-      || Boolean(runtimeSession?.activeTurnId)
-      || Boolean(activeThreads?.has(remoteSessionId));
+    // A turn started in this process is evidence; a restored activeTurnId alone is not.
+    const active = status === "active" || Boolean(activeThreads?.has(remoteSessionId))
+      || Boolean(runtimeSession?.activeTurnId && runtimeSession.activeTurnStartedAt !== undefined);
     const activeTurnId = detectedTurnId ?? runtimeSession?.activeTurnId;
     return {
       active,
-      ...(activeTurnId ? { activeTurnId } : {}),
+      ...(active && activeTurnId ? { activeTurnId } : {}),
     };
   }
 
@@ -1435,7 +1440,9 @@ export class CodexRuntime implements AgentRuntime {
     }
     if (latestInProgress) {
       this.supersedeTurn(session, activeTurnId);
-      this.adoptTurn(session, latestInProgress.id, turnStartedAt(latestInProgress));
+      if (thread.status?.type === "active") {
+        this.adoptTurn(session, latestInProgress.id, turnStartedAt(latestInProgress));
+      }
       return;
     }
 

@@ -193,6 +193,7 @@ const REMOTE_TURN_HISTORY_REFRESH_INTERVAL_MS = 30_000;
 const MAX_LLM_TURN_RETRIES = 3;
 const QUEUED_PROMPT_RETRY_DELAY_MS = 5_000;
 const RECOVERY_ACTIVITY_WINDOW_MS = 10 * 60 * 1_000;
+const RECOVERY_RETRY_WINDOW_MS = 60_000;
 const RECOVERY_HEARTBEAT_INTERVAL_MS = 60 * 1_000;
 const SHELL_COMMAND_JOB_POLL_INTERVAL_MS = 1_000;
 const SHELL_COMMAND_JOB_RELAUNCH_DELAY_MS = 5_000;
@@ -554,6 +555,9 @@ export class ProxySessionController {
   private readonly retriedFailureTurnIds = new Set<string>();
   private readonly queuedPromptRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly recoveryRetryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly recoveryRetryStartedAt = new Map<string, number>();
+  private readonly recoveredLiveAttempts = new Set<string>();
+  private recoveryClosed = false;
   private readonly pendingMergedForwards = new Map<string, PendingForwardAttachment>();
   private readonly pendingResourceForwards = new Map<string, PendingForwardAttachment>();
   private readonly relatedReactionMessageIds = new Map<string, string[]>();
@@ -1353,6 +1357,7 @@ export class ProxySessionController {
   }
 
   close(): void {
+    this.recoveryClosed = true;
     for (const unsubscribe of this.unsubscribe) unsubscribe();
     this.unsubscribe.length = 0;
     this.lastSessionListings.clear();
@@ -1372,6 +1377,8 @@ export class ProxySessionController {
     this.queuedPromptRetryTimers.clear();
     for (const timer of this.recoveryRetryTimers.values()) clearTimeout(timer);
     this.recoveryRetryTimers.clear();
+    this.recoveryRetryStartedAt.clear();
+    this.recoveredLiveAttempts.clear();
     for (const schedule of this.appServerReleaseSchedules.values()) {
       if (schedule.timer) clearTimeout(schedule.timer);
     }
@@ -2294,14 +2301,13 @@ export class ProxySessionController {
         continue;
       }
       if (!this.outbound.canRoute(attempt.contextKey)) continue;
+      this.recoveryRetryStartedAt.set(attempt.attemptId, Date.now());
       try {
         await this.recoverTurnAttempt(attempt);
       } catch (error) {
-        this.logger.error(
-          { error, attemptId: attempt.attemptId, sessionId: attempt.localSessionId },
-          "Failed to recover an unfinished task; it will be retried while the server is running.",
-        );
-        this.scheduleRecoveryRetry(attempt.attemptId);
+        await this.handleRecoveryError(attempt.attemptId, error);
+      } finally {
+        if (!this.recoveryRetryTimers.has(attempt.attemptId)) this.recoveryRetryStartedAt.delete(attempt.attemptId);
       }
     }
     this.restorePersistedQueuedPrompts();
@@ -2394,15 +2400,23 @@ export class ProxySessionController {
     }
   }
 
-  private async expireStaleTurnAttempt(attempt: TurnAttemptRecord): Promise<void> {
-    const session = this.store.getSession(attempt.localSessionId);
+  private async expireStaleTurnAttempt(
+    attempt: TurnAttemptRecord,
+    message = "执行中断已超过 10 分钟，未自动恢复。",
+  ): Promise<void> {
+    clearTimeout(this.recoveryRetryTimers.get(attempt.attemptId));
+    this.recoveryRetryTimers.delete(attempt.attemptId);
+    this.recoveryRetryStartedAt.delete(attempt.attemptId);
+    this.recoveredLiveAttempts.delete(attempt.attemptId);
+    let session = this.store.getSession(attempt.localSessionId);
+    this.store.updateTurnAttempt(attempt.attemptId, { status: "interrupted" });
     const oldCardTurnId = attempt.pendingTurnId ?? attempt.turnId;
     if (session && oldCardTurnId && this.outbound.canRoute(attempt.contextKey)) {
       await this.outbound.interruptTurnForRecovery(
         session.localSessionId,
         attempt.contextKey,
         oldCardTurnId,
-        "执行中断已超过 10 分钟，未自动恢复。",
+        message,
       ).catch((error: unknown) => {
         this.logger.warn(
           { error, attemptId: attempt.attemptId, turnId: oldCardTurnId },
@@ -2410,13 +2424,21 @@ export class ProxySessionController {
         );
       });
     }
-    this.store.updateTurnAttempt(attempt.attemptId, { status: "interrupted" });
+    session = this.store.getSession(attempt.localSessionId);
     if (!session || session.status === "closed") return;
-    if (attempt.turnId && session.lastTurnId === attempt.turnId) {
+    const runtime = this.runtimes.forAgent(session.agentName);
+    const activeTurnId = runtime.getSession(session.localSessionId)?.activeTurnId;
+    const sameTurn = session.lastTurnId === attempt.turnId
+      || session.lastTurnId === attempt.recoveredFromTurnId
+      || !session.lastTurnId;
+    if (sameTurn && session.lastTurnStatus !== "completed" && session.lastTurnStatus !== "failed"
+      && (!activeTurnId || activeTurnId === attempt.turnId)) {
+      // Forget monitoring, not the remote task. Never cancel an unknown writer.
+      if (activeTurnId) runtime.forgetSession?.(session.localSessionId);
       this.store.updateRuntimeSession(session.localSessionId, { lastTurnStatus: "cancelled" });
-    }
-    if (session.status === "starting" || session.status === "running") {
-      this.store.updateSession(session.localSessionId, { status: "ready" });
+      if (session.status === "starting" || session.status === "running") {
+        this.store.updateSession(session.localSessionId, { status: "ready" });
+      }
     }
     if (attempt.turnId && this.outbound.canRoute(attempt.contextKey)) {
       await this.finalizeTurnMessageReactions(attempt.turnId, "cancelled").catch((error: unknown) => {
@@ -2426,6 +2448,44 @@ export class ProxySessionController {
         );
       });
     }
+  }
+
+  private async handleRecoveryError(attemptId: string, error: unknown, activeTurnId?: string): Promise<void> {
+    if (this.recoveryClosed) return;
+    const attempt = this.store.getTurnAttempt(attemptId);
+    if (!attempt || !isIncompleteTurnAttemptStatus(attempt.status)) return;
+    this.logger.warn({ error, attemptId, sessionId: attempt.localSessionId }, "Task recovery failed.");
+    const session = this.store.getSession(attempt.localSessionId);
+    const writerConflict = session?.remoteSessionId === activeWriterThreadId(error) && Boolean(session?.remoteSessionId);
+    const startedAt = this.recoveryRetryStartedAt.get(attemptId) ?? Date.now();
+    this.recoveryRetryStartedAt.set(attemptId, startedAt);
+    const localActiveTurnId = session ? this.runtimes.forAgent(session.agentName).getSession(session.localSessionId)?.activeTurnId : undefined;
+    const monitoredTurnId = activeTurnId ?? (localActiveTurnId === attempt.turnId ? localActiveTurnId : undefined);
+    // Once a live turn was confirmed, a monitoring outage must not make safe restart
+    // consider it idle. Keep reconciling without cancelling or replaying the prompt.
+    if (monitoredTurnId && this.recoveredLiveAttempts.has(attemptId) && !writerConflict) {
+      this.scheduleRecoveryRetry(attemptId, monitoredTurnId);
+      return;
+    }
+    if (writerConflict || error instanceof CodexVersionError || Date.now() - startedAt >= RECOVERY_RETRY_WINDOW_MS) {
+      const message = writerConflict
+        ? "自动恢复未完成：任务仍被另一个 App Server 占用。已停止自动重试，请确认占用进程后释放任务再继续。"
+        : `自动恢复未完成，已停止自动重试。请检查 Agent 状态后重新发送消息。\n${error instanceof Error ? error.message : String(error)}`;
+      await this.expireStaleTurnAttempt(attempt, message);
+      try {
+        const replyTarget = attempt.replyMessageId
+          ? { messageId: attempt.replyMessageId, replyInThread: true as const } : undefined;
+        await this.outbound.withReplyTarget(attempt.contextKey, replyTarget, async () => {
+          await this.outbound.sendText(attempt.contextKey, message);
+          if (writerConflict && session) await this.presentThreadWriterConflict(session, attempt.contextKey, error, false);
+        });
+      } catch (notificationError) {
+        this.logger.warn({ error: notificationError, attemptId }, "Failed to notify about stopped task recovery.");
+      }
+      return;
+    }
+    this.store.updateTurnAttempt(attemptId, { status: "recovering" });
+    this.scheduleRecoveryRetry(attemptId, monitoredTurnId);
   }
 
   private persistActiveTurnHeartbeats(): void {
@@ -2439,6 +2499,7 @@ export class ProxySessionController {
   }
 
   private async recoverTurnAttempt(attempt: TurnAttemptRecord, announce = true): Promise<void> {
+    if (this.recoveryClosed) return;
     const session = this.store.getSession(attempt.localSessionId);
     if (!session || session.status === "closed") {
       this.store.updateTurnAttempt(attempt.attemptId, { status: "interrupted" });
@@ -2481,11 +2542,8 @@ export class ProxySessionController {
       try {
         remote = await runtime.readRemoteSession(session.remoteSessionId);
       } catch (error) {
-        if (error instanceof CodexVersionError) throw error;
-        this.logger.warn(
-          { error, attemptId: attempt.attemptId, remoteSessionId: session.remoteSessionId },
-          "Failed to read the remote task during startup recovery; treating the old local execution as interrupted.",
-        );
+        // A failed activity check is not proof of interruption. Do not replay a prompt blindly.
+        if (sourceTurnId || !isUnmaterializedCodexThreadError(error)) throw error;
       }
     }
     const remoteTurnBelongsToAttempt = remoteTurnMatchesAttempt(remote, attempt);
@@ -2538,12 +2596,20 @@ export class ProxySessionController {
   }
 
   private scheduleRecoveryRetry(attemptId: string, activeTurnId?: string): void {
-    if (this.recoveryRetryTimers.has(attemptId)) return;
+    if (this.recoveryClosed || this.recoveryRetryTimers.has(attemptId)) return;
+    if (!this.recoveryRetryStartedAt.has(attemptId)) this.recoveryRetryStartedAt.set(attemptId, Date.now());
     const timer = setTimeout(() => {
       this.recoveryRetryTimers.delete(attemptId);
       const attempt = this.store.getTurnAttempt(attemptId);
-      if (!attempt || !isIncompleteTurnAttemptStatus(attempt.status)) return;
+      if (!attempt || !isIncompleteTurnAttemptStatus(attempt.status)) {
+        this.recoveryRetryStartedAt.delete(attemptId);
+        this.recoveredLiveAttempts.delete(attemptId);
+        return;
+      }
       const retry = async (): Promise<void> => {
+        if (!activeTurnId && Date.now() - this.recoveryRetryStartedAt.get(attemptId)! >= RECOVERY_RETRY_WINDOW_MS) {
+          throw new Error("等待恢复超过 1 分钟，尚未确认执行已恢复。");
+        }
         let recoveryAttempt = attempt;
         if (activeTurnId) {
           const session = this.store.getSession(attempt.localSessionId);
@@ -2551,6 +2617,8 @@ export class ProxySessionController {
             const runtime = this.runtimes.forAgent(session.agentName);
             const synchronized = await runtime.synchronizeSession(session.localSessionId);
             if (synchronized.activeTurnId === activeTurnId) {
+              this.recoveredLiveAttempts.add(attemptId);
+              this.recoveryRetryStartedAt.delete(attemptId);
               this.scheduleRecoveryRetry(attemptId, activeTurnId);
               return;
             }
@@ -2560,13 +2628,12 @@ export class ProxySessionController {
           }
         }
         await this.recoverTurnAttempt(recoveryAttempt, false);
+        if (!this.recoveryRetryTimers.has(attemptId)) this.recoveryRetryStartedAt.delete(attemptId);
       };
       void retry().catch((error: unknown) => {
-        this.logger.warn(
-          { error, attemptId, sessionId: attempt.localSessionId },
-          "Failed to retry an unfinished task recovery.",
-        );
-        this.scheduleRecoveryRetry(attemptId, activeTurnId);
+        return this.handleRecoveryError(attemptId, error, activeTurnId);
+      }).catch((error: unknown) => {
+        this.logger.error({ error, attemptId }, "Failed to finalize task recovery.");
       });
     }, 5_000);
     timer.unref?.();
@@ -2579,6 +2646,13 @@ export class ProxySessionController {
     turnId: string,
     replyTarget?: MessageReplyTarget,
   ): Promise<void> {
+    // Confirm resume before replacing the old card or announcing a running turn.
+    const current = this.store.getSession(session.localSessionId) ?? session;
+    const loaded = await this.loadSession({
+      ...current, contextKey: attempt.contextKey, status: "running", lastTurnId: turnId, lastTurnStatus: "running",
+    });
+    const pendingAttempt = this.store.getTurnAttempt(attempt.attemptId);
+    if (!pendingAttempt || !isIncompleteTurnAttemptStatus(pendingAttempt.status)) return;
     const oldCardTurnId = attempt.pendingTurnId ?? attempt.turnId;
     if (oldCardTurnId) {
       await this.outbound.interruptTurnForRecovery(
@@ -2607,16 +2681,12 @@ export class ProxySessionController {
       startedAt: Date.now(),
     });
     this.store.updateTurnAttempt(attempt.attemptId, { pendingTurnId: null });
-    const current = this.store.getSession(session.localSessionId) ?? session;
-    const loaded = await this.loadSession({
-      ...current,
-      contextKey: attempt.contextKey,
-      status: "running",
-      lastTurnId: turnId,
-      lastTurnStatus: "running",
-    });
     const synchronized = await loaded.runtime.synchronizeSession(session.localSessionId);
-    if (synchronized.activeTurnId) this.scheduleRecoveryRetry(attempt.attemptId, synchronized.activeTurnId);
+    this.recoveryRetryStartedAt.delete(attempt.attemptId);
+    if (synchronized.activeTurnId) {
+      this.recoveredLiveAttempts.add(attempt.attemptId);
+      this.scheduleRecoveryRetry(attempt.attemptId, synchronized.activeTurnId);
+    }
   }
 
   private async continueInterruptedAttempt(
@@ -4638,6 +4708,11 @@ export class ProxySessionController {
 
   private async handleRuntimeEvent(event: RuntimeEvent): Promise<void> {
     if ("turnId" in event) {
+      const recoveryAttempt = this.recoveryRetryStartedAt.size > 0
+        ? this.store.findIncompleteTurnAttemptByTurnId(event.turnId) : undefined;
+      if (recoveryAttempt && this.recoveryRetryStartedAt.has(recoveryAttempt.attemptId)) {
+        this.recoveredLiveAttempts.add(recoveryAttempt.attemptId);
+      }
       this.store.touchTurnAttempt(event.turnId);
       const source = this.store.getSession(event.sessionId);
       if (source?.remoteSessionId && this.isCodexSession(source)) {
@@ -4683,6 +4758,13 @@ export class ProxySessionController {
       this.store.updateSession(event.sessionId, { status: "running" });
       this.store.updateRuntimeSession(event.sessionId, { lastTurnId: event.turnId, lastTurnStatus: "running" });
     } else if (event.type === "turn_completed" || event.type === "turn_cancelled" || event.type === "turn_failed") {
+      const attempt = this.store.findIncompleteTurnAttemptByTurnId(event.turnId);
+      if (attempt) {
+        clearTimeout(this.recoveryRetryTimers.get(attempt.attemptId));
+        this.recoveryRetryTimers.delete(attempt.attemptId);
+        this.recoveryRetryStartedAt.delete(attempt.attemptId);
+        this.recoveredLiveAttempts.delete(attempt.attemptId);
+      }
       this.store.markTurnAttemptTerminal(
         event.turnId,
         event.type === "turn_completed" ? "completed" : event.type === "turn_cancelled" ? "cancelled" : "failed",

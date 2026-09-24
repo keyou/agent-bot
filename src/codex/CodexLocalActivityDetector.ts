@@ -2,8 +2,10 @@ import { open } from "node:fs/promises";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { PermissionMode } from "../runtime/types.js";
+import { SystemThreadWriterProcessController, threadWriterLockPath } from "./ThreadWriterProcess.js";
 
 const READ_CHUNK_SIZE = 64 * 1024;
+const WRITER_CHECK_CACHE_MS = 5_000;
 const TASK_STARTED = Buffer.from('"type":"task_started"');
 const TASK_COMPLETE = Buffer.from('"type":"task_complete"');
 const TURN_ABORTED = Buffer.from('"type":"turn_aborted"');
@@ -46,7 +48,14 @@ export interface CodexLocalThreadSettings {
  */
 export class CodexLocalActivityDetector {
   private readonly rollouts = new Map<string, RolloutState>();
-  constructor(private readonly codexHome: string) {}
+  private readonly writerChecks = new Map<string, { expiresAt: number; result: Promise<boolean> }>();
+  constructor(
+    private readonly codexHome: string,
+    private readonly hasWriter: (threadId: string) => Promise<boolean> = async (threadId) => {
+      const lockPath = threadWriterLockPath(codexHome, threadId);
+      return Boolean(lockPath && (await new SystemThreadWriterProcessController().inspect(lockPath)).length > 0);
+    },
+  ) {}
 
   async activeThreadIds(threadIds: string[]): Promise<Set<string>> {
     return new Set((await this.activeThreads(threadIds)).keys());
@@ -74,11 +83,32 @@ export class CodexLocalActivityDetector {
     }
 
     const active = new Map<string, string | undefined>();
-    for (const row of rows) {
-      const task = await latestTask(row.rollout_path, this.rollouts);
-      if (task.active) active.set(row.id, task.turnId);
+    for (let index = 0; index < rows.length; index += 4) {
+      await Promise.all(rows.slice(index, index + 4).map(async (row) => {
+        const task = await latestTask(row.rollout_path, this.rollouts);
+        // An unpaired start survives a crash. It is not evidence of a live process.
+        if (task.active && await this.hasLiveWriter(row.id)) active.set(row.id, task.turnId);
+      }));
     }
     return active;
+  }
+
+  private async hasLiveWriter(threadId: string): Promise<boolean> {
+    const cached = this.writerChecks.get(threadId);
+    if (cached && cached.expiresAt > Date.now()) return cached.result;
+    const result = this.hasWriter(threadId).catch((error: unknown) => {
+      throw new Error("无法确认任务的写入进程是否仍在运行，请稍后重试。", { cause: error });
+    });
+    const entry = { expiresAt: Date.now() + WRITER_CHECK_CACHE_MS, result };
+    this.writerChecks.delete(threadId);
+    this.writerChecks.set(threadId, entry);
+    if (this.writerChecks.size > 512) this.writerChecks.delete(this.writerChecks.keys().next().value!);
+    try {
+      return await result;
+    } catch (error) {
+      if (this.writerChecks.get(threadId) === entry) this.writerChecks.delete(threadId);
+      throw error;
+    }
   }
 
   async threadSettings(threadIds: string[]): Promise<Map<string, CodexLocalThreadSettings>> {

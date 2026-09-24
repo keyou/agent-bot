@@ -29,8 +29,9 @@ export class SystemThreadWriterProcessController implements ThreadWriterProcessC
   async inspect(lockPath: string): Promise<ThreadWriterProcess[]> {
     try {
       await access(lockPath);
-    } catch {
-      return [];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
     }
     return process.platform === "win32"
       ? inspectWindowsLockOwners(lockPath)
@@ -134,12 +135,15 @@ async function inspectWindowsLockOwners(lockPath: string): Promise<ThreadWriterP
 async function inspectPosixLockOwners(lockPath: string): Promise<ThreadWriterProcess[]> {
   const pids = await posixLockOwnerPids(lockPath);
   const owners = await Promise.all(pids.map((pid) => inspectPosixProcess(pid)));
+  if (owners.some((owner) => !owner)) throw new Error("Cannot identify a reported thread writer; retry the inspection.");
   return owners.filter((owner): owner is ThreadWriterProcess => owner !== undefined);
 }
 
 async function posixLockOwnerPids(lockPath: string): Promise<number[]> {
   const lsof = await tryExecuteFile("lsof", ["-t", "--", lockPath]);
-  const raw = lsof.ok ? lsof.stdout : (await tryExecuteFile("fuser", [lockPath])).stdout;
+  const result = lsof.ok || lsof.noMatches ? lsof : await tryExecuteFile("fuser", [lockPath]);
+  if (!result.ok && !result.noMatches) throw new Error("Cannot inspect thread writers: lsof and fuser failed.");
+  const raw = result.stdout;
   return [...new Set(raw.match(/\d+/gu)?.map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0) ?? [])];
 }
 
@@ -233,11 +237,15 @@ function executeFile(command: string, args: string[], extraEnv: Record<string, s
   });
 }
 
-function tryExecuteFile(command: string, args: string[]): Promise<{ ok: boolean; stdout: string }> {
-  return executeFile(command, args).then(
-    (stdout) => ({ ok: true, stdout }),
-    () => ({ ok: false, stdout: "" }),
-  );
+function tryExecuteFile(command: string, args: string[]): Promise<{ ok: boolean; stdout: string; noMatches: boolean }> {
+  return new Promise((resolve) => {
+    execFile(command, args, {
+      timeout: PROCESS_INSPECTION_TIMEOUT_MS, maxBuffer: MAX_PROCESS_OUTPUT_BYTES, windowsHide: true, encoding: "utf8",
+    }, (error, stdout, stderr) => resolve({
+      ok: !error, stdout,
+      noMatches: error?.code === 1 && !error.killed && !stdout.trim() && !stderr.trim(),
+    }));
+  });
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -352,7 +360,7 @@ try {
   for ($index = 0; $index -lt $count; $index++) {
     $writerPid = $items[$index].Process.dwProcessId
     $writer = Get-AgentBotProcess $writerPid
-    if ($null -eq $writer) { continue }
+    if ($null -eq $writer) { throw "Cannot identify reported thread writer PID $writerPid; retry the inspection." }
     $application = $writer
     $cursor = $writer
     for ($depth = 0; $depth -lt 8 -and $cursor.ParentProcessId -gt 1; $depth++) {

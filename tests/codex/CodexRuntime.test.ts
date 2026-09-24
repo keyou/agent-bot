@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { describe, expect, test, vi } from "vitest";
 import type { RuntimeEvent, RuntimeExecutionSettings, RuntimeGoal } from "../../src/runtime/types.js";
 import { AppServerRequestError } from "../../src/codex/AppServerConnection.js";
@@ -1796,6 +1797,65 @@ describe("CodexRuntime", () => {
       active: true,
       activeTurnId: "turn_1",
     });
+  });
+
+  test("a restored activeTurnId and unfinished crash rollout do not imply a live execution", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentbot-crash-runtime-"));
+    const id = "00000000-0000-4000-8000-000000000001";
+    const rollout = path.join(home, "rollout.jsonl");
+    const client = new FakeAppServerClient();
+    client.readResult = { thread: { id, status: { type: "notLoaded" }, turns: [{ id: "old-turn", status: "inProgress", items: [] }] } };
+    client.resumeResult = { thread: { id }, model: "gpt-test", reasoningEffort: "high" };
+    const runtime = new CodexRuntime({ ...provider(client), getCodexHome: () => home }, logger());
+    try {
+      fs.writeFileSync(rollout, JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "old-turn" } }) + "\n");
+      const db = new Database(path.join(home, "state_5.sqlite"));
+      db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)");
+      db.prepare("INSERT INTO threads VALUES (?, ?)").run(id, rollout);
+      db.close();
+      await expect(runtime.readRemoteSession(id)).resolves.toMatchObject({ status: "not_loaded", lastTurnStatus: "interrupted" });
+      await runtime.resumeSession({ localSessionId: "restored", remoteSessionId: id, agentName: "codex", cwd: home, permissionMode: "auto", activeTurnId: "old-turn" });
+      await expect(runtime.inspectRemoteSessionActivity(id)).resolves.toEqual({ active: false });
+      await expect(runtime.synchronizeSession("restored")).resolves.toMatchObject({ activeTurnId: undefined, remoteSummary: { status: "not_loaded", lastTurnStatus: "interrupted" } });
+    } finally {
+      runtime.close();
+      if (path.dirname(home) !== path.resolve(os.tmpdir()) || !path.basename(home).startsWith("agentbot-crash-runtime-")) throw new Error("Unsafe cleanup path");
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("local forgetting neither archives nor interrupts a remote thread", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    await runtime.startTurn("s1", "work");
+    client.requests = [];
+    runtime.forgetSession("s1");
+    expect(runtime.getSession("s1")).toBeUndefined();
+    expect(client.requests).toEqual([]);
+  });
+
+  test("does not overwrite the loaded App Server idle status with old unfinished rollout state", async () => {
+    const client = new FakeAppServerClient();
+    const active = vi.spyOn(CodexLocalActivityDetector.prototype, "activeThreads").mockResolvedValue(new Map([["thr_1", "old-turn"]]));
+    const runtime = new CodexRuntime({ ...provider(client), getCodexHome: () => "missing-test-home" }, logger());
+    try {
+      client.readResult = { thread: { id: "thr_1", status: { type: "idle" }, turns: [{ id: "old-turn", status: "inProgress", items: [] }] } };
+      await expect(runtime.readRemoteSession("thr_1")).resolves.toMatchObject({ status: "idle", lastTurnStatus: "interrupted" });
+      await expect(runtime.inspectRemoteSessionActivity("thr_1")).resolves.toEqual({ active: false });
+      expect(active).not.toHaveBeenCalled();
+    } finally { active.mockRestore(); runtime.close(); }
+  });
+
+  test("does not adopt a different stale inProgress turn during reconciliation", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    await runtime.resumeSession({ localSessionId: "s1", remoteSessionId: "thr_1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto", activeTurnId: "old-turn" });
+    client.readResult = { thread: { id: "thr_1", status: { type: "notLoaded" }, turns: [{ id: "another-stale-turn", status: "inProgress", items: [] }] } };
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    await expect(runtime.synchronizeSession("s1")).resolves.toMatchObject({ activeTurnId: undefined });
+    expect(events).toEqual([{ type: "turn_cancelled", sessionId: "s1", turnId: "old-turn" }]);
   });
 
   test("discovers and inspects existing Codex sessions without resuming them", async () => {

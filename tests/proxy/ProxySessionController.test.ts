@@ -348,6 +348,7 @@ function fixture(
       return session;
     }),
     getSession: vi.fn((id) => sessions.get(id)),
+    forgetSession: vi.fn((id) => { sessions.delete(id); }),
     readSessionMetadata: vi.fn(async () => ({})),
     listRemoteSessions: vi.fn(async ({
       searchTerm,
@@ -648,6 +649,179 @@ function fixture(
     config,
   };
 }
+
+function recoveryFixture(status: "active" | "not_loaded" = "active") {
+  const value = fixture();
+  const { store, remoteSessions } = value;
+  const id = "00000000-0000-4000-8000-000000000001";
+  store.getOrCreateUserContext("chat_id:c1", "codex");
+  store.createSession({ localSessionId: "crashed", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "running" });
+  store.updateRuntimeSession("crashed", { runtimeKind: "codex", remoteSessionId: id, lastTurnId: "old-turn", lastTurnStatus: "running" });
+  store.setCurrentSession("chat_id:c1", "crashed");
+  store.saveTurnSnapshot("old-turn", "crashed", {
+    ...createTurnViewState("crashed", "old-turn", Date.now()), status: "running", prompt: "finish work",
+  }, "chat_id:c1");
+  store.createTurnAttempt({ attemptId: "recover", localSessionId: "crashed", contextKey: "chat_id:c1", promptText: "finish work", turnId: "old-turn", status: "running" });
+  remoteSessions.push({ id, cwd: process.cwd(), source: "agent-bot", status, lastTurnId: "old-turn", lastTurnStatus: status === "active" ? "inProgress" : "interrupted" });
+  return { ...value, remoteId: id };
+}
+
+describe("crash recovery", () => {
+  test("ends recovery and shows the writer conflict without claiming a new running card or closing processes", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      vi.mocked(f.runtime.resumeSession).mockRejectedValue(new Error(`thread ${f.remoteId} already has an active writer`));
+      await f.controller.recoverInterruptedTasks();
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getSession("crashed")).toMatchObject({ status: "ready", lastTurnStatus: "cancelled" });
+      expect(f.presenter.startPendingTurn).not.toHaveBeenCalled();
+      expect(f.presenter.interruptTurnForRecovery).toHaveBeenCalledWith("crashed", "chat_id:c1", "old-turn", expect.stringContaining("占用"));
+      expect(JSON.stringify(vi.mocked(f.outbound.sendInteractiveCard).mock.calls)).toContain("任务被占用");
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(f.runtime.resumeSession).toHaveBeenCalledTimes(1);
+      expect(f.threadWriterProcesses.close).not.toHaveBeenCalled();
+      expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+      expect(f.runtime.archiveRemoteSession).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("does not replay the prompt on unknown remote state and bounds recovery failures", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      vi.mocked(f.runtime.readRemoteSession!).mockRejectedValue(new Error("connection unavailable"));
+      await f.controller.recoverInterruptedTasks();
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("recovering");
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getSession("crashed")?.status).toBe("ready");
+      expect(f.runtime.resumeSession).not.toHaveBeenCalled();
+      const reads = vi.mocked(f.runtime.readRemoteSession!).mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(f.runtime.readRemoteSession).toHaveBeenCalledTimes(reads);
+      expect(JSON.stringify(vi.mocked(f.outbound.sendText).mock.calls)).toContain("停止自动重试");
+      // Once the Agent is available again, a new prompt can start normally.
+      f.remoteSessions[0]!.status = "idle";
+      f.remoteSessions[0]!.lastTurnStatus = "interrupted";
+      await f.controller.onMessage(message("continue after repair"));
+      expect(f.runtime.startTurn).toHaveBeenCalledWith("crashed", "continue after repair");
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("retries a transient resume failure before creating exactly one new card", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      vi.mocked(f.runtime.resumeSession).mockRejectedValueOnce(new Error("temporary failure"));
+      await f.controller.recoverInterruptedTasks();
+      expect(f.presenter.startPendingTurn).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(f.runtime.resumeSession).toHaveBeenCalledTimes(2);
+      expect(f.presenter.startPendingTurn).toHaveBeenCalledTimes(1);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("running");
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("running");
+      expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("forgets only local monitoring after repeated synchronization errors, without stopping remote work", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      vi.mocked(f.runtime.synchronizeSession).mockRejectedValue(new Error("connection lost"));
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getSession("crashed")?.status).toBe("ready");
+      expect(f.runtime.forgetSession).toHaveBeenCalledWith("crashed");
+      expect(f.runtime.getSession("crashed")).toBeUndefined();
+      expect(f.presenter.startPendingTurn).toHaveBeenCalledTimes(1);
+      expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+      expect(f.runtime.release).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("keeps a confirmed live task blocking safe restart during a later monitoring outage", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      await f.controller.recoverInterruptedTasks();
+      vi.mocked(f.runtime.synchronizeSession).mockRejectedValue(new Error("temporarily offline"));
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("running");
+      expect(f.store.getServerActivityState().runningSessions).toBe(1);
+      expect(f.presenter.startPendingTurn).toHaveBeenCalledTimes(1);
+      expect(f.runtime.forgetSession).not.toHaveBeenCalled();
+      expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("completes stopped recovery even when its notification cannot be delivered", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      vi.mocked(f.runtime.resumeSession).mockRejectedValue(new Error(`thread ${f.remoteId} already has an active writer`));
+      vi.mocked(f.outbound.sendText).mockRejectedValue(new Error("Feishu offline"));
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getSession("crashed")?.status).toBe("ready");
+      expect(f.runtime.resumeSession).toHaveBeenCalledTimes(1);
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("reconciles a finished recovered turn without another prompt or duplicate final event", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture("not_loaded");
+    try {
+      f.remoteSessions[0]!.lastTurnStatus = "completed";
+      vi.mocked(f.runtime.synchronizeSession).mockImplementation(async (id) => {
+        const session = f.sessions.get(id)!;
+        session.activeTurnId = undefined;
+        for (const listener of f.listeners) listener({ type: "turn_completed", sessionId: id, turnId: "old-turn", finalResponse: "Done" });
+        return session;
+      });
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(f.runtime.synchronizeSession).toHaveBeenCalledTimes(1);
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("completed");
+      expect(f.store.getSession("crashed")?.status).toBe("ready");
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("bounds waiting for a different external turn without taking it over", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      f.remoteSessions[0]!.lastTurnId = "external-turn";
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.runtime.resumeSession).not.toHaveBeenCalled();
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+      expect(f.runtime.interruptRemoteTurn).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("does not clear a newer turn when an older recovery expires", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      vi.mocked(f.runtime.readRemoteSession!).mockRejectedValue(new Error("offline"));
+      await f.controller.recoverInterruptedTasks();
+      f.store.updateRuntimeSession("crashed", { lastTurnId: "new-turn", lastTurnStatus: "running" });
+      f.sessions.set("crashed", { localSessionId: "crashed", remoteSessionId: f.remoteId, runtimeKind: "codex", agentName: "codex", cwd: process.cwd(), permissionMode: "auto", activeTurnId: "new-turn" });
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getSession("crashed")).toMatchObject({ status: "running", lastTurnId: "new-turn", lastTurnStatus: "running" });
+      expect(f.runtime.forgetSession).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+});
 
 describe("ProxySessionController", () => {
   test("opens update choices without a task and routes explicit selections within their topic", async () => {

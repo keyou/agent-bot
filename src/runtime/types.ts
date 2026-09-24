@@ -286,6 +286,8 @@ export interface AgentRuntime {
   resumeSession(input: ResumeRuntimeSessionInput): Promise<RuntimeSession>;
   forkSession?(input: ForkRuntimeSessionInput): Promise<RuntimeSession>;
   getSession(localSessionId: string): RuntimeSession | undefined;
+  // Drop local monitoring only; do not interrupt, unsubscribe, or archive remote work.
+  forgetSession?(localSessionId: string): void;
   readSessionMetadata(remoteSessionId: string): Promise<RuntimeSessionMetadata>;
   listRemoteSessions?(input?: { searchTerm?: string; cursor?: string; limit?: number }): Promise<RemoteSessionPage>;
   readRemoteSession?(remoteSessionId: string, view?: "metadata" | "latest" | "latest-full"): Promise<RemoteSessionSummary>;

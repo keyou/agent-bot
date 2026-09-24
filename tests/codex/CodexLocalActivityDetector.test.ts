@@ -21,6 +21,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -30,7 +31,7 @@ describe("CodexLocalActivityDetector", () => {
     const rollout = path.join(home, "sessions", "incremental.jsonl");
     await writeFile(rollout, `${event("task_started")}\n${"x".repeat(300_000)}\n`);
     createStateDatabase(home, [{ id: "incremental", rolloutPath: rollout }]);
-    const detector = new CodexLocalActivityDetector(home);
+    const detector = new CodexLocalActivityDetector(home, async () => true);
     expect((await detector.activeThreadIds(["incremental"])).has("incremental")).toBe(true);
     reads.bytes = 0;
     expect((await detector.activeThreadIds(["incremental"])).has("incremental")).toBe(true);
@@ -59,7 +60,7 @@ describe("CodexLocalActivityDetector", () => {
       { id: "interrupted", rolloutPath: interruptedRollout },
     ]);
 
-    const active = await new CodexLocalActivityDetector(home).activeThreads([
+    const active = await new CodexLocalActivityDetector(home, async () => true).activeThreads([
       "active",
       "idle",
       "interrupted",
@@ -79,7 +80,7 @@ describe("CodexLocalActivityDetector", () => {
     ].join("\n"));
     createStateDatabase(home, [{ id: "large", rolloutPath: rollout }]);
 
-    const active = await new CodexLocalActivityDetector(home).activeThreadIds(["large"]);
+    const active = await new CodexLocalActivityDetector(home, async () => true).activeThreadIds(["large"]);
 
     expect(active.has("large")).toBe(true);
   });
@@ -114,6 +115,50 @@ describe("CodexLocalActivityDetector", () => {
       permissionMode: "confirm",
     });
     expect(settings.has("missing")).toBe(false);
+  });
+
+  test("ignores an unfinished crash rollout when no writer exists, even if the lock file remains", async () => {
+    const home = await createCodexHome();
+    const id = "00000000-0000-4000-8000-000000000001";
+    const rolloutPath = await createRollout(home, "crashed", ["task_started"]);
+    createStateDatabase(home, [{ id, rolloutPath }]);
+    const detector = new CodexLocalActivityDetector(home);
+    expect(await detector.activeThreads([id])).toEqual(new Map());
+    const hasWriter = vi.fn(async () => false);
+    await mkdir(path.join(home, "thread-writer-locks"));
+    await writeFile(path.join(home, "thread-writer-locks", `${id}.lock`), "");
+    expect(await new CodexLocalActivityDetector(home, hasWriter).activeThreads([id])).toEqual(new Map());
+    expect(hasWriter).toHaveBeenCalledWith(id);
+  });
+
+  test("rechecks live writers independently of cached rollout bytes and shares concurrent checks", async () => {
+    const home = await createCodexHome();
+    const rolloutPath = await createRollout(home, "unchanged", ["task_started"]);
+    createStateDatabase(home, [{ id: "unchanged", rolloutPath }]);
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const hasWriter = vi.fn(async () => true);
+    const detector = new CodexLocalActivityDetector(home, hasWriter);
+    await Promise.all([detector.activeThreads(["unchanged"]), detector.activeThreads(["unchanged"])]);
+    expect(hasWriter).toHaveBeenCalledTimes(1);
+    now += 5_001;
+    hasWriter.mockResolvedValue(false);
+    expect(await detector.activeThreads(["unchanged"])).toEqual(new Map());
+    expect(hasWriter).toHaveBeenCalledTimes(2);
+    now += 5_001;
+    hasWriter.mockResolvedValue(true);
+    expect(await detector.activeThreads(["unchanged"])).toEqual(new Map([["unchanged", "turn-active"]]));
+  });
+
+  test("does not turn a failed process inspection into evidence that a task is idle", async () => {
+    const home = await createCodexHome();
+    const rolloutPath = await createRollout(home, "unknown", ["task_started"]);
+    createStateDatabase(home, [{ id: "unknown", rolloutPath }]);
+    const hasWriter = vi.fn(async () => { throw new Error("permission denied"); });
+    const detector = new CodexLocalActivityDetector(home, hasWriter);
+    await expect(detector.activeThreads(["unknown"])).rejects.toThrow("无法确认任务");
+    await expect(detector.activeThreads(["unknown"])).rejects.toThrow("无法确认任务");
+    expect(hasWriter).toHaveBeenCalledTimes(2);
   });
 });
 
