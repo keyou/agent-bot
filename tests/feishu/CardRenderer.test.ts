@@ -2318,6 +2318,112 @@ describe("CardRenderer", () => {
     }));
   });
 
+  test.each(["grouped", "timeline"] as const)("keeps command approvals compact without changing decisions in %s cards", (thinkingCardLayout) => {
+    const command = '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "Get-Content -LiteralPath aha/components/bua/AGENTS.md | Select-Object -First 115; ' + 'Get-ChildItem -LiteralPath aha/components/bua/skills -Recurse; '.repeat(12) + 'Write-Output END"';
+    const waiting = state();
+    waiting.status = "waiting_for_approval";
+    waiting.approval = {
+      id: "approval_1", title: command, command,
+      reason: "是否允许继续只读检查当前开发约定，以便做最小范围删除？",
+      options: [
+        { id: "accept", label: "允许" }, { id: "acceptForSession", label: "本次会话允许" },
+        { id: "decline", label: "拒绝" }, { id: "cancel", label: "取消" },
+      ],
+    };
+    const original = structuredClone(waiting.approval);
+    const renderer = new CardRenderer({ thinkingCardLayout });
+    let elementId: unknown;
+    for (const card of [renderer.renderTurn(waiting), renderer.renderTurnDetails(waiting)]) {
+      const objects = collectObjects(card);
+      const texts = objects.filter((item) => item.tag === "markdown").map((item) => item.content);
+      const panel = objects.find((item) => String(item.element_id).startsWith("approval_"))!;
+      expect(texts).toContain("**命令执行确认**");
+      expect(texts).not.toContain("**" + command + "**");
+      expect(texts.indexOf(waiting.approval.reason)).toBeLessThan(texts.indexOf("\x60\x60\x60\n" + command + "\n\x60\x60\x60"));
+      expect(texts).toContain("\x60\x60\x60\n" + command + "\n\x60\x60\x60");
+      expect(panel).toMatchObject({ expanded: false, border: { color: "grey" } });
+      expect(panelTitle(panel)).toMatch(/^查看命令 · Get-Content/);
+      expect(panelTitle(panel).length).toBeLessThanOrEqual(72);
+      expect(panel.element_id).toMatch(/^approval_[a-f0-9]{11}$/);
+      if (elementId) expect(panel.element_id).toBe(elementId);
+      elementId = panel.element_id;
+      expect(collectObjects(panel).filter((item) => item.tag === "button")).toHaveLength(0);
+      expect(objects.filter((item) => item.tag === "button")).toEqual(waiting.approval.options.map((option, index) => expect.objectContaining({
+        text: { tag: "plain_text", content: ["Allow Once", "Allow for Session", "Deny", "Cancel Task"][index] },
+        type: ["primary", "primary", "default", "danger"][index],
+        behaviors: [{ type: "callback", value: {
+          action: "approval", sessionId: "s1", turnId: "turn_1", requestId: "approval_1", decision: option.id,
+        } }],
+      })));
+    }
+    expect(waiting.approval).toEqual(original);
+    waiting.approval = { ...original, id: "approval_2" };
+    const next = collectObjects(renderer.renderTurn(waiting)).find((item) => String(item.element_id).startsWith("approval_"));
+    expect(next?.element_id).not.toBe(elementId);
+  });
+
+  test("shows a distinct approval title as a fallback reason, without duplicating a command", () => {
+    const waiting = state();
+    waiting.approval = { id: "a", title: "Allow read-only inspection?", command: "git status", options: [] };
+    const render = () => collectObjects(new CardRenderer().renderTurn(waiting))
+      .filter((item) => item.tag === "markdown").map((item) => item.content);
+    expect(render()).toContain("Allow read-only inspection?");
+    waiting.approval.title = "git status";
+    expect(render()).not.toContain("git status");
+    waiting.approval.reason = "git status";
+    expect(render()).not.toContain("git status");
+    waiting.approval.title = "File change approval";
+    waiting.approval.command = undefined;
+    waiting.approval.reason = "**Review the diff**";
+    expect(render()).toContain("**File change approval**\n**Review the diff**");
+  });
+
+  test("escapes approval reasons as text while preserving command quotes, paths and Unicode", () => {
+    const waiting = state();
+    const reason = '<at id=all></at> **check** C:\\dir\\_name \x60code\x60 [click](https://example.test) 👋';
+    const command = 'Write-Output "<script>👋</script>"; Get-Content C:\\dir\\_name';
+    waiting.approval = { id: "a", title: command, command, reason, options: [] };
+    const texts = collectObjects(new CardRenderer().renderTurn(waiting)).filter((item) => item.tag === "markdown").map((item) => String(item.content));
+    const html = new MarkdownIt({ html: true }).render(texts.find((text) => text.includes("&lt;at"))!);
+    expect(html).not.toMatch(/<(?:at|strong|a|code)[ >]/);
+    expect(html).toContain("**check**");
+    expect(html).toContain("C:\\dir\\_name");
+    expect(texts).toContain("\x60\x60\x60\n" + command + "\n\x60\x60\x60");
+  });
+
+  test.each(["grouped", "timeline"] as const)("bounds verbose approvals and warns before showing truncated commands in %s cards", (thinkingCardLayout) => {
+    const waiting = state();
+    waiting.status = "waiting_for_approval";
+    waiting.plan = [];
+    waiting.fileSummary = [];
+    waiting.activities = Array.from({ length: 100 }, (_, index) => ({
+      kind: "tool" as const, id: "tool:" + index,
+      tool: { ...waiting.completedTools[0]!, id: "tool:" + index, output: thinkingCardLayout === "grouped" ? "输出结果👋".repeat(300) : "ok" },
+    }));
+    waiting.approval = {
+      id: "a", title: "long command", command: 'Write-Output "' + '中文👋\\"\n'.repeat(2_000) + 'COMMAND_END"',
+      reason: '<>&*_[\\\x60👋'.repeat(1_000) + "REASON_END", options: [
+        { id: "accept", label: "Allow" }, { id: "acceptForSession", label: "Allow for session" },
+        { id: "decline", label: "Deny" }, { id: "cancel", label: "Cancel" },
+      ],
+    };
+    const renderer = new CardRenderer({ thinkingCardLayout });
+    const card = renderer.renderTurn(waiting);
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain("请在 Preview 中查看完整命令后再授权");
+    expect(serialized).toContain("说明较长");
+    expect(serialized).not.toContain("COMMAND_END");
+    expect(serialized).not.toContain("REASON_END");
+    const objects = collectObjects(card);
+    const panel = objects.find((item) => String(item.element_id).startsWith("approval_"));
+    const code = collectObjects(panel).find((item) => item.tag === "markdown")?.content;
+    expect(String(code)).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/u);
+    const withoutApproval = JSON.stringify(renderer.renderTurn({ ...waiting, approval: undefined }));
+    expect(Buffer.byteLength(serialized, "utf8") - Buffer.byteLength(withoutApproval, "utf8")).toBeLessThan(5_500);
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(30 * 1024);
+    expect(objects.filter((item) => typeof item.tag === "string").length).toBeLessThanOrEqual(200);
+  });
+
   test("renders a useful Card 2.0 placeholder before the first progress event", () => {
     const starting = state();
     starting.status = "starting";

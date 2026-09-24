@@ -162,6 +162,7 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
       return {
         ...state,
         totalTokens: (state.totalTokens ?? 0) + delta,
+        ...countModelCall(state, event),
         tokenUsageCumulative: Math.max(previousCumulative ?? 0, cumulativeTokens),
         totalTokensIncludingCache: total.value,
         tokenUsageTotalCumulative: total.cumulative,
@@ -607,6 +608,46 @@ function addOptional(left: number | undefined, right: number | undefined): numbe
 function bound(value: string): string {
   if (value.length <= MAX_TEXT) return value;
   return `${value.slice(0, MAX_TEXT - 1)}…`;
+}
+
+function countModelCall(
+  state: TurnViewState,
+  event: Extract<AgentEvent, { type: "token_usage_updated" }>,
+): Pick<TurnViewState, "modelCallCount" | "modelCallTokenBaseline"> {
+  // A pre-existing snapshot without a counter cannot provide a complete turn count.
+  if (state.modelCallCount === undefined && state.modelCallTokenBaseline === undefined
+    && state.tokenUsageCumulative !== undefined) return {};
+  const nonCached = reportedUsage(event.lastTokens, event.cumulativeTokens);
+  const total = reportedUsage(event.lastTotalTokens, event.cumulativeTotalTokens);
+  if (!nonCached && !total) return { modelCallTokenBaseline: state.modelCallTokenBaseline ?? {} };
+  const previous = state.modelCallTokenBaseline;
+  const usage = total ?? nonCached!;
+  const staleNonCached = nonCached !== undefined && previous?.nonCached !== undefined
+    && nonCached.cumulative < previous.nonCached;
+  const nonCachedGrew = nonCached !== undefined && previous?.nonCached !== undefined
+    && nonCached.cumulative > previous.nonCached;
+  const grew = total && previous?.total !== undefined && !previous.totalNeedsRebase
+    ? total.cumulative > previous.total
+    : nonCached && previous?.nonCached !== undefined
+      ? nonCachedGrew
+      : previous?.total === undefined && previous?.nonCached === undefined
+        && usage.last > 0 && usage.cumulative > 0;
+  return {
+    modelCallCount: (state.modelCallCount ?? 0) + (grew ? 1 : 0),
+    modelCallTokenBaseline: {
+      nonCached: nonCached ? Math.max(previous?.nonCached ?? 0, nonCached.cumulative) : previous?.nonCached,
+      total: total ? Math.max(previous?.total ?? 0, total.cumulative) : previous?.total,
+      // After a legacy-only update, rebase totals before using them again; keep
+      // their high-water mark so stale reports cannot lower the baseline.
+      totalNeedsRebase: total && !staleNonCached ? false : nonCachedGrew || previous?.totalNeedsRebase,
+    },
+  };
+}
+
+function reportedUsage(last: number | undefined, cumulative: number | undefined): { last: number; cumulative: number } | undefined {
+  if (last === undefined || cumulative === undefined || !Number.isFinite(last) || !Number.isFinite(cumulative)
+    || last < 0 || cumulative < 0) return undefined;
+  return { last: normalizeTokenCount(last), cumulative: normalizeTokenCount(cumulative) };
 }
 
 function accumulateReportedTokens(

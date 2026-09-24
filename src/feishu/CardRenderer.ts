@@ -4,6 +4,7 @@ import type { JsonValue } from "../acp/acpTypes.js";
 import type { RuntimeSession } from "../acp/AcpSessionManager.js";
 import type {
   ApprovalDecision,
+  ApprovalRequest,
   ModelOption,
   ModelProviderOption,
   PermissionMode,
@@ -1699,38 +1700,7 @@ function renderTurnElements(
   elements.push(...renderActivities(visibleActivities, state.projectCwd));
   if (state.fileSummary.length > 0) elements.push(fileSummaryPanel(state));
 
-  if (state.approval) {
-    const request = state.approval;
-    elements.push(markdown([
-      `**${request.title}**`,
-      request.command ? codeBlock(request.command, 800) : undefined,
-      request.reason,
-    ].filter(Boolean).join("\n")));
-    elements.push({
-      tag: "column_set",
-      flex_mode: "flow",
-      horizontal_spacing: "8px",
-      columns: request.options.map((option) => ({
-        tag: "column",
-        width: "auto",
-        elements: [{
-          tag: "button",
-          text: { tag: "plain_text", content: request.kind === "mode_change" ? option.label : approvalDecisionLabel(option.id) },
-          type: option.id === "accept" || option.id === "acceptForSession" ? "primary" : option.id === "cancel" ? "danger" : "default",
-          behaviors: [{
-            type: "callback",
-            value: {
-              action: "approval",
-              sessionId: state.sessionId,
-              turnId: state.turnId,
-              requestId: request.id,
-              decision: option.id,
-            },
-          }],
-        }],
-      })),
-    });
-  }
+  if (state.approval) elements.push(...renderApprovalElements(state, state.approval));
   if (state.error) elements.push(markdown(codeBlock(state.error, 2_000)));
   const showAssistantText = state.assistantText && assistantTextMode === "always";
   if (showAssistantText) {
@@ -1770,38 +1740,7 @@ function renderGroupedTurnElements(
   elements.push(...renderGroupedActivityGroups(visibleGroups, state.projectCwd));
   if (state.fileSummary.length > 0) elements.push(fileSummaryPanel(state));
 
-  if (state.approval) {
-    const request = state.approval;
-    elements.push(markdown([
-      `**${request.title}**`,
-      request.command ? codeBlock(request.command, 800) : undefined,
-      request.reason,
-    ].filter(Boolean).join("\n")));
-    elements.push({
-      tag: "column_set",
-      flex_mode: "flow",
-      horizontal_spacing: "8px",
-      columns: request.options.map((option) => ({
-        tag: "column",
-        width: "auto",
-        elements: [{
-          tag: "button",
-          text: { tag: "plain_text", content: request.kind === "mode_change" ? option.label : approvalDecisionLabel(option.id) },
-          type: option.id === "accept" || option.id === "acceptForSession" ? "primary" : option.id === "cancel" ? "danger" : "default",
-          behaviors: [{
-            type: "callback",
-            value: {
-              action: "approval",
-              sessionId: state.sessionId,
-              turnId: state.turnId,
-              requestId: request.id,
-              decision: option.id,
-            },
-          }],
-        }],
-      })),
-    });
-  }
+  if (state.approval) elements.push(...renderApprovalElements(state, state.approval));
   if (state.error) elements.push(markdown(codeBlock(state.error, 2_000)));
   const showAssistantText = state.assistantText && assistantTextMode === "always";
   if (showAssistantText) {
@@ -1811,6 +1750,79 @@ function renderGroupedTurnElements(
   }
   if (elements.length === 0) elements.push(markdown(emptyTurnText(state.status, state.agentLabel)));
   return elements;
+}
+
+function renderApprovalElements(state: TurnViewState, request: ApprovalRequest): Record<string, unknown>[] {
+  const elements: Record<string, unknown>[] = [];
+  const command = request.command?.trim();
+  if (command && request.kind !== "mode_change") {
+    elements.push(markdown("**命令执行确认**"));
+    const reason = request.reason?.trim()
+      || (request.title.trim() !== command ? request.title.trim() : "");
+    if (reason && reason !== command) {
+      const preview = approvalTextPreview(reason, 1_000, escapeApprovalText);
+      elements.push(markdown(escapeApprovalText(preview)));
+      if (preview !== reason) elements.push(markdown("<font color='grey'>说明较长，请在 Preview 中查看完整内容。</font>"));
+    }
+    const display = displayToolCommand(command) ?? command;
+    const summary = truncateText(display.replace(/\s+/gu, " "), 64);
+    const preview = approvalTextPreview(command, 2_200);
+    elements.push(collapsiblePanel(`查看命令 · ${summary}`, [
+      markdown(codeBlock(preview, preview.length)),
+      ...(preview !== command ? [markdown("<font color='grey'>命令过长，卡片仅显示开头。请在 Preview 中查看完整命令后再授权。</font>")] : []),
+    ], {
+      elementId: `approval_${createHash("sha256").update(request.id).digest("hex").slice(0, 11)}`,
+      compact: true,
+      borderColor: "grey",
+    }));
+  } else {
+    elements.push(markdown([
+      `**${request.title}**`,
+      request.command ? codeBlock(request.command, 800) : undefined,
+      request.reason,
+    ].filter(Boolean).join("\n")));
+  }
+  elements.push({
+    tag: "column_set",
+    flex_mode: "flow",
+    horizontal_spacing: "8px",
+    columns: request.options.map((option) => ({
+      tag: "column",
+      width: "auto",
+      elements: [{
+        tag: "button",
+        text: { tag: "plain_text", content: request.kind === "mode_change" ? option.label : approvalDecisionLabel(option.id) },
+        type: option.id === "accept" || option.id === "acceptForSession" ? "primary" : option.id === "cancel" ? "danger" : "default",
+        behaviors: [{
+          type: "callback",
+          value: {
+            action: "approval",
+            sessionId: state.sessionId,
+            turnId: state.turnId,
+            requestId: request.id,
+            decision: option.id,
+          },
+        }],
+      }],
+    })),
+  });
+  return elements;
+}
+
+function approvalTextPreview(value: string, maxBytes: number, encode = (text: string): string => text): string {
+  if (Buffer.byteLength(JSON.stringify(encode(value)), "utf8") <= maxBytes) return value;
+  let bytes = 5;
+  let result = "";
+  for (const character of value) {
+    bytes += Buffer.byteLength(JSON.stringify(encode(character)), "utf8") - 2;
+    if (bytes > maxBytes) break;
+    result += character;
+  }
+  return `${result}...`;
+}
+
+function escapeApprovalText(value: string): string {
+  return escapeCardHtml(value).replace(/[\\`*_[\]#]/gu, (character) => `&#${character.codePointAt(0)};`);
 }
 
 function emptyTurnText(status: TurnViewStatus, agentLabel?: string): string {

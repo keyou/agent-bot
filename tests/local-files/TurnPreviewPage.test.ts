@@ -24,6 +24,33 @@ function state(tool?: Partial<ToolState>): TurnViewState {
 
 describe("Turn Preview", () => {
 
+  test.each(["zh", "en"] as const)("adds accessible Markdown export icons only to final answers in %s", (language) => {
+    const markdown = '\n# 报告 👋\r\n\r\n|a|b|\r\n|-|-|\r\n|1|2|\r\n\n[File](dir/file.md)\n<img src=x onerror="bad()">\n</section><script>alert(1)</script>\n';
+    const input = { ...state(), finalResponse: markdown, turnId: '../../bad"<>:task' };
+    const { document } = parseHTML(renderTurnPreviewPage({
+      state: input, eventsUrl: "/events", scriptPath: "/client.js", language,
+    }));
+    const section = document.querySelector(".final-result")!;
+    const buttons = Array.from(section.querySelectorAll(".result-heading button"));
+    expect(buttons.map((button) => button.getAttribute("data-answer-action"))).toEqual(["download", "copy"]);
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual(language === "zh"
+      ? ["下载 Markdown", "复制 Markdown"] : ["Download Markdown", "Copy Markdown"]);
+    for (const button of buttons) {
+      expect(button.getAttribute("title")).toBe(button.getAttribute("aria-label"));
+      expect(button.getAttribute("type")).toBe("button");
+      expect(button.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+      expect(button.textContent).toBe("");
+    }
+    expect(Buffer.from(section.getAttribute("data-answer-markdown")!, "base64").toString("utf8")).toBe(markdown);
+    expect(section.getAttribute("data-answer-filename")).toMatch(/^turn-[A-Za-z0-9_-]+\.md$/u);
+    expect(section.querySelector("script, img[onerror]")).toBeNull();
+    expect(section.querySelector('[data-answer-feedback][role="status"]')).not.toBeNull();
+    for (const status of ["running", "completed", "failed"] as const) {
+      const noFinal = renderTurnPreviewSnapshot({ ...state(), status, assistantText: "Draft only" }, undefined, language);
+      expect(noFinal.content).not.toContain("data-answer-action");
+    }
+  });
+
   test("shows a retryable history failure without changing the completed execution status", () => {
     const input = { ...state(), status: "completed" as const, historyDetail: "summary" as const, historyDetailError: "Provider <script>unavailable</script>" };
     const preview = renderTurnPreviewSnapshot(input);
@@ -358,6 +385,41 @@ describe("Turn Preview", () => {
     expect(input.activities.map((activity) => activity.id)).toEqual(["commentary:progress", "tool"]);
   });
 
+  test.each(["zh", "en"] as const)("shows compact command approvals with the full literal command in the %s preview", (language) => {
+    const input = state();
+    const command = '  "C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "' + 'Get-Content C:\\dir\\_name; '.repeat(300) + '\nWrite-Output <script>👋</script>"\n';
+    const reason = 'Read-only inspection: **not bold**\n<at id=all></at> ![image](https://example.test/i.png)';
+    input.status = "waiting_for_approval";
+    input.approval = { id: 'a"<>&', title: command, command, reason, options: [{ id: "accept", label: "Allow Once" }] };
+    const original = structuredClone(input.approval);
+    for (const deferDetails of [false, true]) {
+      const preview = renderTurnPreviewSnapshot(input, undefined, language, { deferDetails });
+      const { document } = parseHTML(preview.content);
+      const notice = document.querySelector('[data-preview-key="approval"]')!;
+      expect(notice.querySelector("h2")?.textContent).toBe(language === "zh" ? "命令执行确认" : "Command approval");
+      expect(notice.querySelector(".approval-reason")?.textContent).toBe(reason);
+      expect(notice.querySelector("pre")?.textContent).toBe(command);
+      expect(notice.querySelectorAll("pre")).toHaveLength(1);
+      const details = notice.querySelector("details")!;
+      expect(details.hasAttribute("open")).toBe(false);
+      expect(details.getAttribute("data-activity-id")).toBe('approval:a"<>&');
+      expect(notice.querySelector("pre")?.getAttribute("data-scroll-id")).toBe('approval:a"<>&:command');
+      expect(details.querySelector("summary")?.textContent).toBe(language === "zh" ? "查看完整命令" : "View full command");
+      expect(notice.querySelector("script,img,at,button,strong,a")).toBeNull();
+      expect(notice.textContent).toContain(language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu.");
+    }
+    expect(input.approval).toEqual(original);
+    input.approval.reason = undefined;
+    input.approval.title = "Check before continuing";
+    expect(renderTurnPreviewSnapshot(input).content).toContain("Check before continuing");
+    input.approval.reason = command;
+    const { document } = parseHTML(renderTurnPreviewSnapshot(input).content);
+    expect(document.querySelector(".approval-reason")?.textContent).toBe("");
+    input.approval = undefined;
+    input.status = "completed";
+    expect(renderTurnPreviewSnapshot(input).content).not.toContain('data-preview-key="approval"');
+  });
+
   test.each(["zh", "en"] as const)("shows pending plan confirmation safely in the %s read-only preview", (language) => {
     const input = state();
     input.status = "waiting_for_approval";
@@ -519,19 +581,122 @@ describe("Turn Preview", () => {
     expect(snapshot.metadata).toContain("tools");
     expect(snapshot.metadata).toContain('title="Turn">42 tokens</span>');
     expect(snapshot.metadata).toContain('title="Model">gpt-5.3-codex</span>');
-    expect(snapshot.metadata).not.toContain("Context");
+    expect(snapshot.metadata).toContain('title="Context: 1,024 tokens">Context 1K tokens</span>');
     expect(snapshot.metadata).not.toContain("Cumulative");
     const chineseMetadata = renderTurnPreviewSnapshot(input, undefined, "zh").metadata;
     expect(chineseMetadata).toContain('title="本轮">42 tokens</span>');
     expect(chineseMetadata).not.toContain("累计");
-    expect(chineseMetadata).not.toContain("上下文");
+    expect(chineseMetadata).toContain('title="上下文: 1,024 tokens">上下文 1K tokens</span>');
     input.contextCompactionBeforeTokens = 1_024;
-    expect(renderTurnPreviewSnapshot(input, undefined, "en").metadata).toContain('title="Compaction">1K → 768 tokens</span>');
+    expect(renderTurnPreviewSnapshot(input, undefined, "en").metadata).not.toContain("Compaction");
 
     const page = renderTurnPreviewPage({ state: input, eventsUrl: "/events", scriptPath: "/client.js", language: "en" });
     expect(page).toContain('<html lang="en">');
     expect(page).toContain('<div class="header-top">');
     expect(page).toContain("Live updates");
+  });
+
+  test.each(["zh", "en"] as const)("shows per-turn model calls only in Preview in %s", (language) => {
+    const label = language === "zh" ? "模型调用" : "Model calls";
+    const renderer = new CardRenderer();
+    for (const status of ["running", "completed", "failed", "cancelled"] as const) {
+      const input = { ...state(), status, completedAt: 2_000 };
+      for (const modelCallCount of [0, 1, 12, 1_234]) {
+        const counted = { ...input, modelCallCount };
+        const snapshot = renderTurnPreviewSnapshot(counted, undefined, language);
+        expect(snapshot.metadata).toContain(`${label} ${modelCallCount.toLocaleString("en-US")}${language === "zh" ? " 次" : ""}</span>`);
+        expect(snapshot.metadata).not.toMatch(/估算|estimated/iu);
+        expect(snapshot.content).toBe(renderTurnPreviewSnapshot(input, undefined, language).content);
+        expect(renderer.renderTurn(counted)).toEqual(renderer.renderTurn(input));
+      }
+    }
+    for (const modelCallCount of [undefined, -1, NaN, Infinity, 1.5]) {
+      expect(renderTurnPreviewSnapshot({ ...state(), modelCallCount, totalTokens: 100, totalToolCount: 4 }, undefined, language)
+        .metadata).not.toContain(label);
+    }
+  });
+
+  test.each(["zh", "en"] as const)("shows recorded context size immediately before model calls in the header in %s", (language) => {
+    const label = language === "zh" ? "上下文" : "Context";
+    for (const status of ["running", "completed"] as const) {
+      const input = { ...state(), status, modelProvider: "azure", model: "gpt-test", latestContextTokens: 128_456,
+        totalTokens: 123, totalTokensIncludingCache: 5_000, cachedInputTokens: 4_877, modelCallCount: 5, totalToolCount: 7 };
+      const { document } = parseHTML(renderTurnPreviewPage({
+        state: input, eventsUrl: "/events", scriptPath: "/client.js", language,
+      }));
+      const fields = Array.from(document.querySelectorAll("#turn-metadata > span"));
+      expect(fields.slice(1).map((field) => field.textContent)).toEqual([
+        "azure", "gpt-test",
+        language === "zh" ? "非缓存 123 tokens" : "Non-cached 123 tokens",
+        language === "zh" ? "总计 5K tokens" : "Total 5K tokens",
+        `${label} 128.5K tokens`,
+        language === "zh" ? "模型调用 5 次" : "Model calls 5",
+        language === "zh" ? "7 个工具" : "7 tools",
+      ]);
+      expect(fields.at(-3)?.getAttribute("title")).toBe(`${label}: 128,456 tokens`);
+    }
+    expect(renderTurnPreviewSnapshot({ ...state(), latestContextTokens: 0 }, undefined, language).metadata)
+      .toContain(`title="${label}: 0 tokens">${label} 0 tokens</span>`);
+  });
+
+  test.each(["zh", "en"] as const)("keeps context before model calls and tools when optional header fields are absent in %s", (language) => {
+    const label = language === "zh" ? "上下文" : "Context";
+    const variants: Partial<TurnViewState>[] = [
+      { modelProvider: "azure", model: "gpt-test", totalTokens: 100, totalTokensIncludingCache: 500 },
+      { totalTokens: 100, totalToolCount: 0 },
+      { model: "gpt-test" },
+      { totalToolCount: 1 },
+      { modelCallCount: 2 },
+      { modelCallCount: 2, totalToolCount: 1 },
+      { modelCallCount: 0, totalToolCount: 0 },
+      {},
+    ];
+    for (const variant of variants) {
+      const { document } = parseHTML(renderTurnPreviewPage({
+        state: { ...state(), ...variant, latestContextTokens: 0 }, eventsUrl: "/events", scriptPath: "/client.js", language,
+      }));
+      const fields = Array.from(document.querySelectorAll("#turn-metadata > span"));
+      const contextIndex = fields.findIndex((field) => field.textContent === label + " 0 tokens");
+      const following = [
+        variant.modelCallCount === undefined ? undefined
+          : language === "zh" ? `模型调用 ${variant.modelCallCount} 次` : `Model calls ${variant.modelCallCount}`,
+        (variant.totalToolCount ?? 0) > 0
+          ? language === "zh" ? `${variant.totalToolCount} 个工具` : `${variant.totalToolCount} tools` : undefined,
+      ].filter((value) => value !== undefined);
+      expect(contextIndex).toBeGreaterThan(0);
+      expect(fields.slice(contextIndex + 1).map((field) => field.textContent)).toEqual(following);
+      expect(fields.filter((field) => field.textContent?.startsWith(label))).toHaveLength(1);
+    }
+  });
+
+  test.each(["zh", "en"] as const)("omits compaction statistics from preview headers without changing the timeline or cards in %s", (language) => {
+    const input = { ...state(), status: "completed" as const, completedAt: 2_000, latestContextTokens: 256, activities: [
+      { kind: "reasoning" as const, id: "compaction", text: "Context compacted: 2048 → 768 tokens" },
+    ] };
+    const metadata = renderTurnPreviewSnapshot(input, undefined, language).metadata;
+    const compactionStates: Partial<TurnViewState>[] = [
+      { contextCompactionBeforeTokens: 2_048 },
+      { contextCompactionAfterTokens: 768 },
+      { contextCompactionBeforeTokens: 2_048, contextCompactionAfterTokens: 768 },
+    ];
+    for (const compaction of compactionStates) {
+      const compacted = { ...input, ...compaction };
+      const renderer = new CardRenderer();
+      const card = renderer.renderTurn(compacted);
+      const snapshot = renderTurnPreviewSnapshot(compacted, undefined, language);
+      expect(snapshot.metadata).toBe(metadata);
+      expect(snapshot.content).toContain("Context compacted: 2048 → 768 tokens");
+      expect(renderer.renderTurn(compacted)).toEqual(card);
+    }
+  });
+
+  test.each(["zh", "en"] as const)("does not infer missing or invalid context size from other token counts in %s", (language) => {
+    const label = language === "zh" ? "上下文" : "Context";
+    for (const latestContextTokens of [undefined, -1, NaN, Infinity]) {
+      const input = { ...state(), latestContextTokens, totalTokens: 100, totalTokensIncludingCache: 1_000,
+        tokenUsageCumulative: 10_000, contextCompactionAfterTokens: 500 };
+      expect(renderTurnPreviewSnapshot(input, undefined, language).metadata).not.toContain(label);
+    }
   });
 
   test.each(["zh", "en"] as const)("renders current-turn totals without cache-hit tokens in %s", (language) => {
@@ -546,6 +711,7 @@ describe("Turn Preview", () => {
     const labels = language === "zh" ? ["非缓存", "总计", "缓存命中"] : ["Non-cached", "Total", "Cache hit"];
     for (const status of ["running", "completed"] as const) {
       const snapshot = renderTurnPreviewSnapshot({ ...input, status }, undefined, language);
+      expect(snapshot.metadata).toContain(language === "zh" ? "模型调用 1 次" : "Model calls 1");
       expect(snapshot.metadata).toContain(`title="${labels[0]}: 8 tokens">${labels[0]} 8 tokens</span>`);
       expect(snapshot.metadata).toContain(`title="${labels[1]}: 3,563 tokens">${labels[1]} 3.6K tokens</span>`);
       expect(snapshot.metadata).not.toContain(labels[2]);

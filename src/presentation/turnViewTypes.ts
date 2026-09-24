@@ -56,6 +56,10 @@ export interface TurnViewState {
   cachedInputTokens?: number;
   tokenUsageTotalCumulative?: number;
   tokenUsageCachedCumulative?: number;
+  /** Effective token-usage updates observed for this turn. */
+  modelCallCount?: number;
+  /** Independent high-water marks; token breakdowns may disappear in partial updates. */
+  modelCallTokenBaseline?: { nonCached?: number; total?: number; totalNeedsRebase?: boolean };
   contextCompactionStatus?: "running" | "completed";
   contextCompactionCount?: number;
   contextCompactionId?: string;

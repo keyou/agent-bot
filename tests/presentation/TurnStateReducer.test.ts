@@ -347,6 +347,101 @@ describe("TurnStateReducer", () => {
     expect(state.totalTokens).toBe(579);
     expect(state.tokenUsageCumulative).toBe(1_456);
     expect(state.latestContextTokens).toBe(121_000);
+    expect(state.modelCallCount).toBe(2);
+  });
+
+  test("counts effective usage updates once and preserves the counter across restore and hydration", () => {
+    const initial = createTurnViewState("s1", "turn_1", 1_000);
+    const first = event("token_usage_updated", { lastTokens: 10, cumulativeTokens: 1_000_000 });
+    let state = reduceTurnEvent(initial, first);
+    expect(state.modelCallCount).toBe(1);
+    state = JSON.parse(JSON.stringify(state)) as typeof state;
+    for (const usage of [first, event("token_usage_updated", { lastTokens: 50, cumulativeTokens: 999_999 }),
+      event("token_usage_updated", { lastTokens: 0, cumulativeTokens: 1_000_000, contextTokens: 50_000 })]) {
+      state = reduceTurnEvent(state, usage);
+      expect(state.modelCallCount).toBe(1);
+    }
+    state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 20, cumulativeTokens: 1_000_020 }));
+    expect(state.modelCallCount).toBe(2);
+    expect(state.totalTokens).toBe(30);
+    expect(reduceTurnEvent(state, { ...first, sessionId: "another" })).toBe(state);
+    expect(reduceTurnEvent(state, { ...first, turnId: "another" })).toBe(state);
+    const hydrated = hydrateTurnViewState(state, { turnId: "turn_1", status: "completed", finalResponse: "Done", items: [] });
+    expect(hydrated.modelCallCount).toBe(2);
+    expect(hydrated.modelCallTokenBaseline).toEqual(state.modelCallTokenBaseline);
+    expect(reduceTurnEvent(hydrated, first).modelCallCount).toBe(2);
+    const next = reduceTurnEvent(createTurnViewState("s1", "turn_2", 2_000), { ...first, turnId: "turn_2" });
+    expect(next.modelCallCount).toBe(1);
+  });
+
+  test("counts cache-only usage and deduplicates legacy and detailed reports of the same usage", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    const update = (fields: Record<string, number>, expected: number) => {
+      state = reduceTurnEvent(state, event("token_usage_updated", fields));
+      expect(state.modelCallCount).toBe(expected);
+    };
+    update({ lastTokens: 0, cumulativeTokens: 100, lastTotalTokens: 50, cumulativeTotalTokens: 500 }, 1);
+    update({ lastTokens: 0, cumulativeTokens: 100, lastTotalTokens: 50, cumulativeTotalTokens: 550 }, 2);
+    update({ lastTokens: 0, cumulativeTokens: 100 }, 2);
+    update({ lastTokens: 0, cumulativeTokens: 100, lastTotalTokens: 50, cumulativeTotalTokens: 550 }, 2);
+    update({ lastTokens: 10, cumulativeTokens: 110 }, 3);
+    state = JSON.parse(JSON.stringify(state)) as typeof state;
+    update({ lastTokens: 10, cumulativeTokens: 100, lastTotalTokens: 100, cumulativeTotalTokens: 500 }, 3);
+    update({ lastTokens: 10, cumulativeTokens: 110, lastTotalTokens: 60, cumulativeTotalTokens: 610 }, 3);
+    update({ lastTokens: 10, cumulativeTokens: 110, lastTotalTokens: 60, cumulativeTotalTokens: 610 }, 3);
+    update({ lastTokens: 0, cumulativeTokens: 110, lastTotalTokens: 50, cumulativeTotalTokens: 660 }, 4);
+    update({ lastTokens: 10, cumulativeTokens: 100, lastTotalTokens: 100, cumulativeTotalTokens: 500 }, 4);
+    update({ lastTokens: 0, cumulativeTokens: 100, lastTotalTokens: 50, cumulativeTotalTokens: 710 }, 5);
+    update({ lastTokens: 0, cumulativeTokens: 100, lastTotalTokens: 50, cumulativeTotalTokens: 710 }, 5);
+    expect(state.totalTokensIncludingCache).toBeUndefined();
+  });
+
+  test("starts with legacy usage and rebases detailed totals without counting the same update again", () => {
+    let state = reduceTurnEvent(createTurnViewState("s1", "turn_1", 1),
+      event("token_usage_updated", { lastTokens: 25, cumulativeTokens: 100 }));
+    const detailed = event("token_usage_updated", { lastTokens: 25, cumulativeTokens: 100,
+      lastTotalTokens: 100, cumulativeTotalTokens: 1_000 });
+    state = reduceTurnEvent(state, detailed);
+    expect(state.modelCallCount).toBe(1);
+    state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 0, cumulativeTokens: 100,
+      lastTotalTokens: 100, cumulativeTotalTokens: 1_100 }));
+    expect(state.modelCallCount).toBe(2);
+  });
+
+  test("ignores invalid usage and counts valid later updates without poisoning the counter", () => {
+    for (const invalid of [NaN, Infinity, -1]) {
+      let state = createTurnViewState("s1", "turn_1", 1);
+      const bad = event("token_usage_updated", { lastTokens: invalid, cumulativeTokens: invalid,
+        lastTotalTokens: invalid, cumulativeTotalTokens: invalid, contextTokens: 100 });
+      state = reduceTurnEvent(state, bad);
+      expect(state.modelCallCount).toBeUndefined();
+      state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 10, cumulativeTokens: 100 }));
+      expect(state.modelCallCount).toBe(1);
+      state = reduceTurnEvent(state, bad);
+      expect(state.modelCallCount).toBe(1);
+      state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 10, cumulativeTokens: 100 }));
+      expect(state.modelCallCount).toBe(1);
+    }
+    const fallback = reduceTurnEvent(createTurnViewState("s1", "turn_1", 1), event("token_usage_updated", {
+      lastTokens: 10, cumulativeTokens: 100, lastTotalTokens: NaN, cumulativeTotalTokens: Infinity,
+    }));
+    expect(fallback.modelCallCount).toBe(1);
+  });
+
+  test("does not count zero usage, inherited cumulative totals, or non-usage activities", () => {
+    const initial = createTurnViewState("s1", "turn_1", 1);
+    let state = reduceTurnEvent(initial, event("progress", { text: "Thinking" }));
+    state = reduceTurnEvent(state, event("tool_started", { tool: tool("cmd", "Read", "running") }));
+    expect(state.modelCallCount).toBeUndefined();
+    state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 0, cumulativeTokens: 1_000,
+      lastTotalTokens: 0, cumulativeTotalTokens: 5_000, contextTokens: 100 }));
+    expect(state.modelCallCount).toBe(0);
+    state = reduceTurnEvent(state, event("token_usage_updated", { lastTokens: 0, cumulativeTokens: 1_000,
+      lastTotalTokens: 10, cumulativeTotalTokens: 5_010, contextTokens: 110 }));
+    expect(state.modelCallCount).toBe(1);
+    const oldSnapshot = { ...initial, totalTokens: 100, tokenUsageCumulative: 1_000 };
+    expect(reduceTurnEvent(oldSnapshot, event("token_usage_updated", { lastTokens: 10, cumulativeTokens: 1_010 }))
+      .modelCallCount).toBeUndefined();
   });
 
   test("accumulates total and cached tokens for this turn, including after snapshot restore", () => {

@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { TurnPreviewJournal, TurnPreviewProjection } from "../../src/state/TurnPreviewJournal.js";
-import { createTurnViewState } from "../../src/presentation/TurnStateReducer.js";
+import { createTurnViewState, reduceTurnEvent } from "../../src/presentation/TurnStateReducer.js";
+import type { AgentEvent } from "../../src/runtime/types.js";
 
 const directories: string[] = [];
 const journals: TurnPreviewJournal[] = [];
@@ -99,6 +100,45 @@ test("preserves long commands, outputs, reasoning, commentary, messages, images 
   expect(state.promptImagePaths).toEqual(["initial.png"]);
   expect(state.finalResponse).toBe(long);
   expect(state.assistantText).toBe(long);
+});
+
+test("persists model call counts and usage baselines without double-counting state patches or replayed events", () => {
+  const journal = setup();
+  let state = createTurnViewState("s", "t", 1_000);
+  const first: AgentEvent = { ...identity, type: "token_usage_updated", lastTokens: 10, cumulativeTokens: 100,
+    lastTotalTokens: 50, cumulativeTotalTokens: 500 };
+  state = reduceTurnEvent(state, first);
+  journal.event(first);
+  journal.state(state);
+  expect(journal.load("t")?.modelCallCount).toBe(1);
+  journal.close();
+  const reopened = new TurnPreviewJournal(journal.directory);
+  journals.push(reopened);
+  reopened.event(first);
+  reopened.event({ ...first, lastTokens: 0, lastTotalTokens: 50, cumulativeTotalTokens: 550 });
+  const completed: AgentEvent = { ...identity, type: "turn_completed", finalResponse: "Done" };
+  reopened.event(completed);
+  const restored = reopened.load("t")!;
+  expect(restored).toMatchObject({ modelCallCount: 2, status: "completed",
+    modelCallTokenBaseline: { nonCached: 100, total: 550 } });
+  const saved = JSON.parse(JSON.stringify(restored)) as typeof restored;
+  expect(reduceTurnEvent(saved, first).modelCallCount).toBe(2);
+  expect(reduceTurnEvent(saved, { ...first, lastTokens: 20, cumulativeTokens: 120, cumulativeTotalTokens: 600 })
+    .modelCallCount).toBe(3);
+});
+
+test("derives calls from saved usage events but does not invent calls for old summary seeds", () => {
+  const journal = setup();
+  const first: AgentEvent = { ...identity, type: "token_usage_updated", lastTokens: 10, cumulativeTokens: 100 };
+  journal.event(first);
+  // Old state records do not contain the new counter, so replay retains the observed count.
+  journal.state({ ...createTurnViewState("s", "t", 1_000), totalTokens: 10, tokenUsageCumulative: 100 });
+  journal.event(first);
+  journal.event({ ...first, cumulativeTokens: 110 });
+  expect(journal.load("t")?.modelCallCount).toBe(2);
+  journal.seed({ ...createTurnViewState("s", "old", 1_000), totalTokens: 10, tokenUsageCumulative: 100 });
+  journal.event({ ...first, turnId: "old", cumulativeTokens: 110 });
+  expect(journal.load("old")?.modelCallCount).toBeUndefined();
 });
 
 test("ignores incomplete UTF-8 tail and repairs it before the next append", () => {

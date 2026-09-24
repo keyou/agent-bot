@@ -3,7 +3,7 @@ import path from "node:path";
 import { enableDiagramFences, DIAGRAM_PREVIEW_CLIENT_SCRIPT, DIAGRAM_PREVIEW_CSS } from "./DiagramPreview.js";
 import MarkdownIt from "markdown-it";
 import { highlightPreviewCode, PREVIEW_SYNTAX_CSS } from "./PreviewSyntaxHighlight.js";
-import type { ToolState } from "../runtime/types.js";
+import type { ApprovalRequest, ToolState } from "../runtime/types.js";
 import type { FileSummary, TurnActivity, TurnReasoningItem, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
 import { displayFilePath, displayToolCommand, formatShellCommandForDisplay, toolStatusIcon } from "../feishu/CardRenderer.js";
 import { turnReasoningItems } from "../presentation/turnReasoning.js";
@@ -41,6 +41,8 @@ const PREVIEW_LABELS = {
     error: "错误",
     reasoning: "思考",
     finalAnswer: "最终回答",
+    downloadMarkdown: "下载 Markdown",
+    copyMarkdown: "复制 Markdown",
     generating: "回答生成中",
     command: "命令",
     result: "结果",
@@ -51,12 +53,13 @@ const PREVIEW_LABELS = {
     noToolDetails: "没有可显示的工具详情。",
     fileChanges: "文件变更",
     model: "模型",
+    modelCalls: "模型调用",
+    modelCallsDescription: "本轮有效 Token 用量更新次数",
+    contextTokens: "上下文",
     tools: "个工具",
     turnTokens: "本轮",
     totalTokens: "总计",
     nonCachedTokens: "非缓存",
-    compactionTokens: "压缩",
-    compactionAfterTokens: "压缩后",
     characters: "字符",
     truncated: "较早的活动已被运行时截断；本页展示 Agent Bot 当前保存的完整快照。",
     statuses: {
@@ -82,6 +85,8 @@ const PREVIEW_LABELS = {
     error: "Error",
     reasoning: "Reasoning",
     finalAnswer: "Final answer",
+    downloadMarkdown: "Download Markdown",
+    copyMarkdown: "Copy Markdown",
     generating: "Generating answer",
     command: "Command",
     result: "Result",
@@ -92,12 +97,13 @@ const PREVIEW_LABELS = {
     noToolDetails: "No tool details available.",
     fileChanges: "File changes",
     model: "Model",
+    modelCalls: "Model calls",
+    modelCallsDescription: "Effective token usage updates in this turn",
+    contextTokens: "Context",
     tools: "tools",
     turnTokens: "Turn",
     totalTokens: "Total",
     nonCachedTokens: "Non-cached",
-    compactionTokens: "Compaction",
-    compactionAfterTokens: "After compaction",
     characters: "characters",
     truncated: "Earlier activities were truncated by the runtime; this page shows the complete snapshot currently saved by Agent Bot.",
     statuses: {
@@ -152,7 +158,76 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
     loading: isChinese ? "正在加载…" : "Loading…",
     loadFailed: isChinese ? "加载失败，请重试。" : "Could not load details.",
     retry: isChinese ? "重试" : "Retry",
+    copied: isChinese ? "已复制 Markdown" : "Markdown copied",
+    downloaded: isChinese ? "已开始下载" : "Download started",
+    copyFailed: isChinese ? "复制失败，请检查浏览器剪贴板权限后重试。" : "Copy failed. Check clipboard permissions and retry.",
+    downloadFailed: isChinese ? "下载失败，请重试。" : "Download failed. Please retry.",
   };
+  const copyMarkdownFallback = (text) => {
+    const active = document.activeElement;
+    const selection = window.getSelection?.();
+    const ranges = selection ? Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange()) : [];
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.readOnly = true;
+    textarea.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none";
+    document.body.append(textarea);
+    try {
+      textarea.focus({ preventScroll: true });
+      textarea.select();
+      textarea.setSelectionRange(0, text.length);
+      if (!document.execCommand?.("copy")) throw new Error("Clipboard unavailable");
+    } finally {
+      textarea.remove();
+      active?.focus?.({ preventScroll: true });
+      if (selection) {
+        selection.removeAllRanges();
+        for (const range of ranges) selection.addRange(range);
+      }
+    }
+  };
+  const copyMarkdown = async (text) => {
+    if (window.navigator?.clipboard?.writeText) {
+      try { await window.navigator.clipboard.writeText(text); return; } catch {}
+    }
+    copyMarkdownFallback(text);
+  };
+  const answerActionsInFlight = new WeakSet();
+  content.addEventListener("click", async (event) => {
+    const button = event.target.closest?.("button[data-answer-action]");
+    const section = button?.closest(".final-result[data-answer-markdown]");
+    if (!section || !content.contains(section) || answerActionsInFlight.has(button)) return;
+    const action = button.dataset.answerAction;
+    if (action !== "copy" && action !== "download") return;
+    event.preventDefault();
+    const feedback = section.querySelector("[data-answer-feedback]");
+    answerActionsInFlight.add(button);
+    button.disabled = true;
+    try {
+      const markdown = new TextDecoder("utf-8", { ignoreBOM: true }).decode(Uint8Array.from(atob(section.dataset.answerMarkdown), (char) => char.charCodeAt(0)));
+      if (action === "copy") await copyMarkdown(markdown);
+      else {
+        const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown;charset=utf-8" }));
+        const link = document.createElement("a");
+        try {
+          link.href = url;
+          link.download = section.dataset.answerFilename;
+          link.hidden = true;
+          document.body.append(link);
+          link.click();
+        } finally {
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+      }
+      if (feedback) feedback.textContent = action === "copy" ? labels.copied : labels.downloaded;
+    } catch {
+      if (feedback) feedback.textContent = action === "copy" ? labels.copyFailed : labels.downloadFailed;
+    } finally {
+      button.disabled = false;
+      answerActionsInFlight.delete(button);
+    }
+  });
 
   let source;
   const terminalAtLoad = document.body.dataset.terminal === "true";
@@ -589,10 +664,10 @@ export function renderTurnPreviewSnapshot(
       : "",
     `<section class="timeline" data-preview-key="timeline"${timelineContent ? "" : " hidden"}>${timelineContent}</section>`,
     state.fileSummary.length > 0 ? renderFileSummary(state, language, resolveFileUrl, options.deferDetails) : "",
-    state.approval ? `<section class="notice" data-preview-key="approval"><h2>${escapeHtml(state.approval.title)}</h2><div class="markdown">${renderText(state.approval.reason ?? "")}</div><p>${escapeHtml(language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu.")}</p></section>` : "",
+    state.approval ? renderApprovalNotice(state.approval, renderText, language) : "",
     state.error ? `<section class="result error-result" data-preview-key="error"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(state.error)}</pre></section>` : "",
     state.finalResponse
-      ? `<section class="result final-result" data-preview-key="result"><h2>${escapeHtml(labels.finalAnswer)}</h2><div class="markdown">${renderText(state.finalResponse)}</div></section>`
+      ? renderFinalAnswer(state.finalResponse, state.turnId, renderText, language)
       : state.assistantText
         ? `<section class="result" data-preview-key="result"><h2>${escapeHtml(labels.generating)}</h2><div class="markdown">${renderText(state.assistantText)}</div></section>`
         : "",
@@ -604,6 +679,31 @@ export function renderTurnPreviewSnapshot(
     statusLabel: statusLabel(state.status, language),
     terminal,
   };
+}
+
+function renderApprovalNotice(request: ApprovalRequest, renderText: (value: string) => string, language: TurnPreviewLanguage): string {
+  const command = request.command?.trim();
+  const commandApproval = command && request.kind !== "mode_change";
+  const title = commandApproval ? language === "zh" ? "命令执行确认" : "Command approval" : request.title;
+  const reason = commandApproval
+    ? request.reason?.trim() || (request.title.trim() !== command ? request.title : "")
+    : request.reason ?? "";
+  const description = commandApproval
+    ? `<p class="approval-reason">${escapeHtml(reason === command ? "" : reason)}</p>`
+    : `<div class="markdown">${renderText(reason)}</div>`;
+  const details = commandApproval
+    ? `<details class="approval-details" data-activity-id="approval:${escapeAttribute(request.id)}"><summary>${language === "zh" ? "查看完整命令" : "View full command"}</summary><pre data-scroll-id="approval:${escapeAttribute(request.id)}:command">${escapeHtml(request.command!)}</pre></details>` : "";
+  return `<section class="notice" data-preview-key="approval"><h2>${escapeHtml(title)}</h2>${description}${details}<p>${language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu."}</p></section>`;
+}
+
+function renderFinalAnswer(markdown: string, turnId: string, renderText: (value: string) => string, language: TurnPreviewLanguage): string {
+  const labels = previewLabels(language);
+  const filename = `turn-${turnId.replace(/[^A-Za-z0-9_-]/gu, "_").slice(0, 80) || "answer"}.md`;
+  const icon = (paths: string): string => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths}</svg>`;
+  const button = (action: string, label: string, paths: string): string => `<button type="button" class="answer-action" data-answer-action="${action}" title="${escapeAttribute(label)}" aria-label="${escapeAttribute(label)}">${icon(paths)}</button>`;
+  const actions = button("download", labels.downloadMarkdown, '<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>')
+    + button("copy", labels.copyMarkdown, '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>');
+  return `<section class="result final-result" data-preview-key="result" data-answer-markdown="${Buffer.from(markdown, "utf8").toString("base64")}" data-answer-filename="${filename}"><div class="result-heading"><h2>${escapeHtml(labels.finalAnswer)}</h2>${actions}<span class="answer-feedback" data-answer-feedback role="status" aria-live="polite"></span></div><div class="markdown">${renderText(markdown)}</div></section>`;
 }
 
 function renderPlan(state: TurnViewState, language: TurnPreviewLanguage): string {
@@ -1092,7 +1192,7 @@ function renderMetadata(state: TurnViewState, language: TurnPreviewLanguage): st
     ? state.startedAt + state.durationMs
     : undefined);
   const elapsed = `<span>${escapeHtml(labels.elapsed)}<strong${isTerminal(state.status) ? "" : ` data-live-elapsed data-started-at="${state.startedAt}"`}>${completedAt === undefined && isTerminal(state.status) ? escapeHtml(labels.unknown) : formatDuration((completedAt ?? Date.now()) - state.startedAt)}</strong></span>`;
-  return [
+  const fields = [
     elapsed,
     state.modelProvider?.trim() ? `<span title="Provider">${escapeHtml(state.modelProvider.trim())}</span>` : "",
     state.model?.trim() ? `<span title="${escapeAttribute(labels.model)}">${escapeHtml(state.model.trim())}</span>` : "",
@@ -1100,11 +1200,13 @@ function renderMetadata(state: TurnViewState, language: TurnPreviewLanguage): st
       ? `<span title="${escapeAttribute(labels.turnTokens)}">${formatTokenCount(state.totalTokens)} tokens</span>`
       : `<span title="${escapeAttribute(labels.nonCachedTokens)}: ${formatNumber(state.totalTokens)} tokens">${escapeHtml(labels.nonCachedTokens)} ${formatTokenCount(state.totalTokens)} tokens</span>`,
     state.totalTokensIncludingCache === undefined ? "" : `<span title="${escapeAttribute(labels.totalTokens)}: ${formatNumber(state.totalTokensIncludingCache)} tokens">${escapeHtml(labels.totalTokens)} ${formatTokenCount(state.totalTokensIncludingCache)} tokens</span>`,
-    state.contextCompactionAfterTokens === undefined ? "" : state.contextCompactionBeforeTokens === undefined
-      ? `<span title="${escapeAttribute(labels.compactionAfterTokens)}">${formatTokenCount(state.contextCompactionAfterTokens)} tokens</span>`
-      : `<span title="${escapeAttribute(labels.compactionTokens)}">${formatTokenCount(state.contextCompactionBeforeTokens)} → ${formatTokenCount(state.contextCompactionAfterTokens)} tokens</span>`,
+    state.latestContextTokens !== undefined && Number.isFinite(state.latestContextTokens) && state.latestContextTokens >= 0
+      ? `<span title="${escapeAttribute(labels.contextTokens)}: ${formatNumber(state.latestContextTokens)} tokens">${escapeHtml(labels.contextTokens)} ${formatTokenCount(state.latestContextTokens)} tokens</span>` : "",
+    state.modelCallCount !== undefined && Number.isSafeInteger(state.modelCallCount) && state.modelCallCount >= 0
+      ? `<span title="${escapeAttribute(labels.modelCallsDescription)}">${escapeHtml(labels.modelCalls)} ${formatNumber(state.modelCallCount)}${language === "zh" ? " 次" : ""}</span>` : "",
     (state.totalToolCount ?? 0) > 0 ? `<span>${formatNumber(state.totalToolCount ?? 0)} ${escapeHtml(labels.tools)}</span>` : "",
-  ].filter(Boolean).join("");
+  ].filter(Boolean);
+  return fields.join("");
 }
 
 function previewTitle(state: TurnViewState): string {
@@ -1310,6 +1412,17 @@ summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; 
 .detail-message button { margin-left: 8px; cursor: pointer; }
 .tool-image img { display: block; max-width: 100%; max-height: 720px; }
 .final-result h2 { color: var(--success); }
+.approval-reason { white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-reason:empty { display: none; }
+.approval-details { margin: 8px 0; }
+.approval-details pre { max-height: 30em; }
+.result-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-bottom: 8px; }
+.result-heading h2 { margin: 0 4px 0 0; }
+.answer-action { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 30px; height: 30px; padding: 0; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
+.answer-action:hover { color: var(--accent); background: var(--surface); }
+.answer-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.answer-action:disabled { opacity: 0.5; cursor: wait; }
+.answer-feedback { min-width: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 @media (max-width: 700px) {
   .header-inner { padding: 5px 12px; }
   .header-top { flex-basis: 100%; }

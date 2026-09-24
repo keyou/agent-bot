@@ -26,12 +26,16 @@ function initialState(): TurnViewState {
   };
 }
 
-function startClient(initial = initialState(), lazy = false) {
+function startClient(initial = initialState(), lazy = false, options: {
+  clipboard?: { writeText: (text: string) => Promise<void> };
+  legacyCopy?: (text: string) => boolean;
+  language?: "zh" | "en";
+} = {}) {
   let current = initial;
   const { document } = parseHTML(renderTurnPreviewPage({
-    state: initial, eventsUrl: "/turn-events", scriptPath: "/client.js", localFileUrl,
+    state: initial, eventsUrl: "/turn-events", scriptPath: "/client.js", localFileUrl, language: options.language,
   }));
-  if (!lazy) document.getElementById("turn-content")!.innerHTML = renderTurnPreviewSnapshot(initial, localFileUrl).content;
+  if (!lazy) document.getElementById("turn-content")!.innerHTML = renderTurnPreviewSnapshot(initial, localFileUrl, options.language).content;
   const requests: Array<{ key: string; signal: AbortSignal }> = [];
   const fetchDetail = vi.fn(async (url: URL, options: { signal: AbortSignal }) => {
     const key = url.searchParams.get("detail")!;
@@ -49,10 +53,37 @@ function startClient(initial = initialState(), lazy = false) {
   const frames: Array<() => void> = [];
   const setInterval = vi.fn();
   const scrollTo = vi.fn();
-  const window = { location: { href: "https://viewer.test/turn" }, scrollY: 120, innerHeight: 600, scrollTo, addEventListener: vi.fn() };
+  const window = { location: { href: "https://viewer.test/turn" }, scrollY: 120, innerHeight: 600, scrollTo, addEventListener: vi.fn(),
+    navigator: { clipboard: options.clipboard } };
+  const blobs = new Map<string, Blob>();
+  const createObjectURL = vi.fn((blob: Blob) => {
+    const url = "blob:answer-" + blobs.size;
+    blobs.set(url, blob);
+    return url;
+  });
+  const revokeObjectURL = vi.fn((url: string) => { blobs.delete(url); });
+  class PreviewURL extends URL {
+    static override createObjectURL = createObjectURL;
+    static override revokeObjectURL = revokeObjectURL;
+  }
+  const downloads: Array<{ filename: string; blob?: Blob }> = [];
+  const createElement = document.createElement.bind(document);
+  document.createElement = ((tag: string) => {
+    const element = createElement(tag);
+    if (tag === "a") element.click = () => {
+      downloads.push({ filename: element.getAttribute("download") ?? "", blob: blobs.get(element.getAttribute("href") ?? "") });
+    };
+    if (tag === "textarea") {
+      Object.assign(element, { select: vi.fn(), setSelectionRange: vi.fn() });
+    }
+    return element;
+  }) as typeof document.createElement;
+  const legacyCopy = vi.fn(() => options.legacyCopy?.(document.querySelector("textarea")?.value ?? "") ?? false);
+  Object.assign(document, { execCommand: legacyCopy });
   Object.defineProperty(document.documentElement, "scrollHeight", { value: 2_000, configurable: true });
   runInNewContext(TURN_PREVIEW_CLIENT_SCRIPT, {
-    document, window, EventSource, setInterval, clearInterval: vi.fn(), setTimeout, clearTimeout, AbortController, URL, fetch: fetchDetail,
+    document, window, EventSource, setInterval, clearInterval: vi.fn(), setTimeout, clearTimeout, AbortController,
+    URL: PreviewURL, Blob, TextDecoder, atob, fetch: fetchDetail,
     requestAnimationFrame: (callback: () => void) => frames.push(callback),
   });
   const element = <T extends Element = HTMLElement>(selector: string): T => {
@@ -73,11 +104,144 @@ function startClient(initial = initialState(), lazy = false) {
     details.dispatchEvent(new document.defaultView!.Event("toggle", { bubbles: true }));
   };
   const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
-  return { document, element, update, flushFrames, close, setInterval, scrollTo, window, listeners, requests, fetchDetail, toggle, settle };
+  return { document, element, update, flushFrames, close, setInterval, scrollTo, window, listeners, requests, fetchDetail, toggle, settle,
+    downloads, createObjectURL, revokeObjectURL, legacyCopy };
 
 }
 
 describe("Turn Preview incremental client", () => {
+  test.each(["update", "patch"] as const)("retains command approval expansion and scroll during live %s updates", (event) => {
+    const initial = initialState();
+    initial.status = "waiting_for_approval";
+    initial.activities = [];
+    initial.approval = { id: "a1", title: "command", command: "Get-Content file.txt", reason: "Read files", options: [] };
+    const client = startClient(initial);
+    const details = client.element(".approval-details");
+    client.toggle(".approval-details", true);
+    const command = client.element(".approval-details pre");
+    command.scrollLeft = 27;
+    command.scrollTop = 42;
+    const update = (state: TurnViewState) => {
+      if (event === "update") client.update(state);
+      else client.listeners.get("patch")!({ data: JSON.stringify(renderTurnPreviewPatch(state, new Set(), new Set(), localFileUrl, "zh")) });
+      client.flushFrames();
+    };
+    update({ ...initial, approval: { ...initial.approval, reason: "Read files before the next step" } });
+    expect(client.element(".approval-details")).toBe(details);
+    expect(details.hasAttribute("open")).toBe(true);
+    expect(client.element(".approval-details pre")).toBe(command);
+    expect([command.scrollLeft, command.scrollTop]).toEqual([27, 42]);
+    update({ ...initial, approval: { ...initial.approval, id: "a2", command: "git status" } });
+    expect(client.element(".approval-details").hasAttribute("open")).toBe(false);
+    expect(client.element(".approval-details pre").textContent).toBe("git status");
+    update({ ...initial, status: "running", approval: undefined });
+    expect(client.document.querySelector('[data-preview-key="approval"]')).toBeNull();
+  });
+
+  test("copies raw Markdown and downloads an exact UTF-8 .md file from an already completed page", async () => {
+    const markdown = '\n# 结果 👋\r\n\r\n**bold**\n|a|b|\n|-|-|\n|1|2|\n[原链接](dir/file.md)\n\n    code\n<script>alert("text")</script>\n';
+    const writeText = vi.fn(async () => undefined);
+    const client = startClient({ ...initialState(), status: "completed", finalResponse: markdown }, false, { clipboard: { writeText } });
+    expect(client.listeners.size).toBe(0);
+    client.element<HTMLButtonElement>('[data-answer-action="copy"]').click();
+    await client.settle();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(markdown);
+    expect(client.legacyCopy).not.toHaveBeenCalled();
+    expect(client.element("[data-answer-feedback]").textContent).toBe("已复制 Markdown");
+    client.element('[data-answer-action="download"] path')
+      .dispatchEvent(new client.document.defaultView!.Event("click", { bubbles: true }));
+    await client.settle();
+    expect(client.downloads).toHaveLength(1);
+    expect(client.downloads[0]?.filename).toBe("turn-turn.md");
+    expect(client.downloads[0]?.blob?.type).toBe("text/markdown;charset=utf-8");
+    expect(await client.downloads[0]?.blob?.text()).toBe(markdown);
+    expect(client.document.querySelector('a[download]')).toBeNull();
+    expect(client.element("[data-answer-feedback]").textContent).toBe("已开始下载");
+    await vi.waitFor(() => expect(client.revokeObjectURL).toHaveBeenCalledExactlyOnceWith("blob:answer-0"), { timeout: 3_000 });
+  });
+
+  test.each(["unavailable", "denied"])("falls back to legacy copy when clipboard access is %s", async (mode) => {
+    const markdown = "**HTTP LAN preview**\r\n中文";
+    const legacyCopy = vi.fn(() => true);
+    const client = startClient({ ...initialState(), status: "completed", finalResponse: markdown }, false, {
+      clipboard: mode === "denied" ? { writeText: vi.fn(async () => { throw new Error("Denied"); }) } : undefined,
+      legacyCopy,
+    });
+    client.element<HTMLButtonElement>('[data-answer-action="copy"]').click();
+    await client.settle();
+    expect(legacyCopy).toHaveBeenCalledExactlyOnceWith(markdown);
+    expect(client.legacyCopy).toHaveBeenCalledExactlyOnceWith("copy");
+    expect(client.document.querySelector("textarea")).toBeNull();
+    expect(client.element("[data-answer-feedback]").textContent).toBe("已复制 Markdown");
+  });
+
+  test("ignores duplicate copy clicks while pending and preserves leading BOMs", async () => {
+    const markdown = "\ufeff# Original Markdown\n";
+    let resolveCopy: (() => void) | undefined;
+    const writeText = vi.fn(() => new Promise<void>((resolve) => { resolveCopy = resolve; }));
+    const client = startClient({ ...initialState(), status: "completed", finalResponse: markdown }, false, { clipboard: { writeText } });
+    const copy = client.element<HTMLButtonElement>('[data-answer-action="copy"]');
+    copy.click();
+    copy.click();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(markdown);
+    expect(copy.disabled).toBe(true);
+    resolveCopy!();
+    await client.settle();
+    expect(copy.disabled).toBe(false);
+    expect(client.element("[data-answer-feedback]").textContent).toBe("已复制 Markdown");
+  });
+
+  test("reports export failures and allows retries without claiming success", async () => {
+    const legacyCopy = vi.fn(() => false);
+    const client = startClient({ ...initialState(), status: "completed", finalResponse: "# Answer" }, false, { legacyCopy, language: "en" });
+    const copy = client.element<HTMLButtonElement>('[data-answer-action="copy"]');
+    copy.click();
+    await client.settle();
+    expect(client.element("[data-answer-feedback]").textContent).toContain("Copy failed");
+    expect(copy.disabled).toBe(false);
+    expect(client.document.querySelector("textarea")).toBeNull();
+    legacyCopy.mockReturnValue(true);
+    copy.click();
+    await client.settle();
+    expect(client.element("[data-answer-feedback]").textContent).toBe("Markdown copied");
+
+    client.createObjectURL.mockImplementationOnce(() => { throw new Error("Download blocked"); });
+    const download = client.element<HTMLButtonElement>('[data-answer-action="download"]');
+    download.click();
+    await client.settle();
+    expect(client.element("[data-answer-feedback]").textContent).toContain("Download failed");
+    expect(download.disabled).toBe(false);
+    expect(client.downloads).toHaveLength(0);
+  });
+
+  test.each(["update", "patch"] as const)("exports the latest final Markdown after a live %s without rebinding buttons", async (event) => {
+    const initial = initialState();
+    initial.assistantText = "Draft";
+    const writeText = vi.fn(async () => undefined);
+    const client = startClient(initial, false, { clipboard: { writeText } });
+    expect(client.document.querySelector("[data-answer-action]")).toBeNull();
+    const update = (finalResponse: string) => {
+      const next = { ...initial, status: "completed" as const, finalResponse };
+      if (event === "update") client.update(next);
+      else client.listeners.get("patch")!({ data: JSON.stringify(renderTurnPreviewPatch(next, new Set(), new Set(), localFileUrl, "zh")) });
+    };
+    update("**First answer**");
+    const copy = client.element<HTMLButtonElement>('[data-answer-action="copy"]');
+    copy.click();
+    await client.settle();
+    expect(writeText).toHaveBeenLastCalledWith("**First answer**");
+    update("# Corrected answer\n中文");
+    expect(client.element('[data-answer-action="copy"]')).toBe(copy);
+    copy.click();
+    await client.settle();
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenLastCalledWith("# Corrected answer\n中文");
+    expect(client.document.querySelectorAll("[data-answer-action]")).toHaveLength(2);
+    client.element<HTMLButtonElement>('[data-answer-action="download"]').click();
+    await client.settle();
+    expect(await client.downloads[0]?.blob?.text()).toBe("# Corrected answer\n中文");
+  });
+
   test.each(["update", "patch"] as const)("keeps a generic processing header across tool transitions via %s", (event) => {
     const initial = initialState();
     const client = startClient(initial);
@@ -341,10 +505,16 @@ describe("Turn Preview incremental client", () => {
     expect(outputText?.textContent).toContain("More information");
   });
 
-  test("metadata-only and duplicate snapshots do not touch the content DOM or reset scroll", () => {
+  test.each(["update", "patch"] as const)("metadata-only and duplicate %s events do not touch the content DOM or reset scroll", (event) => {
     const input = initialState();
+    const tool = input.activities[0];
+    if (tool?.kind === "tool") { tool.tool.status = "completed"; tool.tool.completedAt = 2_000; }
     const client = startClient(input);
-    client.update(input);
+    const update = (state: TurnViewState) => {
+      if (event === "update") client.update(state);
+      else client.listeners.get("patch")!({ data: JSON.stringify(renderTurnPreviewPatch(state, new Set(), new Set(), localFileUrl, "zh")) });
+    };
+    update(input);
     client.flushFrames();
     const content = client.element("#turn-content");
     const details = client.element("details");
@@ -354,21 +524,40 @@ describe("Turn Preview incremental client", () => {
     const images = client.element(".tool-image img");
     const imageAttributes = vi.spyOn(images, "setAttribute");
     client.scrollTo.mockClear();
-    const next = { ...input, totalTokens: 3, totalTokensIncludingCache: 103, cachedInputTokens: 100 };
-    client.update(next);
+    const next = { ...input, totalTokens: 3, totalTokensIncludingCache: 103, cachedInputTokens: 100, modelCallCount: 1 };
+    update(next);
     client.flushFrames();
     expect(content.innerHTML).toBe(before);
     expect(insert).not.toHaveBeenCalled();
     expect(imageAttributes).not.toHaveBeenCalled();
     expect(client.element("#turn-metadata").textContent).toContain("非缓存 3 tokens");
     expect(client.element("#turn-metadata").textContent).toContain("总计 103 tokens");
+    expect(client.element("#turn-metadata").textContent).toContain("模型调用 1 次");
     expect(client.element("#turn-metadata").textContent).not.toContain("缓存命中");
-    client.update({ ...next, modelProvider: "azure", model: "gpt-test" });
+    update({ ...next, modelProvider: "azure", model: "gpt-test" });
     client.flushFrames();
     const metadata = client.element("#turn-metadata");
+    for (const modelCallCount of [2, 2, 3]) {
+      update({ ...next, modelProvider: "azure", model: "gpt-test", modelCallCount });
+      client.flushFrames();
+      expect(metadata.textContent).toContain(`模型调用 ${modelCallCount} 次`);
+    }
     expect(metadata.textContent).not.toContain("Provider:");
     expect(Array.from(metadata.querySelectorAll("span"), (span) => span.textContent).slice(1, 3))
       .toEqual(["azure", "gpt-test"]);
+    for (const [latestContextTokens, expected] of [[128_456, "128.5K"], [32_000, "32K"], [0, "0"]] as const) {
+      update({ ...next, modelProvider: "azure", model: "gpt-test", latestContextTokens,
+        totalToolCount: latestContextTokens === 0 ? 0 : 2,
+        contextCompactionBeforeTokens: 128_456, contextCompactionAfterTokens: 32_000 });
+      client.flushFrames();
+      expect(metadata.textContent).toContain(`上下文 ${expected} tokens`);
+      const context = Array.from(metadata.children).find((field) => field.textContent === `上下文 ${expected} tokens`);
+      expect(context?.nextElementSibling?.textContent).toBe("模型调用 1 次");
+      expect(metadata.innerHTML).not.toContain("压缩");
+      expect(metadata.textContent).not.toContain("→");
+      expect(metadata.textContent).toContain("总计 103 tokens");
+      expect(metadata.textContent).toContain("非缓存 3 tokens");
+    }
     expect(content.innerHTML).toBe(before);
     expect(client.element("details")).toBe(details);
     expect(details.hasAttribute("open")).toBe(true);
