@@ -30,6 +30,7 @@ import type {
 import { appendGeneratedImageMarkdown } from "../utils/generatedImageMarkdown.js";
 import { normalizeTaskTitle } from "../utils/taskTitle.js";
 import { AppServerRequestError } from "./AppServerConnection.js";
+import { workspaceSandboxFromConfig, workspaceSandboxFromResponse, type TurnSandboxPolicy, type WorkspaceSandboxPolicy } from "./AppServerPermissions.js";
 import { formatCodexError, mapCodexNotification } from "./CodexEventMapper.js";
 import { CodexLocalActivityDetector } from "./CodexLocalActivityDetector.js";
 import { detectProjectlessWorkspace } from "./ProjectlessWorkspace.js";
@@ -89,6 +90,7 @@ interface CodexSession extends RuntimeSession {
   unphasedMessages: Map<string, string>;
   unphasedFinalMessageId?: string;
   needsResume: boolean;
+  workspaceSandboxPolicy?: WorkspaceSandboxPolicy;
   canReplaceEmptyThread: boolean;
   settingsRecoveryError?: string;
   rolloutPath?: string;
@@ -242,7 +244,7 @@ export class CodexRuntime implements AgentRuntime {
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
     session.canReplaceEmptyThread = false;
-    const start = () => client.request<{ turn: { id: string } }>("turn/start", {
+    const start = async () => client.request<{ turn: { id: string } }>("turn/start", {
       threadId: session.remoteSessionId,
       input: codexUserInput(prompt),
       cwd: session.cwd,
@@ -250,6 +252,7 @@ export class CodexRuntime implements AgentRuntime {
       effort: session.reasoningEffort,
       summary: "auto",
       approvalPolicy: session.permissionMode === "auto" ? "never" : "on-request",
+      sandboxPolicy: await this.turnSandboxPolicy(session, client),
     }, SESSION_REQUEST_TIMEOUT_MS);
     let response: { turn: { id: string } };
     try {
@@ -812,6 +815,7 @@ export class CodexRuntime implements AgentRuntime {
         threadId: response.thread.id, name: session.title,
       }, SESSION_REQUEST_TIMEOUT_MS);
       const candidate = { ...session, ...settings, remoteSessionId: response.thread.id,
+        workspaceSandboxPolicy: workspaceSandboxFromResponse(response.sandbox),
         needsResume: false, settingsRecoveryError: undefined };
       await persist?.(candidate);
       Object.assign(session, candidate);
@@ -831,6 +835,7 @@ export class CodexRuntime implements AgentRuntime {
           });
           if (restored.thread.id !== previous.remoteSessionId) throw new Error("恢复时返回了不同的任务 ID。");
           session.needsResume = false;
+          session.workspaceSandboxPolicy = workspaceSandboxFromResponse(restored.sandbox);
           session.settingsRecoveryError = undefined;
         } catch (restoreError) {
           this.logger.warn({ error: restoreError, sessionId }, "Failed to restore Provider after a rejected settings change.");
@@ -1395,7 +1400,7 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   private async resumeAppServerSession(session: CodexSession, client: AppServerClient): Promise<void> {
-    await client.request("thread/resume", {
+    const response = await client.request<ThreadResponse>("thread/resume", {
       threadId: session.remoteSessionId,
       excludeTurns: true,
       cwd: session.cwd,
@@ -1404,6 +1409,19 @@ export class CodexRuntime implements AgentRuntime {
       ...threadLifecycleParams(session.cwd),
       ...permissionParams(session.permissionMode),
     }, SESSION_REQUEST_TIMEOUT_MS);
+    session.workspaceSandboxPolicy = workspaceSandboxFromResponse(response.sandbox);
+  }
+
+  private async turnSandboxPolicy(session: CodexSession, client: AppServerClient): Promise<TurnSandboxPolicy> {
+    if (session.permissionMode === "auto") return { type: "dangerFullAccess" };
+    if (!session.workspaceSandboxPolicy) {
+      // Resolve project-specific options once, without resuming or scanning history.
+      const response = await client.request<{ config?: unknown }>("config/read", {
+        cwd: session.cwd, includeLayers: false,
+      }, CONTROL_REQUEST_TIMEOUT_MS);
+      session.workspaceSandboxPolicy = workspaceSandboxFromConfig(response.config);
+    }
+    return session.workspaceSandboxPolicy;
   }
 
   private async synchronizeSessionNow(sessionId: string): Promise<RuntimeSession> {
@@ -1577,6 +1595,7 @@ export class CodexRuntime implements AgentRuntime {
       messagePhases: new Map(),
       unphasedMessages: new Map(),
       needsResume: false,
+      workspaceSandboxPolicy: workspaceSandboxFromResponse(response.sandbox),
       canReplaceEmptyThread: !("remoteSessionId" in input),
       rolloutPath: stringValue(response.thread.path)?.trim() || undefined,
       turnCount: "remoteSessionId" in input ? undefined : 0,
@@ -1649,6 +1668,7 @@ interface ThreadResponse {
   modelProvider?: string;
   model?: string;
   reasoningEffort?: string | null;
+  sandbox?: unknown;
 }
 
 interface ThreadReadResponse {

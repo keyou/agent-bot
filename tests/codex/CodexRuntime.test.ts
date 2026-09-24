@@ -1630,6 +1630,142 @@ describe("CodexRuntime", () => {
     })));
   });
 
+  test.each(["codex", "traex"])("applies both permission policies on the next %s turn without restarting or replacing the thread", async (agentName) => {
+    const client = new FakeAppServerClient();
+    const connection = provider(client);
+    const runtime = new CodexRuntime(connection, logger());
+    const workspacePolicy = { type: "workspaceWrite", writableRoots: [path.join(process.cwd(), "extra")],
+      networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true };
+    client.startResult = { thread: { id: "thr_1" }, model: "gpt-test", reasoningEffort: "medium", sandbox: workspacePolicy };
+    const session = await runtime.createSession({ localSessionId: "s1", agentName, cwd: process.cwd(), permissionMode: "confirm" });
+    client.requests = [];
+    const first = await runtime.startTurn("s1", "first");
+    await runtime.setPermissionMode("s1", "auto");
+    expect(session.activeTurnId).toBe(first);
+    await runtime.steerTurn("s1", first, "continue");
+    expect(client.requests.map((r) => r.method)).toEqual(["turn/start", "turn/steer"]);
+    expect(client.requests[1]?.params).not.toHaveProperty("sandboxPolicy");
+    const finish = (id: string) => client.emit("turn/completed", { threadId: "thr_1", turn: { id, status: "completed" } });
+    finish(first);
+    client.nextTurnId = "turn_2";
+    const second = await runtime.startTurn("s1", "second");
+    finish(second);
+    await runtime.setPermissionMode("s1", "confirm");
+    client.nextTurnId = "turn_3";
+    await runtime.startTurn("s1", "third");
+    expect(client.requests.filter((r) => r.method === "turn/start").map((r) => {
+      const p = r.params as Record<string, unknown>;
+      return { threadId: p.threadId, approvalPolicy: p.approvalPolicy, sandboxPolicy: p.sandboxPolicy };
+    })).toEqual([
+      { threadId: "thr_1", approvalPolicy: "on-request", sandboxPolicy: workspacePolicy },
+      { threadId: "thr_1", approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } },
+      { threadId: "thr_1", approvalPolicy: "on-request", sandboxPolicy: workspacePolicy },
+    ]);
+    expect(client.requests.every((r) => r.method === "turn/start" || r.method === "turn/steer")).toBe(true);
+    expect(session.remoteSessionId).toBe("thr_1");
+    expect(connection.close).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  test.each([false, true])("resolves and caches workspace settings when an auto task first switches to confirm (configured=%s)", async (configured) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const cwd = process.cwd();
+    const roots = [path.join(cwd, "extra")];
+    client.configResult = { config: configured ? { sandbox_workspace_write: { writable_roots: roots, network_access: true,
+      exclude_tmpdir_env_var: true, exclude_slash_tmp: true } } : {} };
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd, permissionMode: "auto" });
+    client.requests = [];
+    await runtime.setPermissionMode("s1", "confirm");
+    for (const id of ["turn_1", "turn_2"]) {
+      client.nextTurnId = id;
+      await runtime.startTurn("s1", "run");
+      expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: { approvalPolicy: "on-request",
+        sandboxPolicy: { type: "workspaceWrite", writableRoots: configured ? roots : [], networkAccess: configured,
+          excludeTmpdirEnvVar: configured, excludeSlashTmp: configured } } });
+      client.emit("turn/completed", { threadId: "thr_1", turn: { id, status: "completed" } });
+    }
+    expect(client.requests.filter((r) => r.method === "config/read")).toEqual([
+      { method: "config/read", params: { cwd, includeLayers: false } },
+    ]);
+    expect(client.requests.map((r) => r.method)).toEqual(["config/read", "turn/start", "turn/start"]);
+    runtime.close();
+  });
+
+  test("does not start a turn with stale full access when workspace configuration is invalid", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    await runtime.setPermissionMode("s1", "confirm");
+    client.requests = [];
+    client.configResult = { config: { sandbox_workspace_write: { network_access: "false" } } };
+    await expect(runtime.startTurn("s1", "run")).rejects.toThrow();
+    expect(client.requests.map((r) => r.method)).toEqual(["config/read"]);
+    expect(runtime.getSession("s1")?.activeTurnId).toBeUndefined();
+    runtime.close();
+  });
+
+  test.each(["resume", "fork"])("uses the %s response's workspace policy without extra config or history reads", async (operation) => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const sandboxPolicy = { type: "workspaceWrite", writableRoots: [], networkAccess: false,
+      excludeTmpdirEnvVar: true, excludeSlashTmp: false };
+    const response = { thread: { id: "thr_restored" }, model: "gpt-test", reasoningEffort: "medium", sandbox: sandboxPolicy };
+    client.resumeResult = response;
+    client.forkResult = response;
+    const input = { localSessionId: "s1", remoteSessionId: "thr_source", agentName: "codex",
+      cwd: process.cwd(), permissionMode: "confirm" as const };
+    if (operation === "resume") await runtime.resumeSession(input);
+    else await runtime.forkSession({ ...input, lastTurnId: "source_turn" });
+    client.requests = [];
+    await runtime.startTurn("s1", "continue");
+    expect(client.requests).toEqual([{ method: "turn/start", params: expect.objectContaining({
+      threadId: "thr_restored", approvalPolicy: "on-request", sandboxPolicy,
+    }) }]);
+    runtime.close();
+  });
+
+  test("refreshes workspace policy on a cwd retry and does not drop sandbox restrictions when rejected", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    const firstPolicy = { type: "workspaceWrite", writableRoots: [], networkAccess: true,
+      excludeTmpdirEnvVar: false, excludeSlashTmp: false };
+    const updatedPolicy = { ...firstPolicy, networkAccess: false, excludeTmpdirEnvVar: true };
+    client.startResult = { thread: { id: "thr_1" }, model: "gpt-test", reasoningEffort: "medium", sandbox: firstPolicy };
+    client.resumeResult = { thread: { id: "thr_1" }, sandbox: updatedPolicy };
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "confirm" });
+    client.requests = [];
+    client.turnStartErrors.push(new AppServerRequestError("turn/start", -32602, "invalid cwd: missing directory"));
+    await runtime.startTurn("s1", "run");
+    expect(client.requests.map((r) => r.method)).toEqual(["turn/start", "thread/resume", "turn/start"]);
+    expect(client.requests[0]?.params).toMatchObject({ sandboxPolicy: firstPolicy });
+    expect(client.requests[2]?.params).toMatchObject({ sandboxPolicy: updatedPolicy });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+    client.requests = [];
+    client.turnStartErrors.push(new AppServerRequestError("turn/start", -32602, "sandbox policy rejected"));
+    await expect(runtime.startTurn("s1", "retry")).rejects.toThrow("sandbox policy rejected");
+    expect(client.requests).toEqual([{ method: "turn/start", params: expect.objectContaining({ sandboxPolicy: updatedPolicy }) }]);
+    expect(runtime.getSession("s1")?.activeTurnId).toBeUndefined();
+    runtime.close();
+  });
+
+  test("does not start a turn when reading the workspace config fails", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    await runtime.setPermissionMode("s1", "confirm");
+    const request = client.request.bind(client);
+    vi.spyOn(client, "request").mockImplementation(async (method, params, timeoutMs) => {
+      if (method === "config/read") throw new Error("config unavailable");
+      return request(method, params, timeoutMs);
+    });
+    client.requests = [];
+    await expect(runtime.startTurn("s1", "run")).rejects.toThrow("config unavailable");
+    expect(client.requests).toEqual([]);
+    expect(runtime.getSession("s1")?.activeTurnId).toBeUndefined();
+    runtime.close();
+  });
+
   test("auto approvals accept immediately and confirm approvals wait for a response", async () => {
     const client = new FakeAppServerClient();
     const runtime = new CodexRuntime(provider(client), logger());
@@ -2672,6 +2808,7 @@ class FakeAppServerClient {
   listResult: unknown = { data: [], nextCursor: null };
   listErrors: Error[] = [];
   turnStartErrors: Error[] = [];
+  nextTurnId = "turn_1";
   modeChangeResponse?: () => Promise<void>;
   configResult: unknown = { config: { model_provider: "openai", model_providers: {} } };
   modelListResult: unknown = { data: [{
@@ -2753,7 +2890,7 @@ class FakeAppServerClient {
     if (method === "turn/start") {
       const error = this.turnStartErrors.shift();
       if (error) throw error;
-      return { turn: { id: "turn_1", status: "inProgress" } } as T;
+      return { turn: { id: this.nextTurnId, status: "inProgress" } } as T;
     }
     if (method === "model/list") return this.modelListResult as T;
     return {} as T;
