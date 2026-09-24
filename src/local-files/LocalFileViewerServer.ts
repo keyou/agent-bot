@@ -9,6 +9,8 @@ import dos from "highlight.js/lib/languages/dos";
 import dockerfile from "highlight.js/lib/languages/dockerfile";
 import powershell from "highlight.js/lib/languages/powershell";
 import MarkdownIt from "markdown-it";
+import { CSV_PREVIEW_CSS, renderCsvPreview, csvSourcePreview } from "./CsvPreview.js";
+import { enableDiagramFences, DIAGRAM_PREVIEW_CLIENT_SCRIPT, DIAGRAM_PREVIEW_CSS } from "./DiagramPreview.js";
 import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 import {
   selectPreferredNetworkAddress,
@@ -56,6 +58,7 @@ const MARKDOWN_RENDERER = new MarkdownIt({
     return `<pre class="markdown-code-block hljs"><code${languageAttribute}>${highlighted}</code></pre>`;
   },
 });
+enableDiagramFences(MARKDOWN_RENDERER);
 MARKDOWN_RENDERER.renderer.rules.table_open = () =>
   '<div class="markdown-table-scroll" role="region" aria-label="Markdown 表格" tabindex="0"><table>\n';
 MARKDOWN_RENDERER.renderer.rules.table_close = () => '</table></div>\n';
@@ -79,7 +82,7 @@ const HIGHLIGHT_LANGUAGE_BY_FILENAME: Readonly<Record<string, string>> = {
   "dockerfile": "dockerfile",
   "makefile": "makefile",
 };
-const VIEWER_CLIENT_SCRIPT = `(() => {
+const VIEWER_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() => {
   const eventsUrl = document.body.dataset.eventsUrl;
   const content = document.getElementById("viewer-content");
   const metadata = document.getElementById("viewer-metadata");
@@ -157,14 +160,15 @@ const VIEWER_CLIENT_SCRIPT = `(() => {
   requestAnimationFrame(positionHashTarget);
   if (!eventsUrl || typeof EventSource !== "function") return;
 
-  const restoreScroll = (top, left, atBottom, codeScrollLeft, tableScrollLeft) => {
+  const restoreScroll = (top, left, atBottom, codeScrollLeft, tablePositions) => {
     requestAnimationFrame(() => {
       const maxTop = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
       window.scrollTo(left, atBottom ? maxTop : Math.min(top, maxTop));
       const code = content.querySelector(".code");
       if (code) code.scrollLeft = codeScrollLeft;
-      content.querySelectorAll(".markdown-table-scroll").forEach((table, index) => {
-        table.scrollLeft = tableScrollLeft[index] ?? 0;
+      content.querySelectorAll(".markdown-table-scroll, .csv-table-scroll").forEach((table, index) => {
+        table.scrollLeft = tablePositions[index]?.left ?? 0;
+        table.scrollTop = tablePositions[index]?.top ?? 0;
       });
     });
   };
@@ -174,12 +178,40 @@ const VIEWER_CLIENT_SCRIPT = `(() => {
     const maxTop = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
     const atBottom = maxTop - top <= 24;
     const codeScrollLeft = content.querySelector(".code")?.scrollLeft ?? 0;
-    const tableScrollLeft = Array.from(content.querySelectorAll(".markdown-table-scroll"), (table) => table.scrollLeft);
-    content.innerHTML = nextContent;
+    const tablePositions = Array.from(content.querySelectorAll(".markdown-table-scroll, .csv-table-scroll"), (table) => ({ left: table.scrollLeft, top: table.scrollTop }));
+    const template = document.createElement("template");
+    template.innerHTML = nextContent;
+    const previousDiagrams = new Set(content.querySelectorAll("[data-diagram]"));
+    const nextDiagrams = Array.from(template.content.querySelectorAll("[data-diagram]"));
+    const retainedDiagrams = new Map();
+    const diagramSource = (block) => block.querySelector(".diagram-source code").textContent;
+    // Match unchanged diagrams first so inserted text or diagrams do not reset their state.
+    for (const next of nextDiagrams) {
+      const current = Array.from(previousDiagrams).find((block) => diagramSource(block) === diagramSource(next));
+      if (current) { retainedDiagrams.set(next, current); previousDiagrams.delete(current); }
+    }
+    for (const next of nextDiagrams) {
+      if (retainedDiagrams.has(next)) continue;
+      const current = Array.from(previousDiagrams).find((block) => block.dataset.previewKey === next.dataset.previewKey);
+      if (current) { retainedDiagrams.set(next, current); previousDiagrams.delete(current); }
+    }
+    const diagramScroll = [];
+    for (const [next, current] of retainedDiagrams) {
+      for (const panel of current.querySelectorAll(".diagram-preview, .diagram-source")) {
+        diagramScroll.push([panel, panel.scrollLeft, panel.scrollTop]);
+      }
+      const source = current.querySelector(".diagram-source code");
+      if (source.textContent !== diagramSource(next)) source.textContent = diagramSource(next);
+      current.dataset.previewKey = next.dataset.previewKey;
+      next.replaceWith(current);
+    }
+    content.replaceChildren(template.content);
     metadata.innerHTML = nextMetadata;
     syncViewMode();
+    window.agentBotDiagrams.scan();
+    for (const [panel, left, top] of diagramScroll) { panel.scrollLeft = left; panel.scrollTop = top; }
     highlightHashTarget();
-    restoreScroll(top, left, atBottom, codeScrollLeft, tableScrollLeft);
+    restoreScroll(top, left, atBottom, codeScrollLeft, tablePositions);
   };
 
   const source = new EventSource(eventsUrl);
@@ -187,7 +219,7 @@ const VIEWER_CLIENT_SCRIPT = `(() => {
     try {
       const update = JSON.parse(event.data);
       if (typeof update.content === "string" && typeof update.metadata === "string") {
-        if (viewSwitch) viewSwitch.hidden = update.viewMode !== "markdown" && update.viewMode !== "html";
+        if (viewSwitch) viewSwitch.hidden = update.viewMode !== "markdown" && update.viewMode !== "html" && update.viewMode !== "csv";
         replaceContent(update.content, update.metadata);
       }
     } catch {
@@ -229,7 +261,7 @@ interface DirectoryViewerEntry {
 interface RenderedFileSnapshot {
   content: string;
   metadata: string[];
-  viewMode?: "markdown" | "html";
+  viewMode?: "markdown" | "html" | "csv";
 }
 
 export interface LocalFileViewerServerOptions {
@@ -611,6 +643,7 @@ export class LocalFileViewerServer {
       ],
       content: snapshot.content,
       viewMode: snapshot.viewMode,
+      diagramScriptPath: isMarkdownFile(filePath) ? `${this.basePath}/assets/mermaid.js`.replace(/\/{2,}/gu, "/") : undefined,
       liveUpdates: {
         eventsUrl: eventsUrl.toString(),
         scriptPath: `${this.basePath}/assets/viewer.js`.replace(/\/{2,}/gu, "/"),
@@ -640,6 +673,11 @@ export class LocalFileViewerServer {
         appendUrlQueryParameter(renderUrl, "render", "html");
         appendUrlQueryParameter(renderUrl, "version", `${stat.mtimeMs}-${stat.ctimeMs}-${stat.size}`);
         content = `<iframe class="html-preview" data-view-panel="rendered" title="HTML 预览" sandbox="allow-scripts" referrerpolicy="no-referrer" src="${escapeAttribute(renderUrl.toString())}"></iframe><section data-view-panel="code">${notice}${renderText(preview.text, filePath)}</section>`;
+      } else if (extension === ".csv") {
+        viewMode = "csv";
+        const source = csvSourcePreview(preview.text);
+        const sourceNotice = source.truncated ? '<div class="notice">代码仅显示前 2000 个物理行，可打开原始文件或下载完整文件。</div>' : "";
+        content = `${renderCsvPreview(preview.text, preview.truncated)}<section data-view-panel="code">${notice}${sourceNotice}${renderText(source.text, filePath)}</section>`;
       } else {
         viewMode = isMarkdownFile(filePath) ? "markdown" : undefined;
         const previewContent = viewMode === "markdown"
@@ -984,6 +1022,7 @@ function renderViewerPage(input: {
   actions: Array<{ href: string; label: string }>;
   content: string;
   viewMode?: RenderedFileSnapshot["viewMode"];
+  diagramScriptPath?: string;
   liveUpdates?: { eventsUrl: string; scriptPath: string };
 }): string {
   const metadata = renderMetadata(input.metadata);
@@ -1008,7 +1047,7 @@ function renderViewerPage(input: {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(input.title)} · Agent Bot</title>
-  <style>
+  <style>${input.diagramScriptPath ? DIAGRAM_PREVIEW_CSS : ""}
     :root { --viewer-header-offset: 56px; --viewer-code-font: "Cascadia Mono", "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", "Sarasa Mono SC", "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", NSimSun, monospace; color-scheme: light dark; font-family: Inter, "Segoe UI", system-ui, sans-serif; }
     * { box-sizing: border-box; }
     body { margin: 0; background: #f5f7fa; color: #1f2329; }
@@ -1056,6 +1095,8 @@ function renderViewerPage(input: {
     .markdown-body code { padding: .14em .35em; border-radius: 4px; background: #f2f3f5; font-family: var(--viewer-code-font); font-size: .9em; }
     .markdown-body .markdown-code-block { margin: 0 0 1em; padding: 14px 16px; overflow: auto; border-radius: 6px; background: #f6f8fa; line-height: 1.55; }
     .markdown-body .markdown-code-block code { padding: 0; background: transparent; font-size: 13px; }
+    .markdown-body .diagram-source { padding: 14px 16px; }
+    .markdown-body .diagram-source code { padding: 0; background: transparent; font-size: 13px; }
     .markdown-table-scroll { max-width: 100%; margin: 0 0 1em; overflow-x: auto; }
     .markdown-table-scroll:focus-visible { outline: 2px solid #1456f0; outline-offset: 2px; }
     .markdown-body table { width: max-content; margin: 0; border-collapse: collapse; white-space: nowrap; overflow-wrap: normal; word-break: normal; }
@@ -1063,6 +1104,7 @@ function renderViewerPage(input: {
     .markdown-body th { background: #f5f7fa; }
     .markdown-body img { max-width: 100%; height: auto; }
     .markdown-body hr { height: 1px; margin: 1.5em 0; border: 0; background: #dfe3e8; }
+    ${CSV_PREVIEW_CSS}
     .media { display: grid; place-items: center; min-height: 220px; }
     .media img, .media video { max-width: 100%; max-height: calc(100vh - 70px); }
     .media audio { width: min(720px, 100%); }
@@ -1092,6 +1134,7 @@ function renderViewerPage(input: {
       .view-switch button.is-active { background: #3a3b3d; color: #8ab4ff; box-shadow: none; }
       .code, .directory-list { background: #202124; color: #e8eaed; border-color: #3a3b3d; }
       .markdown-body { background: #202124; color: #e8eaed; }
+      .markdown-body .diagram { --border: #55585c; }
       .markdown-body h1, .markdown-body h2 { border-color: #3a3b3d; }
       .markdown-body blockquote { color: #a6a9ad; border-color: #55585c; }
       .markdown-body a { color: #8ab4ff; }
@@ -1115,7 +1158,7 @@ function renderViewerPage(input: {
     }
   </style>
 </head>
-<body${input.viewMode ? ' data-view-mode="rendered"' : ""}${liveAttributes}>
+<body${input.viewMode ? ' data-view-mode="rendered"' : ""}${liveAttributes}${input.diagramScriptPath ? ` data-diagram-script="${escapeAttribute(input.diagramScriptPath)}"` : ""}>
   <header id="viewer-header">
     <h1 id="viewer-title" data-file-path="${escapeAttribute(input.filePath)}">${escapeHtml(input.filePath)}</h1>
     <div class="meta"><span class="metadata-values" id="viewer-metadata">${metadata}</span>${toolbar}</div>

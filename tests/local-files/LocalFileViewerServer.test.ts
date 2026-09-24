@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { runInNewContext } from "node:vm";
+import { parseHTML } from "linkedom";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
@@ -20,6 +22,117 @@ afterEach(async () => {
 });
 
 describe("LocalFileViewerServer", () => {
+  test.each([".csv", ".CSV"])("previews %s as an escaped table while preserving source, raw content, and signed access", async (extension) => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, `report${extension}`);
+    const source = '姓名,备注\r\n张三,"包含,逗号"\r\n李四,"第一行\n第二行"\r\n<img src=x>,0012';
+    fs.writeFileSync(filePath, source);
+    const server = await startServer(directory);
+    const url = server.createFileUrl(filePath)!;
+    const response = await fetch(url);
+    const page = await response.text();
+    const { document } = parseHTML(page);
+    expect(response.status).toBe(200);
+    expect(document.body.dataset.viewMode).toBe("rendered");
+    expect(document.querySelector("#viewer-view-switch")).not.toBeNull();
+    expect(document.querySelectorAll(".csv-table tbody tr")).toHaveLength(4);
+    expect([...document.querySelectorAll(".csv-cell")].map((cell) => cell.textContent)).toContain("包含,逗号");
+    expect(document.querySelector('[data-view-panel="rendered"] img')).toBeNull();
+    expect(document.querySelector('[data-view-panel="code"] #L4')).not.toBeNull();
+    expect(page).toContain(".csv-table { width: max-content;");
+    const rawUrl = new URL(url); rawUrl.searchParams.set("raw", "1");
+    expect(await (await fetch(rawUrl)).text()).toBe(source);
+    const downloadUrl = new URL(rawUrl); downloadUrl.searchParams.set("download", "1");
+    const download = await fetch(downloadUrl);
+    expect(download.headers.get("content-disposition")).toContain("attachment");
+    expect(await download.text()).toBe(source);
+    const tampered = new URL(url); tampered.searchParams.set("path", path.join(directory, "other.csv"));
+    expect((await fetch(tampered)).status).toBe(403);
+  });
+
+  test.each([
+    ["utf8-bom", Buffer.from("\ufeff名称,数值\n中文,0012")],
+    ["utf16", Buffer.from("\ufeff名称,数值\n中文,0012", "utf16le")],
+    ["gb18030", Buffer.from([0xc3, 0xfb, 0xb3, 0xc6, 0x2c, 0x78, 0x0a, 0xd6, 0xd0, 0xce, 0xc4, 0x2c, 0x31])],
+  ])("uses existing text decoding for %s CSV", async (_encoding, bytes) => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "encoded.csv");
+    fs.writeFileSync(filePath, bytes);
+    const server = await startServer(directory);
+    const { document } = parseHTML(await (await fetch(server.createFileUrl(filePath)!)).text());
+    expect([...document.querySelectorAll(".csv-cell")].map((cell) => cell.textContent)).toContain("中文");
+    expect(document.querySelector(".csv-cell")?.textContent).toBe("名称");
+  });
+
+  test.each([["data.txt", Buffer.from("a,b\n1,2")], ["binary.csv", Buffer.from([0, 1, 2, 3, 4, 5])]])("does not parse non-CSV or binary content: %s", async (fileName, bytes) => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, fileName);
+    fs.writeFileSync(filePath, bytes);
+    const server = await startServer(directory);
+    const { document } = parseHTML(await (await fetch(server.createFileUrl(filePath)!)).text());
+    expect(document.querySelector(".csv-table")).toBeNull();
+  });
+
+  test("bounds both table and hidden code DOM for large CSV files without changing downloads", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "large.csv");
+    const source = "name,value\n".repeat(220_000);
+    fs.writeFileSync(filePath, source);
+    const server = await startServer(directory);
+    const url = new URL(server.createFileUrl(filePath)!);
+    const page = await (await fetch(url)).text();
+    const { document } = parseHTML(page);
+    expect(document.querySelectorAll(".csv-table tbody tr")).toHaveLength(500);
+    expect(document.querySelectorAll(".code .line")).toHaveLength(2000);
+    expect(page).toContain("2 MiB");
+    expect(page).toContain("前 500 行");
+    expect(page).toContain("2000 个物理行");
+    url.searchParams.set("raw", "1");
+    expect(await (await fetch(url)).text()).toBe(source);
+  });
+
+  test("streams CSV updates while the client retains view mode and table scroll position", async () => {
+    const directory = createTemporaryDirectory();
+    const filePath = path.join(directory, "live.csv");
+    fs.writeFileSync(filePath, "case,result\nB05,running\n");
+    const server = await startServer(directory);
+    const url = server.createFileUrl(filePath)!;
+    const page = await (await fetch(url)).text();
+    const script = await (await fetch(new URL("/assets/viewer.js", url))).text();
+    const { document, window: domWindow } = parseHTML(page);
+    const listeners = new Map<string, (event: { data: string }) => void>();
+    class EventSource {
+      addEventListener(type: string, callback: (event: { data: string }) => void) { listeners.set(type, callback); }
+      close() {}
+    }
+    const frames: Array<() => void> = [];
+    const window = { location: { hash: "" }, scrollY: 0, scrollX: 0, innerHeight: 600, scrollTo: vi.fn(), addEventListener: vi.fn() };
+    Object.defineProperty(document.documentElement, "scrollHeight", { value: 2000 });
+    runInNewContext(script, { document, window, EventSource, requestAnimationFrame: (fn: () => void) => frames.push(fn) });
+    for (const frame of frames.splice(0)) frame();
+    const codeButton = document.querySelector('[data-view-mode-button="code"]')!;
+    codeButton.dispatchEvent(new domWindow.Event("click"));
+    const table = document.querySelector(".csv-table-scroll")!;
+    Object.assign(table, { scrollLeft: 180, scrollTop: 75 });
+    const controller = new AbortController();
+    try {
+      const eventsUrl = document.body.dataset.eventsUrl!;
+      const events = createServerSentEventReader(await fetch(eventsUrl, { signal: controller.signal }));
+      expect(JSON.parse(await events.next("update")).viewMode).toBe("csv");
+      fs.appendFileSync(filePath, "B08,completed\n");
+      const update = await events.next("update");
+      expect(JSON.parse(update).viewMode).toBe("csv");
+      listeners.get("update")!({ data: update });
+      for (const frame of frames.splice(0)) frame();
+      expect(document.body.dataset.viewMode).toBe("code");
+      expect(document.querySelector("#viewer-view-switch")?.hasAttribute("hidden")).toBe(false);
+      expect(document.querySelector(".csv-table-scroll")).toMatchObject({ scrollLeft: 180, scrollTop: 75 });
+      expect(document.querySelector(".csv-table")?.textContent).toContain("completed");
+      document.querySelector('[data-view-mode-button="rendered"]')!.dispatchEvent(new domWindow.Event("click"));
+      expect(document.body.dataset.viewMode).toBe("rendered");
+    } finally { controller.abort(); }
+  }, 10_000);
+
   test("streams only changed journal blocks, resumes at a byte cursor and serves complete lazy details", async () => {
     const directory = createTemporaryDirectory();
     const journal = new TurnPreviewJournal(path.join(directory, "journal"));
@@ -28,6 +141,7 @@ describe("LocalFileViewerServer", () => {
     journal.event({ ...identity, type: "progress", text: "old commentary", activityId: "commentary:old" });
     const tool = { id: "cmd", kind: "command", title: "run", command: "run", status: "running" as const };
     journal.event({ ...identity, type: "tool_started", tool });
+    journal.event({ ...identity, type: "token_usage_updated", lastTokens: 128_000, cumulativeTokens: 128_000, contextTokens: 128_000 });
     const getSnapshot = vi.fn();
     const server = new LocalFileViewerServer({ host: "127.0.0.1", port: 0, stateDirectory: directory,
       previewJournal: journal, getTurnSnapshot: getSnapshot, turnPreviewPollIntervalMs: 50 });
@@ -37,15 +151,18 @@ describe("LocalFileViewerServer", () => {
     try {
       const url = server.createTurnPreviewUrl("t")!;
       const html = await (await fetch(url)).text();
+      expect(html).toContain('title="Context: 128,000 tokens">Context 128K tokens</span>');
       const eventUrl = /data-events-url="([^"]+)"/u.exec(html)![1]!.replaceAll("&amp;", "&");
       expect(new URL(eventUrl).searchParams.get("after")).toBeTruthy();
       const events = createServerSentEventReader(await fetch(eventUrl, { signal: abort.signal }));
       journal.event({ ...identity, type: "tool_output_delta", toolId: "cmd", delta: "complete output ".repeat(1000) });
+      journal.event({ ...identity, type: "token_usage_updated", lastTokens: 32_000, cumulativeTokens: 160_000, contextTokens: 32_000 });
       journal.flush();
       const update = JSON.parse(await events.next("patch"));
       expect(update.content).toContain('data-activity-id="cmd"');
       expect(update.content).not.toContain("old commentary");
       expect(update.content).not.toContain("complete output");
+      expect(update.metadata).toContain('title="Context: 32,000 tokens">Context 32K tokens</span>');
       const resumeUrl = new URL(eventUrl);
       const lastEventId = resumeUrl.searchParams.get("after")!;
       resumeUrl.searchParams.delete("after");
@@ -68,7 +185,9 @@ describe("LocalFileViewerServer", () => {
       journal.event({ ...identity, type: "turn_completed", finalResponse: "done" });
       journal.flush();
       expect(JSON.parse(await events.next("patch"))).toMatchObject({ terminal: true });
-      expect(await (await fetch(url)).text()).toContain("old commentary");
+      const completedPage = await (await fetch(url)).text();
+      expect(completedPage).toContain("old commentary");
+      expect(completedPage).toContain('title="Context: 32,000 tokens">Context 32K tokens</span>');
     } finally { abort.abort(); journal.close(); }
   });
 
@@ -161,7 +280,7 @@ describe("LocalFileViewerServer", () => {
     expect(script).toContain('button.addEventListener("click"');
     expect(script).toContain('document.body.dataset.viewMode = mode === "code" ? "code" : "rendered"');
     expect(script).toContain('if (/^#L\\d+$/u.test(window.location.hash)) document.body.dataset.viewMode = "code"');
-    expect(script).toContain('viewSwitch.hidden = update.viewMode !== "markdown" && update.viewMode !== "html"');
+    expect(script).toContain('viewSwitch.hidden = update.viewMode !== "markdown" && update.viewMode !== "html" && update.viewMode !== "csv"');
   });
 
   test.each([".html", ".htm", ".HTML"])("previews %s in a sandbox while retaining source and raw downloads", async (extension) => {
@@ -316,9 +435,10 @@ describe("LocalFileViewerServer", () => {
     const page = await (await fetch(fileUrl)).text();
     const eventsLink = /data-events-url="([^"]+)"/u.exec(page)![1]!.replaceAll("&amp;", "&");
     const script = await (await fetch(new URL("/assets/viewer.js", fileUrl))).text();
-    expect(script).toContain('Array.from(content.querySelectorAll(".markdown-table-scroll"), (table) => table.scrollLeft)');
-    expect(script).toContain("table.scrollLeft = tableScrollLeft[index] ?? 0");
-    expect(script).toContain("restoreScroll(top, left, atBottom, codeScrollLeft, tableScrollLeft)");
+    expect(script).toContain('Array.from(content.querySelectorAll(".markdown-table-scroll, .csv-table-scroll")');
+    expect(script).toContain("table.scrollLeft = tablePositions[index]?.left ?? 0");
+    expect(script).toContain("table.scrollTop = tablePositions[index]?.top ?? 0");
+    expect(script).toContain("restoreScroll(top, left, atBottom, codeScrollLeft, tablePositions)");
 
     const controller = new AbortController();
     try {
@@ -768,6 +888,7 @@ describe("LocalFileViewerServer", () => {
       prompt: "检查 <preview> & SSE\n![Prompt](auth%20image.png)",
       totalTokens: 8,
       totalTokensIncludingCache: 3_563,
+      latestContextTokens: 3_563,
       cachedInputTokens: 3_555,
       modelProvider: "azure",
       status: "running",
@@ -799,6 +920,7 @@ describe("LocalFileViewerServer", () => {
     expect(page).toContain("正在检查入口。");
     expect(page).toContain("实时更新");
     expect(page).toContain('title="总计: 3,563 tokens"');
+    expect(page).toContain('title="上下文: 3,563 tokens">上下文 3.6K tokens</span>');
     expect(page).not.toContain("缓存命中");
     expect(page).toContain('title="Provider">azure</span>');
     expect(page).not.toContain("检查 <preview> & SSE");
@@ -830,6 +952,7 @@ describe("LocalFileViewerServer", () => {
       expect(initial.metadata).not.toContain("缓存命中");
       expect(initial.metadata).toContain('title="Provider">azure</span>');
       expect(initial.metadata).not.toContain("Provider:");
+      expect(initial.metadata).toContain('title="上下文: 3,563 tokens">上下文 3.6K tokens</span>');
       expect(initial.content).toContain("正在检查入口。");
       expect(initial.terminal).toBe(false);
       expect(initial.content).toContain(`src="${imageUrl!.replaceAll("&", "&amp;")}"`);
@@ -841,6 +964,7 @@ describe("LocalFileViewerServer", () => {
         durationMs: 2_500,
         totalTokens: 16,
         totalTokensIncludingCache: 7_126,
+        latestContextTokens: 2_048,
         cachedInputTokens: 7_110,
         finalResponse: `完成 **Preview**。\n![QR](<${imagePath.replaceAll("\\", "/")}>)`,
         activities: [
@@ -866,6 +990,7 @@ describe("LocalFileViewerServer", () => {
       };
       const update = JSON.parse(await events.next("update")) as { content: string; metadata: string; terminal: boolean };
       expect(update.metadata).toContain('title="总计: 7,126 tokens"');
+      expect(update.metadata).toContain('title="上下文: 2,048 tokens">上下文 2K tokens</span>');
       expect(update.metadata).not.toContain("缓存命中");
       expect(update.metadata).toContain('title="Provider">azure</span>');
       expect(update.metadata).not.toContain("Provider:");
