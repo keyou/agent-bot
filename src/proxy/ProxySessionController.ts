@@ -384,7 +384,6 @@ interface AgentRemoteSessionSummary {
 
 interface SessionsCardOptions {
   updateMessageId?: string;
-  forceSwitchTaskId?: string;
   page?: number;
 }
 
@@ -1212,7 +1211,7 @@ export class ProxySessionController {
           await this.stopSessionReference(contextKey, sessionId);
           if (scopedAction.value.cardView === "status") await this.refreshStatusCardFromAction(scopedAction, sessionId);
           else if (scopedAction.value.cardView !== "safe_restart") {
-            await this.refreshSessionsCardFromAction(scopedAction, { forceSwitchTaskId: sessionId });
+            await this.refreshSessionsCardFromAction(scopedAction);
           }
         } else if (kind === "session_turns" || kind === "session_turns_page") {
           const sessionReference = String(scopedAction.value.sessionId ?? "").trim();
@@ -6836,20 +6835,28 @@ export class ProxySessionController {
       const project = taskProjectInfo(entry);
       const projectActionSource = projectActionSources.get(project.key) ?? entry;
       const marker = entry.current ? "✅ " : entry.active ? "🟢 " : "";
-      const showStop = entry.status === "外部执行中"
-        && entry.reference !== options.forceSwitchTaskId
-        && entry.id !== options.forceSwitchTaskId;
-      const actions: TaskListCardAction[] = entry.current ? [] : [bindCardAction({
-        text: showStop ? "Stop" : "Switch",
-        type: showStop ? "danger" as const : "default" as const,
+      const stopAction = entry.active ? bindCardAction({
+        text: "Stop",
+        type: "danger",
         value: {
-          action: showStop ? "session_stop" : "session_switch",
+          action: "session_stop",
           sessionId: entry.reference,
           ...(searchTerm ? { searchTerm } : {}),
           page: String(page),
           contextKey,
         },
-      })];
+      }) : undefined;
+      const actions: TaskListCardAction[] = [];
+      if (!entry.current && entry.status !== "外部执行中") actions.push(bindCardAction({
+        text: "Switch",
+        value: {
+          action: "session_switch",
+          sessionId: entry.reference,
+          ...(searchTerm ? { searchTerm } : {}),
+          page: String(page),
+          contextKey,
+        },
+      }));
       actions.push(bindCardAction({
         text: "SwitchGroup",
         value: {
@@ -6915,7 +6922,7 @@ export class ProxySessionController {
           contextKey,
         },
       }));
-      actions.push(bindCardAction({
+      if (!entry.active) actions.push(bindCardAction({
         text: "Archive",
         value: {
           action: "session_archive",
@@ -6937,6 +6944,7 @@ export class ProxySessionController {
             `**最新 Prompt**：${cardText(lastUserPrompt)}`,
             `<font color='grey'>最近更新：${cardText(entry.updatedLabel)}</font>`,
           ],
+          stopAction,
           actions,
           current: entry.current,
         },
@@ -6966,7 +6974,7 @@ export class ProxySessionController {
         `第 ${page + 1} 页 · 每页 ${SESSION_PAGE_SIZE} 个任务${hasNext ? "" : ` · 当前共 ${entries.length} 个任务`}`,
         "",
         "> 项目菜单：**New** 新建任务，**NewGroup** 新建群。",
-        "> 任务详情：**Switch** 切换，**Stop** 停止，**Fork** / **ForkGroup** 创建分支，**Status** 查看状态，**Archive** 归档。",
+        "> 任务详情：**Switch** 切换，运行中任务可用 **Stop** 发送停止信号，**Fork** / **ForkGroup** 创建分支，**Status** 查看状态，**Archive** 归档。",
       ],
       [
         ...(hasPrevious ? [bindCardAction({
@@ -7041,7 +7049,7 @@ export class ProxySessionController {
 
   private async refreshSessionsCardFromAction(
     action: CardAction,
-    options: { forceSwitchTaskId?: string; page?: number } = {},
+    options: { page?: number } = {},
   ): Promise<void> {
     if (!action.messageId) return;
     const searchTerm = typeof action.value.searchTerm === "string" && action.value.searchTerm.trim()
@@ -7049,7 +7057,6 @@ export class ProxySessionController {
       : undefined;
     await this.listSessions(action.contextKey, searchTerm, {
       updateMessageId: action.messageId,
-      forceSwitchTaskId: options.forceSwitchTaskId,
       page: options.page ?? parseSessionPage(action.value.page),
     });
   }

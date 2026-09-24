@@ -217,7 +217,7 @@ function sessionOverflowActions(
   return actions;
 }
 
-function sessionOverflowToken(card: unknown, label: string): string | undefined {
+function sessionActionToken(card: unknown, label: string): string | undefined {
   let token: string | undefined;
   const visit = (value: unknown): void => {
     if (token) return;
@@ -227,6 +227,14 @@ function sessionOverflowToken(card: unknown, label: string): string | undefined 
     }
     if (!value || typeof value !== "object") return;
     const record = value as Record<string, unknown>;
+    if (record.tag === "button" && (record.text as { content?: string } | undefined)?.content === label) {
+      const behavior = (record.behaviors as Array<{ type: string; value?: { t?: string } }> | undefined)
+        ?.find((item) => item.type === "callback");
+      if (behavior?.value?.t) {
+        token = behavior.value.t;
+        return;
+      }
+    }
     if (record.tag === "overflow" && Array.isArray(record.options)) {
       for (const option of record.options) {
         if (!option || typeof option !== "object") continue;
@@ -7489,7 +7497,7 @@ describe("ProxySessionController", () => {
     }] });
     await controller.onMessage(message("/sessions Selected"));
     const list = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
-    const token = sessionOverflowToken(list, "Turns");
+    const token = sessionActionToken(list, "Turns");
     expect(token).toBeDefined();
     vi.mocked(runtime.listRemoteTurnSummaries!).mockImplementation(async () => {
       expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "正在读取历史轮次，请稍后。");
@@ -7841,7 +7849,7 @@ describe("ProxySessionController", () => {
 
     await controller.onMessage(message("/sessions"));
     const card = (outbound.sendInteractiveCard as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
-    const token = sessionOverflowToken(card, "Switch");
+    const token = sessionActionToken(card, "Switch");
     expect(token).toBeDefined();
     expect(JSON.stringify(card)).not.toContain("session_switch");
 
@@ -8038,7 +8046,7 @@ describe("ProxySessionController", () => {
     expect(serialized.indexOf("Running task")).toBeLessThan(serialized.indexOf("Idle task"));
   });
 
-  test("stops an active external task from the sessions card and changes its button to Switch", async () => {
+  test("keeps Stop after sending an interrupt and offers Switch only when the task is idle", async () => {
     const { controller, remoteSessions, runtime, outbound, store } = fixture();
     remoteSessions.push({
       id: "active_external",
@@ -8049,11 +8057,16 @@ describe("ProxySessionController", () => {
       lastTurnId: "turn_external",
       lastTurnStatus: "inProgress",
     });
+    await controller.onMessage(message("/sessions"));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1];
+    const token = sessionActionToken(card, "Stop");
+    expect(token).toBeDefined();
+    expect(runtime.interruptRemoteTurn).not.toHaveBeenCalled();
     const action = {
       actionId: "stop-card-active",
       contextKey: "chat_id:c1",
-      messageId: "om_sessions",
-      value: { action: "session_stop", sessionId: "active_external" },
+      messageId: "card",
+      value: { t: token! },
     };
 
     await controller.onCardAction(action);
@@ -8067,17 +8080,197 @@ describe("ProxySessionController", () => {
     );
     expect(outbound.updateInteractiveCard).toHaveBeenCalledOnce();
     const updatedCard = (outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
-    const serialized = JSON.stringify(updatedCard);
-    expect(serialized).toContain('"content":"Switch"');
-    expect(sessionOverflowActions(updatedCard, store, "om_sessions")).toContainEqual(expect.objectContaining({
-      action: "session_switch",
+    expect(sessionOverflowActions(updatedCard, store)).toContainEqual(expect.objectContaining({
+      action: "session_stop",
       sessionId: "agent-runtime:codex:active_external",
       page: "0",
     }));
-    expect(sessionOverflowActions(updatedCard, store, "om_sessions")).not.toContainEqual(expect.objectContaining({
+    expect(sessionOverflowActions(updatedCard, store)).not.toContainEqual(expect.objectContaining({
+      action: "session_switch",
+      sessionId: "agent-runtime:codex:active_external",
+    }));
+    expect(store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId).toBeUndefined();
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+
+    Object.assign(remoteSessions[0]!, { status: "idle", lastTurnStatus: "interrupted" });
+    await controller.onCardAction({
+      actionId: "refresh-stopped-session",
+      contextKey: "chat_id:c1",
+      messageId: "card",
+      value: { action: "session_page", page: "0" },
+    });
+    const stoppedCard = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(sessionOverflowActions(stoppedCard, store)).toContainEqual(expect.objectContaining({
+      action: "session_switch",
+      sessionId: "agent-runtime:codex:active_external",
+    }));
+    expect(sessionOverflowActions(stoppedCard, store)).not.toContainEqual(expect.objectContaining({
       action: "session_stop",
       sessionId: "agent-runtime:codex:active_external",
     }));
+  });
+
+  test.each([true, false])("offers Stop for an Agent Bot task (current: %s) without changing its binding", async (current) => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("Run the build"));
+    const activeId = store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId!;
+    if (!current) await controller.onMessage(message("/new"));
+    const currentId = store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId;
+    vi.mocked(outbound.sendInteractiveCard).mockClear();
+
+    await controller.onMessage(message("/sessions"));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1];
+    const actions = sessionOverflowActions(card, store);
+    expect(actions).toContainEqual(expect.objectContaining({
+      action: "session_stop", sessionId: "agent-runtime:codex:thr_1",
+    }));
+    expect(actions).not.toContainEqual(expect.objectContaining({
+      action: "session_archive", sessionId: "agent-runtime:codex:thr_1",
+    }));
+    expect(actions.some((action) => action.action === "session_switch"
+      && action.sessionId === "agent-runtime:codex:thr_1")).toBe(!current);
+    expect(actions).not.toContainEqual(expect.objectContaining({
+      action: "session_stop", sessionId: "agent-runtime:codex:thr_2",
+    }));
+    expect(runtime.interruptRemoteTurn).not.toHaveBeenCalled();
+    const token = sessionActionToken(card, "Stop");
+    expect(token).toBeDefined();
+
+    await controller.onCardAction({
+      actionId: "stop-owned-task", contextKey: "chat_id:c1", messageId: "card", value: { t: token! },
+    });
+    expect(runtime.interruptRemoteTurn).toHaveBeenCalledExactlyOnceWith("thr_1", "turn_1");
+    expect(store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId).toBe(currentId);
+    expect(store.getSession(activeId)?.status).toBe("running");
+    expect(runtime.closeSession).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "已发送停止信号，任务会自动停止。");
+  });
+
+  test("offers Stop for local running tasks missing from the remote list without reading history", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("Run the build"));
+    vi.mocked(runtime.listRemoteSessions!).mockResolvedValue({ sessions: [] });
+    vi.mocked(runtime.readRemoteSession!).mockClear();
+    vi.mocked(outbound.sendInteractiveCard).mockClear();
+
+    await controller.onMessage(message("/sessions"));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1];
+    expect(sessionOverflowActions(card, store)).toContainEqual(expect.objectContaining({
+      action: "session_stop", sessionId: "agent-runtime:codex:thr_1",
+    }));
+    expect(runtime.readRemoteSession).not.toHaveBeenCalled();
+    expect(runtime.interruptRemoteTurn).not.toHaveBeenCalled();
+  });
+
+  test("stops a task in another conversation from its list button without changing either binding", async () => {
+    const { controller, runtime, store, outbound } = fixture();
+    await controller.onMessage(message("/new"));
+    const currentId = store.getUserContext("chat_id:c1")!.currentSessionId;
+    await controller.onMessage({ messageId: "other-running", contextKey: "chat_id:other", text: "Run another task" });
+    const otherId = store.getUserContext("chat_id:other")!.currentSessionId!;
+    const other = store.getSession(otherId)!;
+    vi.mocked(outbound.sendInteractiveCard).mockClear();
+    await controller.onMessage(message("/sessions"));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1];
+    const token = sessionActionToken(card, "Stop");
+    expect(token).toBeDefined();
+
+    await controller.onCardAction({
+      actionId: "stop-other-conversation", contextKey: "chat_id:c1", messageId: "card", value: { t: token! },
+    });
+    expect(runtime.interruptRemoteTurn).toHaveBeenCalledExactlyOnceWith(other.remoteSessionId, "turn_1");
+    expect(store.getUserContext("chat_id:c1")!.currentSessionId).toBe(currentId);
+    expect(store.getUserContext("chat_id:other")!.currentSessionId).toBe(otherId);
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "已发送停止信号，任务会自动停止。");
+    expect(runtime.closeSession).not.toHaveBeenCalled();
+  });
+
+  test("routes a paged Stop token to the owning Agent and preserves the search and page", async () => {
+    const traexRemote: RemoteSessionSummary = {
+      id: "shared_task", title: "Target 99", cwd: "D:/work", source: "traex", status: "active",
+      lastTurnId: "traex_turn", lastTurnStatus: "inProgress",
+    };
+    const interrupt = vi.fn(async () => undefined);
+    const traexRuntime = {
+      kind: "codex",
+      listRemoteSessions: vi.fn(async () => ({ sessions: [traexRemote] })),
+      readRemoteSession: vi.fn(async () => traexRemote),
+      interruptRemoteTurn: interrupt,
+      onEvent: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    } as unknown as AgentRuntime;
+    const { controller, runtime, remoteSessions, outbound, store } = fixture({ traex: traexRuntime });
+    for (let index = 0; index < 10; index++) remoteSessions.push({
+      id: index === 0 ? "shared_task" : "codex_" + index,
+      title: "Target " + index, cwd: "D:/work", source: "vscode", status: "active",
+      lastTurnId: "codex_turn_" + index, lastTurnStatus: "inProgress",
+    });
+    await controller.onMessage(message("/sessions Target"));
+    await controller.onCardAction({
+      actionId: "target-next-page", contextKey: "chat_id:c1", messageId: "card",
+      value: { action: "session_page", page: "1", searchTerm: "Target" },
+    });
+    const card = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1];
+    const token = sessionActionToken(card, "Stop");
+    expect(token).toBeDefined();
+    expect(store.getCardActionBinding("card", token!)).toMatchObject({
+      action: "session_stop", sessionId: "agent-runtime:traex:shared_task", page: "1", searchTerm: "Target",
+    });
+    expect(interrupt).not.toHaveBeenCalled();
+
+    await controller.onCardAction({
+      actionId: "stop-traex-from-list", contextKey: "chat_id:c1", messageId: "card", value: { t: token! },
+    });
+    expect(interrupt).toHaveBeenCalledExactlyOnceWith("shared_task", "traex_turn");
+    expect(runtime.interruptRemoteTurn).not.toHaveBeenCalled();
+    const refreshed = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1];
+    expect(JSON.stringify(refreshed)).toContain("第 2 页");
+    expect(sessionOverflowActions(refreshed, store)).toContainEqual(expect.objectContaining({
+      action: "session_stop", sessionId: "agent-runtime:traex:shared_task", page: "1", searchTerm: "Target",
+    }));
+    expect(store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId).toBeUndefined();
+  });
+
+  test("does not interrupt a task that finished after its Stop card was rendered", async () => {
+    const { controller, runtime, remoteSessions, outbound } = fixture();
+    const remote: RemoteSessionSummary = {
+      id: "finished_task", title: "Finished task", cwd: "D:/work", source: "vscode", status: "active",
+      lastTurnId: "finished_turn", lastTurnStatus: "inProgress",
+    };
+    remoteSessions.push(remote);
+    await controller.onMessage(message("/sessions"));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1];
+    const token = sessionActionToken(card, "Stop");
+    expect(token).toBeDefined();
+    Object.assign(remote, { status: "idle", lastTurnStatus: "completed" });
+
+    await controller.onCardAction({
+      actionId: "stop-already-finished", contextKey: "chat_id:c1", messageId: "card", value: { t: token! },
+    });
+    expect(runtime.interruptRemoteTurn).not.toHaveBeenCalled();
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "当前没有正在执行的任务。");
+    expect(outbound.sendText).not.toHaveBeenCalledWith("chat_id:c1", "已发送停止信号，任务会自动停止。");
+  });
+
+  test("reports Stop failures without pretending the task stopped", async () => {
+    const { controller, runtime, remoteSessions, outbound } = fixture();
+    remoteSessions.push({
+      id: "failing_task", title: "Running task", cwd: "D:/work", source: "vscode", status: "active",
+      lastTurnId: "failing_turn", lastTurnStatus: "inProgress",
+    });
+    vi.mocked(runtime.interruptRemoteTurn!).mockRejectedValue(new Error("Interrupt unavailable"));
+    await controller.onMessage(message("/sessions"));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls[0]?.[1];
+    const token = sessionActionToken(card, "Stop");
+    expect(token).toBeDefined();
+
+    await controller.onCardAction({
+      actionId: "stop-failed", contextKey: "chat_id:c1", messageId: "card", value: { t: token! },
+    });
+    expect(runtime.interruptRemoteTurn).toHaveBeenCalledExactlyOnceWith("failing_task", "failing_turn");
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("Interrupt unavailable"));
+    expect(outbound.sendText).not.toHaveBeenCalledWith("chat_id:c1", "已发送停止信号，任务会自动停止。");
+    expect(outbound.updateInteractiveCard).not.toHaveBeenCalled();
   });
 
   test("archives an idle task from the sessions card and clears the current binding", async () => {
@@ -8358,7 +8551,7 @@ describe("ProxySessionController", () => {
     remoteSessions.push({ id: "shared_remote", cwd, title: "Keep task title", source: "agent-bot", status: "idle" });
     await controller.onMessage(message("/sessions Keep"));
     const card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
-    const token = sessionOverflowToken(card, "SwitchGroup");
+    const token = sessionActionToken(card, "SwitchGroup");
     expect(token).toBeDefined();
     await controller.onCardAction({ actionId: "switch-group-token", contextKey: "chat_id:c1", userId: "ou_user", messageId: "card", value: { t: token! } });
     expect(store.getUserContext("chat_id:oc_new_group")).toMatchObject({ currentSessionId: "shared", boundProjectCwd: cwd, defaultAgent: "codex" });
@@ -8731,7 +8924,7 @@ describe("ProxySessionController", () => {
     }));
     expect(initial).not.toContain("<font color='blue'>Previous</font>");
     expect(initial).toContain("> 项目菜单：**New** 新建任务，**NewGroup** 新建群。");
-    expect(initial).toContain("> 任务详情：**Switch** 切换，**Stop** 停止，**Fork** / **ForkGroup** 创建分支，**Status** 查看状态，**Archive** 归档。");
+    expect(initial).toContain("> 任务详情：**Switch** 切换，运行中任务可用 **Stop** 发送停止信号，**Fork** / **ForkGroup** 创建分支，**Status** 查看状态，**Archive** 归档。");
     expect(initial.indexOf("<font color='blue'>Next</font>")).toBeLessThan(
       initial.indexOf("> 项目菜单：**New** 新建任务"),
     );
@@ -9341,7 +9534,7 @@ describe("ProxySessionController", () => {
       sessionId: "agent-runtime:codex:thr_1",
       page: "0",
     }));
-    expect(actions).not.toContainEqual(expect.objectContaining({
+    expect(actions).toContainEqual(expect.objectContaining({
       action: "session_stop",
       sessionId: "agent-runtime:codex:thr_1",
     }));

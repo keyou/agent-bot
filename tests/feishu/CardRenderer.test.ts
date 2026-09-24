@@ -3065,7 +3065,37 @@ describe("CardRenderer", () => {
       .not.toContainEqual(expect.objectContaining({ tag: "hr" }));
   });
 
-  test("keeps a ten-project sessions page within Feishu card limits", () => {
+  test("renders a direct Stop button inside running task details without changing the collapsed row", () => {
+    const renderer = new CardRenderer();
+    const entry = {
+      reference: "agent-runtime:codex:running",
+      summary: "1. ✅ Running task · codex",
+      detailLines: ["**最新 Prompt**：Build"],
+      current: true,
+      actions: [{ text: "Status", value: { t: "status-token" } }],
+    };
+    const render = (running: boolean) => renderer.renderSessionTaskListCard("任务列表", "任务", [{
+      title: "📁 Project",
+      entries: [{
+        ...entry,
+        ...(running ? { stopAction: { text: "Stop", type: "danger" as const, value: { t: "stop-token" } } } : {}),
+      }],
+    }], []);
+    const running = collectObjects(render(true));
+    const idle = collectObjects(render(false));
+    const panel = running.find((item) => item.tag === "collapsible_panel");
+    expect(panel).toMatchObject({ expanded: false, border: { color: "green" } });
+    expect(panel?.element_id).toBe(idle.find((item) => item.tag === "collapsible_panel")?.element_id);
+    expect(panel?.elements).toContainEqual({
+      tag: "button", text: { tag: "plain_text", content: "Stop" }, type: "danger", size: "tiny",
+      behaviors: [{ type: "callback", value: { t: "stop-token" } }],
+    });
+    expect(running.filter((item) => item.tag === "button")).toHaveLength(1);
+    expect(idle.filter((item) => item.tag === "button")).toHaveLength(0);
+    expect(JSON.stringify(running.find((item) => item.tag === "overflow"))).not.toContain("stop-token");
+  });
+
+  test.each([false, true])("keeps a ten-project sessions page within Feishu card limits (running: %s)", (running) => {
     const groups = Array.from({ length: 10 }, (_, index) => ({
       title: `📁 D:\\work\\organization\\project-${index + 1}`,
       actions: [
@@ -3079,6 +3109,7 @@ describe("CardRenderer", () => {
           `**最新 Prompt**：Review project ${index + 1} ${"x".repeat(50)}`,
           "<font color='grey'>最近更新：2026/08/15 10:00:00</font>",
         ],
+        stopAction: running ? { text: "Stop", type: "danger" as const, value: { t: `stop-${index + 1}` } } : undefined,
         actions: [
           { text: "Switch", value: { t: `switch-${index + 1}` } },
           { text: "SwitchGroup", value: { t: `switch-group-${index + 1}` } },
@@ -3086,7 +3117,7 @@ describe("CardRenderer", () => {
           { text: "ForkGroup", value: { t: `fork-group-${index + 1}` } },
           { text: "Status", value: { t: `status-${index + 1}` } },
           { text: "Turns", value: { t: `turns-${index + 1}` } },
-          { text: "Archive", value: { t: `archive-${index + 1}` } },
+          ...(!running ? [{ text: "Archive", value: { t: `archive-${index + 1}` } }] : []),
         ],
       }],
     }));
@@ -3105,7 +3136,8 @@ describe("CardRenderer", () => {
 
     expect(taggedElements.filter((item) => item.tag === "collapsible_panel")).toHaveLength(10);
     expect(taggedElements.filter((item) => item.tag === "overflow")).toHaveLength(20);
-    expect(taggedElements.length).toBeLessThan(200);
+    expect(taggedElements.filter((item) => item.tag === "button")).toHaveLength(running ? 10 : 0);
+    expect(taggedElements.length).toBeLessThanOrEqual(200);
     expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(30 * 1024);
   });
 

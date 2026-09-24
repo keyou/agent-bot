@@ -197,6 +197,7 @@ export interface SessionTaskCardEntry {
   reference: string;
   summary: string;
   detailLines: string[];
+  stopAction?: TaskListCardAction;
   actions?: TaskListCardAction[];
   current?: boolean;
 }
@@ -2298,6 +2299,7 @@ function collapsiblePanel(
 
 function sessionTaskPanel(entry: SessionTaskCardEntry): Record<string, unknown> {
   const elements: Record<string, unknown>[] = [markdown(entry.detailLines.join("\n"))];
+  if (entry.stopAction) elements.push(sessionActionButton(entry.stopAction));
   if (entry.actions?.length) elements.push(sessionActionOverflow(entry.actions));
   return collapsiblePanel(entry.summary, elements, {
     elementId: sessionTaskPanelElementId(entry.reference),
