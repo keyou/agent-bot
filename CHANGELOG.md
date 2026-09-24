@@ -6,6 +6,37 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 中文
+
+- 修复权限切换未同步沙箱策略的问题：下一轮同时应用审批与沙箱设置，无需重启 Agent、Fork 或新建任务，并保留工作区沙箱配置。
+- 修复崩溃后任务持续显示运行中的问题：核实存活写入进程，限制未确认恢复的重试时间，提示写锁冲突，不中断其他客户端任务。
+- Session 列表为运行中任务提供独立 Stop 按钮，发送正常停止信号，保留任务绑定、搜索条件和分页。
+- 支持 CSV 只读表格预览，支持引号内逗号与换行、空单元格，并对超大文件和格式错误给出提示。
+- Markdown 文件预览支持 Mermaid/流程图，提供预览、源码及原大、适应切换，实时更新保留图表状态。
+- Turn Preview 最终回答旁新增下载和复制图标，以原始 Markdown 格式导出，支持局域网 HTTP 页面的复制回退。
+- 简化命令授权卡片：先显示原因，命令默认折叠，过长内容可在 Preview 查看完整原文；授权操作保持不变。
+- Turn Preview 顶部显示上下文大小及按有效 Token 用量更新次数统计的模型调用次数，上下文位于模型调用前面，不再显示压缩统计；支持局部实时更新，不额外读取历史。
+
+### English
+
+- Apply both approval and sandbox policies on every App Server Turn start so permission switches take effect on the next Turn without an Agent restart or task replacement. Preserve workspace sandbox options and fail closed when configuration or policy validation fails.
+
+- Show per-turn model call counts in Turn Preview headers using effective token-usage updates, with duplicate/regression filtering, cached-usage support, persisted baselines, and live metadata-only updates. Keep Feishu cards unchanged and avoid additional Agent history reads.
+
+- Make command approval cards compact: show a short heading and the reason before a collapsed command, avoid repeated command titles, and provide the full original command in read-only Turn Preview. Keep all approval decisions and callbacks unchanged.
+
+- Support Mermaid/flowchart diagrams in Markdown file previews using Turn Preview's local renderer, Preview/Source and Actual size/Fit controls, safe source fallback, and preserved diagram state across live file updates.
+
+- Add download/copy icon buttons beside Turn Preview's final answer to export original UTF-8 Markdown, with clipboard fallback for HTTP/LAN pages, accessible feedback, and support for live-arriving and historical answers.
+
+- Add a direct Stop button to running task details in `/sessions`, including the current task, other Agent Bot tasks, and external tasks. Send the normal interrupt without changing task bindings, preserve search/pagination, and keep running status until the Agent reports completion. Hide unavailable Archive actions while running to keep ten-task cards within Feishu limits.
+
+- Preview CSV files as read-only, scrollable tables with row/column labels, safe quoted-field parsing, existing text-encoding support, bounded rendering, code/raw/download access, and preserved scroll positions on live updates.
+
+- Fix crash recovery leaving stale tasks running: verify live Codex writers, confirm resume before replacing progress cards, report writer conflicts, and bound unconfirmed recovery retries without interrupting external or already-confirmed live work.
+
+- Show the latest reported context token count immediately before model calls in Turn Preview headers, with live incremental updates and exact counts on hover; hide compaction statistics and leave missing context values hidden.
+
 ## [0.1.24-alpha.4] - 2026-09-23
 
 ### 中文

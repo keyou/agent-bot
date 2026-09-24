@@ -211,7 +211,7 @@ Turn Preview 复用 highlight.js，在服务端高亮显式标注语言的 Markd
 
 输入附件路径分别保存在 `TurnViewState.promptImagePaths` 和用户活动的 `localImagePaths` 可选字段中，不混入受长度限制的文字。待启动轮次转为正式轮次、追加及重试、排队启动和快照恢复都会保留路径。Preview 通过现有签名文件服务加 `raw=1` 加载图片，文件缺失则显示占位提示。新增 JSON 字段不需要数据库迁移，也不会自动回填缺少路径的历史用户活动。
 
-Turn Preview 支持在 Prompt、Commentary 和回答的 Markdown 中使用 `mermaid`、`flowchart` 代码块。浏览器按需从同源 `/assets/mermaid.js` 加载锁定版本的 Mermaid（支持 `fileViewer.publicBaseUrl` 路径前缀），不依赖 CDN。严格模式禁用 HTML 标签和交互回调；拒绝 frontmatter、配置指令和超过 50,000 字符的源码，最多 500 条边。生成的 SVG 还会移除可执行元素和外部链接，保留现有 CSP。图表块默认预览并按宽度适配，SSE 更新保留手动模式、「适应 / 原大」选择和未变化的 SVG；加载或渲染失败时显示转义后的源码。SVG 宽度不超过 viewBox 原宽度和容器宽度，保持比例且不放大小图。窄屏或触摸设备的预览高度最多为 480 px 或 55 svh（回退为 55 vh），长图纵向滚动；原大恢复 viewBox 宽度并在块内滚动，切回适应时重置块内滚动位置。CSS 自动适应横竖屏切换，无需重新渲染 Mermaid。普通代码块和工具输出保持不变。
+Turn Preview 支持在 Prompt、Commentary 和回答的 Markdown 中使用 `mermaid`、`flowchart` 代码块。Markdown 文件预览复用相同的渲染器、切换控件、尺寸规则和安全策略，整份文件的代码视图及原始内容/下载保持不变。文件更新保留匹配图表的节点、模式、尺寸和滚动位置，仅重新渲染变化的源码。浏览器按需从同源 `/assets/mermaid.js` 加载锁定版本的 Mermaid（支持 `fileViewer.publicBaseUrl` 路径前缀），不依赖 CDN。严格模式禁用 HTML 标签和交互回调；拒绝 frontmatter、配置指令和超过 50,000 字符的源码，最多 500 条边。生成的 SVG 还会移除可执行元素和外部链接，保留现有 CSP。图表块默认预览并按宽度适配，SSE 更新保留手动模式、「适应 / 原大」选择和未变化的 SVG；加载或渲染失败时显示转义后的源码。SVG 宽度不超过 viewBox 原宽度和容器宽度，保持比例且不放大小图。窄屏或触摸设备的预览高度最多为 480 px 或 55 svh（回退为 55 vh），长图纵向滚动；原大恢复 viewBox 宽度并在块内滚动，切回适应时重置块内滚动位置。CSS 自动适应横竖屏切换，无需重新渲染 Mermaid。普通代码块和工具输出保持不变。
 
 HTML 文本文件（`.html`、`.htm`，不区分大小写）支持预览与代码模式。预览 iframe 使用带 `render=html` 的签名文件 URL，按检测到的编码流式加载完整原文，并携带文件版本参数用于实时刷新。iframe 与响应 CSP 都使用 `sandbox allow-scripts`，不授予 `allow-same-origin`；直接打开渲染 URL 时，响应级沙箱仍生效。允许内联脚本、样式及 data/blob 嵌入媒体，不开放外部或本地资源加载、网络请求、表单、弹窗和顶层跳转。外层页面保持原有脚本限制，原始文件与下载响应不变。源码仍经过转义、按需高亮，限制为开头 2 MiB，并支持 `#L<n>` 行号定位。
 
@@ -321,6 +321,8 @@ Fork 从未绑定过 Agent Bot 的任务前，Agent Bot 会先读取不含 Turns
 
 Provider 会与模型、思考强度和权限模式一起保存在任务中；每个 Agent 还可以在 `agents.<name>.defaults` 下分别保存这些默认值。新任务先读取所选 Agent 的默认值，再由显式设置或同 Agent 任务继承值覆盖。Agent Bot 会通过 `thread/start`、`thread/resume` 和 `thread/fork` 传递最终设置，并把运行时返回的实际值保存到任务。
 
+每次 `turn/start` 还会同时传递 `approvalPolicy` 和 `sandboxPolicy`：`auto` 对应 `never` + `dangerFullAccess`，`confirm` 对应 `on-request` + `workspaceWrite`。权限切换从下一轮生效，无需重启共享 App Server、恢复或分支任务；`turn/steer` 不携带这些覆盖参数。工作区策略优先取会话生命周期响应；缺失时按当前 cwd 懒加载一次 `config/read` 并按会话缓存，保留额外可写目录、网络访问和临时目录排除配置，不读取历史。配置无效或不可用时不启动新轮次；沙箱策略被拒绝时不会去掉限制后重试。
+
 `/provider`、`/model`、`/thinking` 和 `/permissions` 打开同一张 Card 2.0 运行设置卡片，并激活对应的 tab。四个命令都拒绝参数，tab 切换和设置修改只通过卡片回调完成。Provider 选项来自 App Server 的 `config/read`；对于 Codex，即使隐式内置的 `openai` 没有出现在显式 `model_providers` 配置中，Agent Bot 也会保留该选项。内置 OpenAI Provider 使用 App Server 的 `model/list`；显式配置的自定义 Provider 会在接口可用时使用 `GET <base_url>/models`，并携带其 `query_params`、`http_headers`、`env_http_headers` 和已配置的 Bearer 凭据，凭据只在 Agent Bot 内部使用，不会进入卡片或模型记录。切换 Provider 时，如果目标模型目录包含原模型则继续使用；否则依次选择标记的默认模型和返回列表中的第一个模型。自定义接口只返回模型 ID 时，会按同名模型合并 App Server 目录中的思考强度元数据。模型发现不可用时，Agent Bot 会把当前或已配置模型作为唯一候选，因此不会因缺少 `/models` 而阻止切换；保存前仍由 Codex 返回的实际 Provider 和模型完成校验。每次成功修改 Provider、模型、思考强度或权限后，Agent Bot 都会更新当前任务，把完整生效设置原子写入该 Agent 在 `config.yaml` 中的默认值，就地刷新卡片，并从下一次请求生效；对应 CLI 任务设置命令使用相同的持久化路径。
 
 Agent Bot 内部保留本地路由键以关联飞书卡片和投递状态，但对用户展示所属 App Server 的任务 ID。没有明确用户操作时，不会续写、steer、停止或分支其他客户端正在运行的 Agent 工作。
@@ -347,7 +349,7 @@ SQLite 保存：
 - 进度快照和消息绑定
 - 最终消息投递记录
 
-每次 Worker 启动时，Agent Bot 都会先扫描未终结的 turn 执行记录，再放行持久化的 Prompt 队列。只有前 5 分钟内仍有活动的执行才具备恢复资格；turn 运行期间的运行时事件和每分钟心跳会刷新持久化的活动时间。更早的未完成执行会被标记为已中断，不发送恢复通知，也不创建续跑 turn。符合条件的恢复会先通知原私聊、群聊或话题；远端已完成的 turn 只同步状态并继续未完成的最终消息投递；远端仍活动的 turn 会换用新的进度卡并持续轮询到终态；已失效的 App Server turn 或被中断的 ACP 进程会在同一任务和工作目录中创建新的续跑 turn，续跑 Prompt 会要求 Agent 先检查已有副作用，避免重复操作。恢复状态在连续多次重启之间保持持久化。
+每次 Worker 启动时，Agent Bot 都会先扫描未终结的 turn 执行记录，再放行持久化的 Prompt 队列。只有前 10 分钟内仍有活动的执行才具备恢复资格；turn 运行期间的运行时事件和每分钟心跳会刷新持久化的活动时间。更早的未完成执行会被标记为已中断，不发送恢复通知，也不创建续跑 turn。符合条件的恢复会先通知原私聊、群聊或话题；远端已完成的 turn 只同步状态并继续未完成的最终消息投递；远端仍活动的 turn 会换用新的进度卡并持续轮询到终态；已失效的 App Server turn 或被中断的 ACP 进程会在同一任务和工作目录中创建新的续跑 turn，续跑 Prompt 会要求 Agent 先检查已有副作用，避免重复操作。写锁冲突会终止自动恢复并显示占用卡片，不自动关闭任何进程。其他尚未确认恢复成功的故障每 5 秒重试，1 分钟重试窗口耗尽后关闭恢复卡片、标记中断并通知用户；活动检查失败不代表可以重放原 Prompt。已经确认活跃的轮次在临时断连期间继续监控，不受该恢复超时限制。未加载的 Codex 任务必须同时存在未结束的 rollout 和操作系统确认的存活写入进程，才补充为活跃状态；进程检查失败不会当成空闲。写入进程检查独立缓存 5 秒，不影响 rollout 增量读取；已加载任务的空闲或完成状态优先于旧日志中的开始事件。
 
 当 turn 因临时 LLM 服务错误失败时，Agent Bot 会在同一任务中自动再创建最多 3 个 turn。限流、临时过载、上游 5xx、超时和模型服务流中断可以重试；认证失败、额度耗尽、上下文超限、无效请求、不支持的模型、权限或策略错误以及工具错误会立即终止。每次重试使用新的思考卡片，重试 Prompt 会要求 Agent 先检查已有副作用再继续，避免重复操作。重试次数和待处理消息绑定会持久化；原始消息及追加消息的 Reaction 会保持处理中，并跟随最新的重试 turn，直到成功或耗尽重试次数。
 

@@ -130,6 +130,8 @@ agentbot task permissions [auto|confirm]
 
 Omit the value to inspect the current setting and available choices. `agent` changes the default Agent for future tasks in that conversation. The other settings affect the specified task from its next request and become the saved defaults for that Agent.
 
+For App Server tasks, `permissions auto` applies `never` approval and `dangerFullAccess` sandbox policies on the next Turn; `permissions confirm` applies `on-request` and `workspaceWrite`, preserving configured workspace restrictions. No Agent restart, fork, or new task is needed. Steering or changing the setting does not re-sandbox tools already executing. Feishu `/permissions` takes no arguments: choose the mode on its card.
+
 A successful Provider switch confirms settings, not inference connectivity. Model-list fallback warnings appear on settings cards; inspect the Provider service when availability is unconfirmed. App Server errors and native retry notices show the message and supplied `additionalDetails` as literal text on the current progress card and Preview without terminating the turn. Use Preview for long reasons; `Reconnecting` alone does not identify the cause when the Agent supplies no details, and old snapshots are not backfilled. Do not stop or restart a retrying task unless the user requests it.
 
 Providers such as a Responses bridge may omit assistant message phases. Unphased text stays in the progress timeline; successful completion promotes only the last message not followed by a tool start. Do not diagnose progress text in the answer area as a CSS issue without checking message phases. Old snapshots are not automatically backfilled.
@@ -152,6 +154,8 @@ In Feishu, `/turn` (also `/turns`) opens history. `/turn <Turn ID>` or `/turn <i
 The Feishu `/sessions` card also has `SwitchGroup`: create a new group bound to the selected existing task, without forking or creating a new Agent task. Source bindings remain unchanged, and active Agent Bot Turns keep their original delivery route; messages from the new group queue instead of steering them. External active tasks are not taken over.
 
 The Feishu `/sessions` card provides `Turns` for each task, including unbound external tasks. Browsing and pagination never switch, resume, or bind a task; Reset is available only for the current task.
+
+Expand a running task in `/sessions` to use its `Stop` button, including the current task and tasks in other conversations or external clients. It requests the normal Agent interrupt without switching tasks or killing processes; only click it when the user requests stopping that task. The refreshed list preserves search/page and uses actual Agent status, not interrupt acknowledgement, to decide whether Stop remains available. Archive is offered only when idle.
 
 Use `turns` to obtain a real Turn ID before `reset`. Reset changes conversation context only; it does not revert local files. Agent Bot announces an interactive Reset when it starts and queues every new message after its Reaction until the replacement thread is ready.
 
@@ -215,6 +219,8 @@ Codex requires version 0.153.4 or later. Init checks this locally, and runtime s
 Use `init --reset` only for an explicitly requested full reset. Without `--profile` it resets the default Profile; pass `--profile <directory>` to reset another Profile. It preserves backups under `.reset-backups`.
 
 ## After Code Changes
+
+For tasks stuck after a Worker crash, inspect the recovery notice and any writer-conflict card before acting. Unconfirmed recovery retries stop after a one-minute window; a live writer conflict stops them immediately. An old unfinished rollout or a leftover lock file alone is not proof of a running task. Do not delete locks, edit task state, or close another Agent process automatically. Already-confirmed live turns remain monitored; ask the user before stopping them.
 
 Run the relevant checks, then build:
 
