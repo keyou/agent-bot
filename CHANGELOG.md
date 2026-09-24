@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.5] - 2026-09-24
+
 ### 中文
 
 - 修复权限切换未同步沙箱策略的问题：下一轮同时应用审批与沙箱设置，无需重启 Agent、Fork 或新建任务，并保留工作区沙箱配置。
