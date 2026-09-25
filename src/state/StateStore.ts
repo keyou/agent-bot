@@ -6,7 +6,17 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { migrations } from "./migrations.js";
 import type { UpdateCheckSchedule, UpdateNotice } from "../updates/types.js";
-import type { ConversationTurn } from "../runtime/types.js";
+import type { ConversationTurn, RuntimeExecutionSettings } from "../runtime/types.js";
+
+export interface PendingProviderSettings {
+  localSessionId: string;
+  contextKey: string;
+  settings: RuntimeExecutionSettings;
+  messageId?: string;
+  replyMessageId?: string;
+  activeTab?: "provider" | "model" | "thinking" | "permission" | "agent";
+  error?: string;
+}
 
 export type SessionStatus = "starting" | "ready" | "running" | "closed" | "failed";
 
@@ -298,6 +308,27 @@ export class StateStore {
     const row = this.db.prepare("SELECT value_json FROM update_check_schedule WHERE id = 1")
       .get() as { value_json: string } | undefined;
     return row ? JSON.parse(row.value_json) as UpdateCheckSchedule : undefined;
+  }
+
+  getPendingProviderSettings(localSessionId: string): PendingProviderSettings | undefined {
+    const row = this.db.prepare("SELECT value_json FROM pending_provider_settings WHERE local_session_id = ?")
+      .get(localSessionId) as { value_json: string } | undefined;
+    return row ? JSON.parse(row.value_json) as PendingProviderSettings : undefined;
+  }
+
+  savePendingProviderSettings(pending: PendingProviderSettings): void {
+    this.db.prepare(`INSERT INTO pending_provider_settings (local_session_id, value_json) VALUES (?, ?)
+      ON CONFLICT(local_session_id) DO UPDATE SET value_json = excluded.value_json`)
+      .run(pending.localSessionId, JSON.stringify(pending));
+  }
+
+  deletePendingProviderSettings(localSessionId: string): void {
+    this.db.prepare("DELETE FROM pending_provider_settings WHERE local_session_id = ?").run(localSessionId);
+  }
+
+  listPendingProviderSettings(): PendingProviderSettings[] {
+    const rows = this.db.prepare("SELECT value_json FROM pending_provider_settings").all() as Array<{ value_json: string }>;
+    return rows.map((row) => JSON.parse(row.value_json) as PendingProviderSettings);
   }
 
   saveUpdateCheckSchedule(schedule: UpdateCheckSchedule): void {
@@ -982,6 +1013,7 @@ export class StateStore {
   archiveSession(localSessionId: string): void {
     const now = new Date().toISOString();
     const archive = this.db.transaction(() => {
+      this.deletePendingProviderSettings(localSessionId);
       this.db.prepare(`
         UPDATE sessions
         SET status = 'closed', updated_at = ?

@@ -217,4 +217,10 @@ export const migrations = [
     PRIMARY KEY (local_session_id, remote_session_id, context_key, message_id)
   );
   `,
+  `
+  CREATE TABLE IF NOT EXISTS pending_provider_settings (
+    local_session_id TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL
+  );
+  `,
 ] as const;

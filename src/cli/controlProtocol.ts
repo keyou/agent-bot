@@ -9,7 +9,7 @@ import type {
   RemoteSessionSummary,
   RuntimeGoal,
 } from "../runtime/types.js";
-import type { SessionRecord } from "../state/StateStore.js";
+import type { SessionRecord, PendingProviderSettings } from "../state/StateStore.js";
 import type { ShellCommandResult } from "../utils/executeShellCommand.js";
 
 export type ControlRequest =
@@ -136,6 +136,7 @@ export interface TaskAgentControlData {
 }
 
 export interface TaskSettingsControlData {
+  pendingProvider?: PendingProviderSettings;
   session: SessionRecord;
   providers: ModelProviderOption[];
   models: ModelOption[];

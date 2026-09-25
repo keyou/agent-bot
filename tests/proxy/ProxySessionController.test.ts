@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Logger } from "pino";
 import { CodexVersionError } from "../../src/codex/CodexVersion.js";
+import { ProviderSwitchError } from "../../src/codex/ProviderSwitch.js";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type {
   ThreadWriterProcess,
@@ -11709,5 +11710,240 @@ describe("ProxySessionController", () => {
       "chat_id:c1",
       "帮助卡片中的命令无效，请发送 /help 获取最新卡片。",
     );
+  });
+});
+
+describe("deferred Provider settings", () => {
+  async function runningFixture() {
+    const f = fixture();
+    await f.controller.onMessage(message("work"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const originalModels = await f.runtime.listModels();
+    vi.mocked(f.runtime.listModels).mockImplementation(async (provider) => provider === "azure"
+      ? originalModels.filter((model) => model.id === "gpt-next") : originalModels);
+    let actionSequence = 0;
+    const action = (value: Record<string, string>, contextKey = "chat_id:c1") => f.controller.onCardAction({
+      actionId: `select-${++actionSequence}`, contextKey, messageId: "settings-card",
+      value: { ...value, sessionId: id, contextKey },
+    });
+    const finish = (type: "turn_completed" | "turn_cancelled" | "turn_failed" = "turn_completed") => {
+      f.runtime.getSession(id)!.activeTurnId = undefined;
+      Object.assign(f.remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+      for (const listener of f.listeners) {
+        if (type === "turn_failed") listener({ type, sessionId: id, turnId: "turn_1", message: "nonretryable" });
+        else listener({ type, sessionId: id, turnId: "turn_1", finalResponse: "done" });
+      }
+    };
+    return { ...f, id, action, finish };
+  }
+
+  test.each(["turn_completed", "turn_cancelled", "turn_failed"] as const)("stages settings without touching live state and applies after %s", async (terminal) => {
+    const f = await runningFixture();
+    const defaults = f.config.agents.codex?.defaults;
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    expect(f.runtime.setExecutionSettings).not.toHaveBeenCalled();
+    expect(f.store.getSession(f.id)).toMatchObject({ modelProvider: "openai", model: "gpt-test" });
+    expect(f.config.agents.codex?.defaults).toEqual(defaults);
+    expect(f.store.getPendingProviderSettings(f.id)?.settings).toMatchObject({ modelProvider: "azure", model: "gpt-next" });
+    const card = JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("待生效");
+    expect(card).toContain("gpt-next");
+    expect(card).not.toContain("Provider 已切换");
+    f.finish(terminal);
+    await vi.waitFor(() => expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined());
+    expect(f.store.getSession(f.id)).toMatchObject({ modelProvider: "azure", model: "gpt-next" });
+    expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+  });
+
+  test("model tab follows the draft Provider, edits stay pending, and queued turns use the latest settings", async () => {
+    const f = await runningFixture();
+    const models = await f.runtime.listModels();
+    vi.mocked(f.runtime.listModels).mockResolvedValue(models);
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    await f.action({ action: "settings_tab_open", tab: "model" });
+    expect(f.runtime.listModels).toHaveBeenLastCalledWith("azure", "gpt-test");
+    await f.action({ action: "settings_model_select", provider: "azure", model: "gpt-next" });
+    await f.action({ action: "settings_thinking_select", provider: "azure", model: "gpt-next", effort: "xhigh" });
+    await f.action({ action: "settings_permission_select", permissionMode: "confirm" });
+    expect(f.runtime.setModel).not.toHaveBeenCalled();
+    expect(f.runtime.setReasoningEffort).not.toHaveBeenCalled();
+    expect(f.runtime.setPermissionMode).not.toHaveBeenCalled();
+    f.store.enqueuePrompt({ promptId: "next", localSessionId: f.id, contextKey: "chat_id:c1", text: "next" });
+    vi.mocked(f.runtime.startTurn).mockImplementationOnce(async () => {
+      expect(f.runtime.getSession(f.id)).toMatchObject({ modelProvider: "azure", model: "gpt-next", reasoningEffort: "xhigh", permissionMode: "confirm" });
+      return "turn_2";
+    });
+    f.finish();
+    await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(2));
+    expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
+    expect(f.store.countQueuedPrompts(f.id)).toBe(0);
+  });
+
+  test("CLI reports actual and pending settings separately and the last Provider selection wins", async () => {
+    const f = await runningFixture();
+    const result = await f.controller.controlTaskSettings(f.id, "provider", "azure");
+    expect(result.session.modelProvider).toBe("openai");
+    expect(result.pendingProvider?.settings.model).toBe("gpt-next");
+    expect(result.models.map((model) => model.id)).toEqual(["gpt-next"]);
+    await f.controller.controlTaskSettings(f.id, "provider", "openai");
+    await f.controller.controlTaskSettings(f.id, "model", "gpt-test");
+    await f.action({ action: "settings_model_select", provider: "azure", model: "gpt-next" });
+    expect(JSON.stringify(vi.mocked(f.outbound.sendText).mock.calls)).toContain("Provider 已发生变化");
+    expect(f.store.getPendingProviderSettings(f.id)?.settings).toMatchObject({ modelProvider: "openai", model: "gpt-test" });
+    f.finish();
+    await vi.waitFor(() => expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined());
+    expect(f.store.getSession(f.id)).toMatchObject({ modelProvider: "openai", model: "gpt-test" });
+  });
+
+  test.each([true, false])("failed deferred switches return the card and task to the original settings (queue=%s)", async (queued) => {
+    const f = await runningFixture();
+    const original = { modelProvider: "openai", model: "gpt-test", reasoningEffort: "high", permissionMode: "auto" };
+    const defaults = f.config.agents.codex?.defaults;
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    await f.action({ action: "settings_permission_select", permissionMode: "confirm" });
+    if (queued) {
+      f.store.enqueuePrompt({ promptId: "next", localSessionId: f.id, contextKey: "chat_id:c1", text: "next" });
+      vi.mocked(f.runtime.startTurn).mockImplementationOnce(async () => {
+        expect(f.runtime.getSession(f.id)).toMatchObject(original);
+        return "next-turn";
+      });
+    }
+    vi.mocked(f.runtime.setExecutionSettings!).mockRejectedValueOnce(new ProviderSwitchError("Provider unavailable", true));
+    f.finish();
+    await vi.waitFor(() => expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined());
+    expect(f.store.getSession(f.id)).toMatchObject(original);
+    expect(f.runtime.getSession(f.id)).toMatchObject(original);
+    expect(f.config.agents.codex?.defaults).toEqual(defaults);
+    expect(f.persistAgentExecutionDefaults).not.toHaveBeenCalled();
+    const card = JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("已回退到 Provider openai、模型 gpt-test");
+    expect(card).toContain("**Provider / 模型**：`openai` / `gpt-test`");
+    expect(card).not.toContain("待生效");
+    expect(card).not.toContain("Provider 已切换");
+    expect(card).toContain("orange");
+    await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(queued ? 2 : 1));
+    expect(f.store.countQueuedPrompts(f.id)).toBe(0);
+    expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
+    expect((await f.controller.controlTaskSettings(f.id)).pendingProvider).toBeUndefined();
+    if (!queued) {
+      await f.controller.onMessage(message("continue with the original settings"));
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(2);
+      expect(f.runtime.getSession(f.id)).toMatchObject(original);
+      expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
+    }
+  });
+
+  test("a failed rollback notification does not retry the rejected Provider or block the queue", async () => {
+    const f = await runningFixture();
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    f.store.enqueuePrompt({ promptId: "next", localSessionId: f.id, contextKey: "chat_id:c1", text: "next" });
+    vi.mocked(f.runtime.setExecutionSettings!).mockRejectedValueOnce(new ProviderSwitchError("unavailable", true));
+    vi.mocked(f.outbound.updateInteractiveCard).mockRejectedValueOnce(new Error("card unavailable"));
+    vi.mocked(f.outbound.replyText!).mockRejectedValueOnce(new Error("notification unavailable"));
+    f.finish();
+    await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(2));
+    expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
+    expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined();
+    expect(f.store.getSession(f.id)).toMatchObject({ modelProvider: "openai", model: "gpt-test" });
+  });
+
+  test.each(["failed", "unknown", "mismatched"])("unverified rollback (%s) preserves the queue and can be retried", async (outcome) => {
+    const f = await runningFixture();
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    f.store.enqueuePrompt({ promptId: "next", localSessionId: f.id, contextKey: "chat_id:c1", text: "next" });
+    vi.mocked(f.runtime.setExecutionSettings!).mockImplementationOnce(async () => {
+      if (outcome === "mismatched") f.runtime.getSession(f.id)!.model = "wrong-model";
+      throw outcome === "unknown" ? new Error("Provider unavailable")
+        : new ProviderSwitchError("Provider unavailable", outcome === "mismatched");
+    });
+    f.finish();
+    await vi.waitFor(() => expect(f.store.getPendingProviderSettings(f.id)?.error).toBe("Provider unavailable"));
+    expect(f.store.getSession(f.id)?.modelProvider).toBe("openai");
+    expect(f.runtime.startTurn).toHaveBeenCalledOnce();
+    expect(f.store.countQueuedPrompts(f.id)).toBe(1);
+    const failedCard = JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(failedCard).toContain("切换失败");
+    const retryAction = sessionOverflowActions(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1)?.[1])
+      .find((a) => a.action === "settings_provider_select" && a.provider === "azure");
+    expect(retryAction).toBeDefined();
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(2));
+    expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined();
+    expect(f.runtime.setExecutionSettings).toHaveBeenCalledTimes(2);
+  });
+
+  test("an in-flight model discovery is serialized with the terminal switch", async () => {
+    const f = await runningFixture();
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    const models = await f.runtime.listModels();
+    let resolveModels!: (value: typeof models) => void;
+    vi.mocked(f.runtime.listModels).mockImplementationOnce(() => new Promise((resolve) => { resolveModels = resolve; }));
+    const change = f.action({ action: "settings_model_select", provider: "azure", model: "gpt-test" });
+    await vi.waitFor(() => expect(resolveModels).toBeTypeOf("function"));
+    f.finish();
+    resolveModels(models);
+    await change;
+    await vi.waitFor(() => expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined());
+    expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
+    expect(f.store.getSession(f.id)?.model).toBe("gpt-test");
+  });
+
+  test("an automatic LLM retry applies the pending Provider first", async () => {
+    const f = await runningFixture();
+    await f.action({ action: "settings_provider_select", provider: "azure" });
+    f.runtime.getSession(f.id)!.activeTurnId = undefined;
+    Object.assign(f.remoteSessions[0]!, { status: "idle", lastTurnStatus: "failed" });
+    vi.mocked(f.runtime.startTurn).mockImplementationOnce(async () => {
+      expect(f.runtime.getSession(f.id)?.modelProvider).toBe("azure");
+      return "retry-turn";
+    });
+    for (const listener of f.listeners) listener({ type: "turn_failed", sessionId: f.id, turnId: "turn_1", message: "stream disconnected before completion" });
+    await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(2));
+    expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
+  });
+
+  test("settings selected in another bound conversation stay with that task and update the selecting card", async () => {
+    const f = await runningFixture();
+    f.store.getOrCreateUserContext("chat_id:other", "codex");
+    f.store.setCurrentSession("chat_id:other", f.id);
+    await f.action({ action: "settings_provider_select", provider: "azure" }, "chat_id:other");
+    expect(f.store.getPendingProviderSettings(f.id)?.contextKey).toBe("chat_id:other");
+    f.finish();
+    await vi.waitFor(() => expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined());
+    const result = vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1);
+    expect(result?.[0]).toBe("settings-card");
+    expect(JSON.stringify(result?.[1])).toContain("Provider 已切换");
+    expect(JSON.stringify(result?.[1])).toContain("chat_id:other");
+  });
+
+  test("new turns apply a persisted draft before submitting the prompt", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("/new"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    f.store.savePendingProviderSettings({ localSessionId: id, contextKey: "chat_id:c1", settings: {
+      modelProvider: "azure", model: "gpt-next", reasoningEffort: "medium", permissionMode: "auto",
+    } });
+    vi.mocked(f.runtime.startTurn).mockImplementationOnce(async () => {
+      expect(f.runtime.getSession(id)?.modelProvider).toBe("azure");
+      return "fresh-turn";
+    });
+    await f.controller.onMessage(message("continue"));
+    expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
+    expect(f.runtime.startTurn).toHaveBeenCalledOnce();
+    expect(f.store.getPendingProviderSettings(id)).toBeUndefined();
+  });
+
+  test("startup applies persisted idle settings even without queued prompts", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("/new"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    f.store.savePendingProviderSettings({ localSessionId: id, contextKey: "chat_id:c1", settings: {
+      modelProvider: "azure", model: "gpt-next", reasoningEffort: "medium", permissionMode: "auto",
+    } });
+    await f.controller.recoverInterruptedTasks();
+    expect(f.store.getSession(id)?.modelProvider).toBe("azure");
+    expect(f.store.getPendingProviderSettings(id)).toBeUndefined();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
   });
 });

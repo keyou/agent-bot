@@ -35,7 +35,7 @@ import { formatCodexError, mapCodexNotification } from "./CodexEventMapper.js";
 import { CodexLocalActivityDetector } from "./CodexLocalActivityDetector.js";
 import { detectProjectlessWorkspace } from "./ProjectlessWorkspace.js";
 import { threadWriterLockPath } from "./ThreadWriterProcess.js";
-import { assertProviderSettingsApplied, PROVIDER_SWITCH_BUSY, providerSwitchFailure } from "./ProviderSwitch.js";
+import { assertProviderSettingsApplied, PROVIDER_SWITCH_BUSY, ProviderSwitchError, providerSwitchFailure } from "./ProviderSwitch.js";
 import { fetchProviderModels, type ProviderModelConfig } from "./ProviderModels.js";
 
 const WINDOWS_SCREENSHOT_DEVELOPER_INSTRUCTIONS = [
@@ -738,7 +738,16 @@ export class CodexRuntime implements AgentRuntime {
     settings: RuntimeExecutionSettings,
     persist?: (session: RuntimeSession) => Promise<void>,
   ): Promise<RuntimeSession> {
-    return this.runSessionOperation(sessionId, () => this.setExecutionSettingsNow(sessionId, settings, persist));
+    return this.runSessionOperation(sessionId, async () => {
+      try {
+        return await this.setExecutionSettingsNow(sessionId, settings, persist);
+      } catch (error) {
+        if (error instanceof ProviderSwitchError) throw error;
+        // Errors outside the mutation block are preflight failures; no settings were changed.
+        const session = this.sessions.get(sessionId);
+        throw new ProviderSwitchError(providerSwitchFailure(error), Boolean(session && !session.settingsRecoveryError), { cause: error });
+      }
+    });
   }
 
   private async setExecutionSettingsNow(
@@ -844,7 +853,10 @@ export class CodexRuntime implements AgentRuntime {
           session.needsResume = true;
         }
       }
-      throw new Error(`Provider 切换失败：${providerSwitchFailure(error)} ${recovery}`, { cause: error });
+      throw new ProviderSwitchError(
+        `Provider 切换失败：${providerSwitchFailure(error)} ${recovery}`,
+        !session.settingsRecoveryError, { cause: error },
+      );
     }
     if (replacementId) await this.discardUnusedThread(client, previous.remoteSessionId);
     return session;

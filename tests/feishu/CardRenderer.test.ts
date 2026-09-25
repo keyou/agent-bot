@@ -446,9 +446,9 @@ describe("CardRenderer", () => {
 
   test.each([
     ["agent", "只影响新建任务，不切换当前任务。", { agent: "traex" }],
-    ["provider", "只影响当前任务，需空闲时切换。", { provider: "ai_coding" }],
-    ["model", "只影响当前任务，下一轮生效。", { model: "gpt-next" }],
-    ["thinking", "只影响当前任务，下一轮生效。", { model: "gpt-test", effort: "low" }],
+    ["provider", "只影响当前任务；运行中选择将在本轮结束后生效。", { provider: "ai_coding" }],
+    ["model", "只影响当前任务，下一轮生效。", { model: "gpt-next", provider: "openai" }],
+    ["thinking", "只影响当前任务，下一轮生效。", { model: "gpt-test", effort: "low", provider: "openai" }],
     ["permission", "只影响当前任务，下一轮生效。", { permissionMode: "confirm" }],
   ] as const)("ends %s settings with one concise blockquote without changing callbacks", (activeTab, effect, selectedValue) => {
     const card = new CardRenderer().renderExecutionSettings({

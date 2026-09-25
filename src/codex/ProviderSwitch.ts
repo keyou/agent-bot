@@ -3,6 +3,13 @@ import type { RuntimeExecutionSettings } from "../runtime/types.js";
 
 export const PROVIDER_SWITCH_BUSY = "当前任务正在执行，暂时不能切换 Provider。请等待任务完成，或停止任务后重试。";
 
+export class ProviderSwitchError extends Error {
+  constructor(message: string, readonly previousSettingsRestored: boolean, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ProviderSwitchError";
+  }
+}
+
 export function isMissingRolloutError(error: unknown): boolean {
   if (error instanceof AppServerRequestError && error.method !== "thread/resume") return false;
   const message = error instanceof AppServerRequestError ? error.serverMessage

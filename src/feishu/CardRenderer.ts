@@ -131,7 +131,7 @@ export type ExecutionSettingsTab = "agent" | "provider" | "model" | "thinking" |
 
 const EXECUTION_SETTING_EFFECTS: Record<ExecutionSettingsTab, string> = {
   agent: "只影响新建任务，不切换当前任务。",
-  provider: "只影响当前任务，需空闲时切换。",
+  provider: "只影响当前任务；运行中选择将在本轮结束后生效。",
   model: "只影响当前任务，下一轮生效。",
   thinking: "只影响当前任务，下一轮生效。",
   permission: "只影响当前任务，下一轮生效。",
@@ -143,6 +143,8 @@ export interface ExecutionSettingsAgentOption {
 }
 
 export interface ExecutionSettingsCardView {
+  pendingNotice?: string;
+  pendingFailed?: boolean;
   sessionId?: string;
   contextKey: string;
   activeTab: ExecutionSettingsTab;
@@ -553,6 +555,7 @@ export class CardRenderer {
               `**思考强度 / 权限**：${inlineCode(view.currentEffort ?? "自动")} / ${inlineCode(permissionModeLabel(view.currentPermissionMode))}`,
             ]
           : []),
+        ...(view.pendingNotice ? [view.pendingNotice] : []),
         ...(view.notice ? [view.notice] : []),
         ...(view.warning ? [`**提示**：${escapeCardHtml(view.warning)}`] : []),
       ].join("\n")),
@@ -584,7 +587,8 @@ export class CardRenderer {
             inlineCode(provider.id),
             provider.isDefault ? " · 默认" : "",
           ].join(""),
-          current: provider.id === view.currentProvider,
+          current: provider.id === view.currentProvider && !view.pendingFailed,
+          currentLabel: view.pendingNotice ? "待生效" : undefined,
           action: {
             text: "Switch",
             value: {
@@ -601,12 +605,14 @@ export class CardRenderer {
       } else {
         elements.push(...view.models.map((model) => settingsOptionRow({
           label: `${inlineCode(model.id)}${model.isDefault ? " · 默认" : ""}`,
-          current: model.id === view.currentModel,
+          current: model.id === view.currentModel && !view.pendingFailed,
+          currentLabel: view.pendingNotice ? "待生效" : undefined,
           action: {
             text: "Switch",
             value: {
               action: "settings_model_select",
               ...baseAction,
+              provider: view.currentProvider ?? "",
               model: model.id,
             },
           },
@@ -622,11 +628,13 @@ export class CardRenderer {
         elements.push(...view.reasoningOptions.map((option) => settingsOptionRow({
           label: inlineCode(option.value),
           current: option.value === view.currentEffort,
+          currentLabel: view.pendingNotice ? "待生效" : undefined,
           action: {
             text: "Switch",
             value: {
               action: "settings_thinking_select",
               ...baseAction,
+              provider: view.currentProvider ?? "",
               model: currentModel,
               effort: option.value,
             },
@@ -637,6 +645,7 @@ export class CardRenderer {
       elements.push(...(["auto", "confirm"] as PermissionMode[]).map((mode) => settingsOptionRow({
         label: `${inlineCode(mode)} · ${permissionModeLabel(mode)}`,
         current: mode === view.currentPermissionMode,
+        currentLabel: view.pendingNotice ? "待生效" : undefined,
         action: {
           text: "Switch",
           value: {
@@ -649,7 +658,7 @@ export class CardRenderer {
     }
 
     elements.push(markdown(`> ${EXECUTION_SETTING_EFFECTS[view.activeTab]}`));
-    return sectionCard("运行设置", elements, view.warning ? "orange" : view.notice ? "green" : "blue");
+    return sectionCard("运行设置", elements, view.warning || view.pendingFailed ? "orange" : view.notice ? "green" : "blue");
   }
 
   renderProviderSelector(view: ProviderSelectorCardView): Record<string, unknown> {
@@ -2918,6 +2927,7 @@ function settingsTabElement(
 function settingsOptionRow(input: {
   label: string;
   current: boolean;
+  currentLabel?: string;
   action: TaskListCardAction;
 }): Record<string, unknown> {
   return {
@@ -2937,7 +2947,7 @@ function settingsOptionRow(input: {
         tag: "column",
         width: "auto",
         vertical_align: "center",
-        elements: input.current ? [markdown("✅ 当前")] : [taskActionElement(input.action)],
+        elements: input.current ? [markdown(`✅ ${input.currentLabel ?? "当前"}`)] : [taskActionElement(input.action)],
       },
     ],
   };

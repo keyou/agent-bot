@@ -6,6 +6,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 中文
+
+- 支持运行中预选 Provider：卡片立即展示待生效 Provider 和模型，可继续选择目标 Provider 的模型，本轮结束后按最后选择应用。待生效设置跨重启保留；切换失败自动回退原 Provider 和模型，确认回退后同步恢复卡片并继续排队消息，回退失败时明确提示并暂停。
+
+### English
+
+- Stage Provider changes during active turns, immediately showing the pending Provider/model and its model catalog. Apply the latest selection before the next turn, persist pending settings across restarts, and roll back failed switches to the original Provider/model. Restore the card and resume queued prompts only after verified rollback; pause with an error if rollback fails.
+
 ## [0.1.24-alpha.5] - 2026-09-24
 
 ### 中文

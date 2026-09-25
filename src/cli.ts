@@ -1832,7 +1832,12 @@ function printTaskSettings(
   result: TaskSettingsControlData,
   setting: "provider" | "model" | "thinking" | "permissions",
 ): void {
-  const session = result.session;
+  const session = result.pendingProvider?.settings ?? result.session;
+  if (result.pendingProvider) {
+    const status = cliText("Pending Provider switch (after current turn)", "Provider 待切换（本轮结束后生效）");
+    const error = result.pendingProvider.error ? `: ${result.pendingProvider.error}` : "";
+    process.stdout.write(`${status}${error}\n`);
+  }
   process.stdout.write(`${cliText("Provider: ", "Provider：")}${session.modelProvider ?? cliText("Agent default", "Agent 默认")}\n`);
   process.stdout.write(`${cliText("Model: ", "模型：")}${session.model ?? cliText("default", "默认")}\n`);
   process.stdout.write(`${cliText("Thinking: ", "思考强度：")}${session.reasoningEffort ?? cliText("automatic", "自动")}\n`);

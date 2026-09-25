@@ -18,6 +18,29 @@ afterEach(() => {
 });
 
 describe("StateStore runtime metadata", () => {
+  test("persists pending Provider settings separately and removes them on archive", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-pending-settings-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "state.sqlite");
+    const first = new StateStore(file);
+    first.createSession({ localSessionId: "s", contextKey: "c", agentName: "codex", cwd: directory, status: "running" });
+    first.updateRuntimeSession("s", { modelProvider: "openai", model: "old-model" });
+    const pending = { localSessionId: "s", contextKey: "c", messageId: "card", settings: {
+      modelProvider: "azure", model: "new-model", reasoningEffort: "high", permissionMode: "auto" as const,
+    } };
+    first.savePendingProviderSettings(pending);
+    first.savePendingProviderSettings({ ...pending, settings: { ...pending.settings, model: "chosen-model" } });
+    first.close();
+    const store = new StateStore(file);
+    stores.push(store);
+    expect(store.getSession("s")).toMatchObject({ modelProvider: "openai", model: "old-model" });
+    expect(store.getPendingProviderSettings("s")?.settings.model).toBe("chosen-model");
+    expect(store.listPendingProviderSettings()).toHaveLength(1);
+    store.archiveSession("s");
+    expect(store.getPendingProviderSettings("s")).toBeUndefined();
+    expect(store.listPendingProviderSettings()).toEqual([]);
+  });
+
   test("reads submitted message boundaries without full snapshots and isolates task, branch and topic", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-boundary-"));
     tempDirectories.push(directory);

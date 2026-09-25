@@ -7,6 +7,7 @@ import type { RuntimeEvent, RuntimeExecutionSettings, RuntimeGoal } from "../../
 import { AppServerRequestError } from "../../src/codex/AppServerConnection.js";
 import { CodexRuntime, type AppServerClientProvider } from "../../src/codex/CodexRuntime.js";
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
+import { ProviderSwitchError } from "../../src/codex/ProviderSwitch.js";
 
 describe("CodexRuntime", () => {
 
@@ -2599,11 +2600,50 @@ describe("Provider switching", () => {
   test("blocks the next turn after failed recovery until settings are verified again", async () => {
     const { client, runtime } = await setup();
     client.resumeResults.push(oldResponse, new Error("restore failed"));
-    await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow("远端恢复失败");
+    const switching = runtime.setExecutionSettings("s", target);
+    await expect(switching).rejects.toThrow("远端恢复失败");
+    await expect(switching).rejects.toMatchObject({ previousSettingsRestored: false });
     await expect(runtime.startTurn("s", "do not use uncertain settings")).rejects.toThrow("远端恢复失败");
     expect(client.requests.some((r) => r.method === "turn/start")).toBe(false);
     await runtime.setExecutionSettings("s", target);
     await expect(runtime.startTurn("s", "verified")).resolves.toBe("turn_1");
+  });
+
+  test.each(["request", "persistence"])("reports verified rollback after a %s failure and starts the next turn with the original model", async (failure) => {
+    const { client, runtime, session } = await setup();
+    const requested = { ...target, model: "gpt-next" };
+    client.resumeResults.push(
+      failure === "request" ? new Error("target unavailable") : { ...targetResponse, model: "gpt-next" },
+      oldResponse,
+    );
+    const switching = runtime.setExecutionSettings("s", requested, async () => { throw new Error("save failed"); });
+    await expect(switching).rejects.toBeInstanceOf(ProviderSwitchError);
+    await expect(switching).rejects.toMatchObject({ previousSettingsRestored: true });
+    expect(session).toMatchObject({ modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto" });
+    expect(client.requests.at(-1)).toMatchObject({ method: "thread/resume", params: {
+      threadId: "thr_1", modelProvider: "openai", model: "gpt-test",
+    } });
+    await runtime.startTurn("s", "continue");
+    expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: {
+      threadId: "thr_1", model: "gpt-test", effort: "medium", approvalPolicy: "never",
+    } });
+  });
+
+  test("does not report rollback success when restoring the original model is ignored", async () => {
+    const { client, runtime } = await setup();
+    client.resumeResults.push(new Error("target unavailable"), { ...oldResponse, model: "wrong-model" });
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toMatchObject({ previousSettingsRestored: false });
+    await expect(runtime.startTurn("s", "wait")).rejects.toThrow("远端恢复失败");
+    expect(client.requests.some((request) => request.method === "turn/start")).toBe(false);
+    client.readErrors.push(new Error("metadata unavailable"));
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toMatchObject({ previousSettingsRestored: false });
+  });
+
+  test("reports intact previous settings for preflight failures without detaching", async () => {
+    const { client, runtime } = await setup();
+    client.readErrors.push(new Error("metadata unavailable"));
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toMatchObject({ previousSettingsRestored: true });
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/read"]);
   });
 
   test("serializes consecutive switches so the last verified choice wins", async () => {

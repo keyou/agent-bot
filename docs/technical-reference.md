@@ -337,6 +337,10 @@ Project behavior:
 
 Forks use the latest available completed turn and do not interrupt an active source turn.
 
+### Deferred Provider settings
+
+`pending_provider_settings` stores a task-scoped target Provider/model/reasoning/permission bundle and the notification route independently of active session fields. Settings mutations and Turn starts are serialized per task, including multiple bound conversations. Cards use the pending Provider’s model catalog and mark the selection as pending; model/thinking callbacks carry the Provider ID to reject stale cards. Terminal events and startup recovery apply pending settings, and every Turn start checks them before submitting a Prompt. Failed switches restore the original Provider/model; a typed runtime error reports whether rollback succeeded. Only after verifying rollback and matching both runtime and persisted settings does the controller clear the draft, restore the card with a warning, and allow queued/new Prompts to continue. Failed or unverified rollback retains the draft and queued Prompts for explicit recovery. Archive clears the draft. Agent defaults are only persisted after the runtime confirms the actual Provider/model.
+
 ## Persistence And Recovery
 
 SQLite stores:
