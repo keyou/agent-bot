@@ -23,6 +23,11 @@ console:
 updates:
   enabled: true
 
+# Interactive terminal: independent authorization, not a read-only Preview.
+terminal:
+  enabled: true
+  # Shares fileViewer host, port and publicBaseUrl; keeps independent owner authorization.
+
 # Signed, read-only pages for local files referenced in Agent replies.
 fileViewer:
   enabled: true

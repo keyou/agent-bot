@@ -1,4 +1,5 @@
 export interface ServerActivityState {
+  activeTerminals?: number;
   runningSessions: number;
   pendingFinalDeliveries: number;
   latestInboundAt?: string;
@@ -49,11 +50,16 @@ export class SafeRestartScheduler {
   private idleInboundAt?: string;
   private scheduleId = 0;
   private restartImmediatelyIfIdle = false;
+  private restartingNow = false;
 
   constructor(private readonly options: SafeRestartSchedulerOptions) {}
 
   get scheduled(): boolean {
     return Boolean(this.reason);
+  }
+
+  get restarting(): boolean {
+    return this.restartingNow;
   }
 
   get pendingReason(): string | undefined {
@@ -131,14 +137,14 @@ export class SafeRestartScheduler {
     if (!reason) return;
     const scheduleId = this.scheduleId;
     const state = this.options.readActivity();
-    if (state.runningSessions > 0 || state.pendingFinalDeliveries > 0) {
+    if (hasActiveWork(state) || state.pendingFinalDeliveries > 0) {
       this.idleSince = undefined;
       this.idleInboundAt = undefined;
       await this.emitStatus({
         scheduleId,
         reason,
         notificationTargets: this.notificationTargetsSnapshot(),
-        phase: state.runningSessions > 0 ? "waiting_tasks" : "waiting_delivery",
+        phase: hasActiveWork(state) ? "waiting_tasks" : "waiting_delivery",
         activity: state,
       });
       return;
@@ -176,18 +182,18 @@ export class SafeRestartScheduler {
     }
     const confirmed = this.options.readActivity();
     if (
-      confirmed.runningSessions > 0
+      hasActiveWork(confirmed)
       || confirmed.pendingFinalDeliveries > 0
       || (confirmed.latestInboundAt ?? "") !== this.idleInboundAt
     ) {
       this.idleSince = undefined;
       this.idleInboundAt = undefined;
-      if (confirmed.runningSessions > 0 || confirmed.pendingFinalDeliveries > 0) {
+      if (hasActiveWork(confirmed) || confirmed.pendingFinalDeliveries > 0) {
         await this.emitStatus({
           scheduleId,
           reason,
           notificationTargets: this.notificationTargetsSnapshot(),
-          phase: confirmed.runningSessions > 0 ? "waiting_tasks" : "waiting_delivery",
+          phase: hasActiveWork(confirmed) ? "waiting_tasks" : "waiting_delivery",
           activity: confirmed,
         });
       } else {
@@ -206,6 +212,7 @@ export class SafeRestartScheduler {
   }
 
   private async restart(reason: string, scheduleId: number, activity: ServerActivityState): Promise<void> {
+    this.restartingNow = true;
     const notificationTargets = this.notificationTargetsSnapshot();
     this.clear();
     await this.emitStatus({
@@ -216,7 +223,8 @@ export class SafeRestartScheduler {
       activity,
       remainingMs: 0,
     });
-    await this.options.onReady(reason, notificationTargets);
+    try { await this.options.onReady(reason, notificationTargets); }
+    finally { this.restartingNow = false; }
   }
 
   private requestPoll(): void {
@@ -267,6 +275,10 @@ export class SafeRestartScheduler {
   private notificationTargetsSnapshot(): RestartNotificationTarget[] {
     return this.notificationTargets.map((target) => ({ ...target }));
   }
+}
+
+function hasActiveWork(state: ServerActivityState): boolean {
+  return state.runningSessions > 0 || (state.activeTerminals ?? 0) > 0;
 }
 
 function normalizedNotificationTarget(

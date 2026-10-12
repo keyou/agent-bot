@@ -4,6 +4,25 @@ import { SafeRestartScheduler, type ServerActivityState } from "../../src/superv
 afterEach(() => vi.useRealTimers());
 
 describe("SafeRestartScheduler", () => {
+  test("waits for terminals and exposes restart commitment before asynchronous card delivery", async () => {
+    vi.useFakeTimers();
+    let activeTerminals = 1;
+    const onReady = vi.fn();
+    const scheduler = new SafeRestartScheduler({
+      readActivity: () => ({ runningSessions: 0, pendingFinalDeliveries: 0, activeTerminals }),
+      onReady,
+      onStatus: async (status) => {
+        if (status.phase === "restarting") expect(scheduler.restarting).toBe(true);
+      },
+    });
+    scheduler.schedule("terminal test", undefined, { restartImmediatelyIfIdle: true });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(onReady).not.toHaveBeenCalled();
+    expect(scheduler.restarting).toBe(false);
+    activeTerminals = 0;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onReady).toHaveBeenCalledOnce();
+  });
   test("uses a five-second quiet period by default", async () => {
     vi.useFakeTimers();
     const onReady = vi.fn();

@@ -1,6 +1,9 @@
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { TerminalServer } from "./terminal/TerminalServer.js";
+import { sendTerminalAuthorization } from "./terminal/TerminalCards.js";
+import { ShellCommandJobManager } from "./shell/ShellCommandJobManager.js";
 import { LocalControlServer } from "./cli/LocalControlServer.js";
 import { controlEndpoint, type ControlRequest, type ControlResponse } from "./cli/controlProtocol.js";
 import { readPackageVersion } from "./cli/packageVersion.js";
@@ -79,6 +82,8 @@ const transport = consoleOnly ? "console" : requireServerFeishuTransport(config.
 const logger = createLogger(config);
 const store = new StateStore(config.storage.sqlitePath, (error) => logger.error({ error }, "Failed to persist Turn preview journal."));
 let localFileViewer: LocalFileViewerServer | undefined;
+let terminalServer: TerminalServer | undefined;
+const shellCommandJobs = new ShellCommandJobManager(path.join(path.dirname(config.storage.sqlitePath), "command-jobs"));
 let loadTurnDetails: ((turnId: string) => Promise<unknown>) | undefined;
 if (config.fileViewer.enabled) {
   const viewer = new LocalFileViewerServer({
@@ -160,7 +165,7 @@ let restartRequested = false;
 let pendingSelfUpdatePlanPath: string | undefined;
 let preparingSelfUpdate = false;
 const safeRestart = new SafeRestartScheduler({
-  readActivity: () => store.getServerActivityState(),
+  readActivity: () => serverActivity(),
   onReady: (reason, notificationTargets) => pendingSelfUpdatePlanPath
     ? initiateSelfUpdate(reason, notificationTargets)
     : initiateRestart(reason, notificationTargets),
@@ -226,8 +231,39 @@ async function prepareAndScheduleUpdate(version: string, target: RestartNotifica
   }
 }
 
+if (feishuOutbound && localFileViewer && config.terminal?.enabled !== false) {
+  const server = new TerminalServer({
+    stateDirectory: path.join(path.dirname(config.storage.sqlitePath), "terminal"),
+    ownerId: () => config.feishu.userOpenId,
+    canStart: () => !shuttingDown && !restartRequested && !safeRestart.scheduled && !safeRestart.restarting,
+    readJob: (jobId) => shellCommandJobs.readJob(jobId),
+    requestApproval: (authorization) => sendTerminalAuthorization(feishuOutbound, authorization),
+    updateCard: (messageId, view) => feishuOutbound.updateInteractiveCard(messageId, new CardRenderer().renderTerminalAuthorization(view)),
+    logger,
+  });
+  try {
+    const publicBaseUrl = await server.start(localFileViewer);
+    terminalServer = server;
+    logger.info({ publicBaseUrl }, "Interactive terminal service started (owner authorization required).");
+  } catch (error) {
+    await server.close();
+    logger.warn({ error }, "Terminal service unavailable; command cards remain usable.");
+  }
+}
+
+function serverActivity() {
+  const activity = store.getServerActivityState();
+  const activeTerminals = terminalServer?.activeCount ?? 0;
+  return { ...activity, activeTerminals };
+}
+
 const controller = new ProxySessionController(config, store, runtimes, outbound, logger, {
   supervised,
+  terminalUrl: (jobId) => terminalServer?.createUrl(jobId),
+  authorizeTerminal: (action) => {
+    if (!terminalServer) throw new Error("网页终端未启用。");
+    return terminalServer.resolveApproval(action);
+  },
   showUpdates: (contextKey, userId) => manualUpdates.show(contextKey, userId),
   selectUpdate: (action, replyTarget) => manualUpdates.select(action, replyTarget),
   restart: requestRestart,
@@ -264,7 +300,7 @@ const controller = new ProxySessionController(config, store, runtimes, outbound,
     const changed = writeAgentExecutionDefaults(activeConfigPath, agentName, defaults);
     logger.info({ agentName, changed }, "Stored Agent execution defaults.");
   },
-});
+}, undefined, undefined, shellCommandJobs);
 loadTurnDetails = (turnId) => controller.loadTurnDetails(turnId);
 
 if (feishuOutbound) {
@@ -327,7 +363,7 @@ function recoverPendingSelfUpdate(): void {
     pending.plan.reason ?? `Resume Agent Bot update to ${pending.plan.toVersion}`,
     notificationTarget,
     {
-      restartImmediatelyIfIdle: isServerIdle(store.getServerActivityState()),
+      restartImmediatelyIfIdle: isServerIdle(serverActivity()),
     },
   );
   logger.warn(
@@ -468,7 +504,7 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
           }),
           safeRestartScheduled: safeRestart.scheduled,
           safeRestartReason: safeRestart.pendingReason,
-          activity: store.getServerActivityState(),
+          activity: serverActivity(),
         },
       };
     case "server_restart": {
@@ -497,7 +533,7 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
       }
       assertSelfUpdatePlanPath(request.planPath, agentBotHome());
       const notificationTarget = inferServerRestartTarget(request.notificationSessionId);
-      const restartImmediatelyIfIdle = isServerIdle(store.getServerActivityState());
+      const restartImmediatelyIfIdle = isServerIdle(serverActivity());
       pendingSelfUpdatePlanPath = request.planPath;
       safeRestart.schedule(request.reason, notificationTarget, { restartImmediatelyIfIdle });
       return {
@@ -636,6 +672,7 @@ async function shutdown(
     outbound.flushAll().catch((error: unknown) => logger.warn({ error }, "Failed to flush presenters.")),
     delay(5_000),
   ]);
+  await terminalServer?.close().catch((error: unknown) => logger.warn({ error }, "Failed to close terminals."));
   runtimes.close();
   await controlServer?.close().catch((error: unknown) => logger.warn({ error }, "Failed to close local control endpoint."));
   await localFileViewer?.close().catch((error: unknown) => logger.warn({ error }, "Failed to close local file viewer."));
@@ -708,8 +745,8 @@ function inferServerRestartTarget(notificationSessionId?: string): RestartNotifi
   return privateRestartNotificationTarget(config.feishu.userOpenId);
 }
 
-function isServerIdle(activity: { runningSessions: number; pendingFinalDeliveries: number }): boolean {
-  return activity.runningSessions === 0 && activity.pendingFinalDeliveries === 0;
+function isServerIdle(activity: { runningSessions: number; pendingFinalDeliveries: number; activeTerminals?: number }): boolean {
+  return activity.runningSessions === 0 && activity.pendingFinalDeliveries === 0 && !activity.activeTerminals;
 }
 
 function restartNotificationTargetForSession(

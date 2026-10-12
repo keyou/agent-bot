@@ -57,6 +57,9 @@ export const agentConfigSchema = z.object({
 });
 
 export const appConfigSchema = z.object({
+  terminal: z.object({
+    enabled: z.boolean().default(true),
+  }).default({ enabled: true }),
   updates: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
   console: z
     .object({
@@ -108,6 +111,7 @@ export type AgentConfig = Omit<ParsedAgentConfig, "defaults"> & {
   defaults?: AgentExecutionDefaults;
 };
 export type GroupNameFormatConfig = z.infer<typeof groupNameFormatSchema>;
-export type AppConfig = Omit<z.infer<typeof appConfigSchema>, "updates"> & {
+export type AppConfig = Omit<z.infer<typeof appConfigSchema>, "updates" | "terminal"> & {
   updates?: { enabled: boolean };
+  terminal?: z.infer<typeof appConfigSchema>["terminal"];
 };

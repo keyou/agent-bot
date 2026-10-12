@@ -67,6 +67,14 @@ try {
   }
 
   const cliEntry = path.join(installedPackageRoot, "dist", "cli.js");
+  run(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from 'node:module';
+    import fs from 'node:fs';
+    import path from 'node:path';
+    const require = createRequire(${JSON.stringify(path.join(installedPackageRoot, "package.json"))});
+    for (const name of ['@xterm/xterm', '@xterm/addon-fit', 'ws', 'node-pty']) require(name);
+    fs.readFileSync(path.join(path.dirname(require.resolve('@xterm/xterm')), '../css/xterm.css'));
+  `], installRoot);
   const helpResult = run(process.execPath, [cliEntry, "--help"], installRoot);
   for (const expected of [packageJson.version, "agentbot server start", "-v, --version"]) {
     if (!helpResult.stdout.includes(expected)) {

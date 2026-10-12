@@ -53,8 +53,8 @@
     "start:once": "node dist/index.js",
     "cli": "node dist/cli.js",
     "test": "npm run test:unit && npm run test:process && npm run test:render",
-    "test:unit": "vitest run --exclude tests/shell/ShellCommandJobManager.test.ts --exclude tests/scripts/prepare-release.test.ts --exclude tests/feishu/GroupAvatarGenerator.test.ts",
-    "test:process": "vitest run tests/shell/ShellCommandJobManager.test.ts tests/scripts/prepare-release.test.ts --maxWorkers=1",
+    "test:unit": "vitest run --exclude tests/shell/ShellCommandJobManager.test.ts --exclude tests/scripts/prepare-release.test.ts --exclude tests/feishu/GroupAvatarGenerator.test.ts --exclude tests/terminal/TerminalPty.process.test.ts",
+    "test:process": "vitest run tests/shell/ShellCommandJobManager.test.ts tests/scripts/prepare-release.test.ts tests/terminal/TerminalPty.process.test.ts --maxWorkers=1",
     "test:render": "vitest run tests/feishu/GroupAvatarGenerator.test.ts --maxWorkers=1",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "verify": "npm run typecheck && npm test",
@@ -71,18 +71,22 @@
     "@clack/prompts": "1.7.0",
     "@larksuiteoapi/node-sdk": "1.73.0",
     "@resvg/resvg-js": "2.6.2",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
     "better-sqlite3": "12.11.1",
     "dotenv": "17.4.2",
     "highlight.js": "11.12.0",
     "markdown-it": "15.0.1",
     "mermaid": "11.17.2",
     "pino": "10.3.1",
+    "ws": "8.21.3",
     "yaml": "2.9.0",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
     "@types/node": "22.18.11",
+    "@types/ws": "8.18.1",
     "eslint": "10.6.0",
     "linkedom": "0.18.13",
     "prettier": "3.9.5",
@@ -96,5 +100,8 @@
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "npm@11.12.1"
+  "packageManager": "npm@11.12.1",
+  "optionalDependencies": {
+    "node-pty": "1.1.0"
+  }
 }

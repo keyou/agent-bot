@@ -13,12 +13,15 @@
         "@clack/prompts": "1.7.0",
         "@larksuiteoapi/node-sdk": "1.73.0",
         "@resvg/resvg-js": "2.6.2",
+        "@xterm/addon-fit": "0.11.0",
+        "@xterm/xterm": "6.0.0",
         "better-sqlite3": "12.11.1",
         "dotenv": "17.4.2",
         "highlight.js": "11.12.0",
         "markdown-it": "15.0.1",
         "mermaid": "11.17.2",
         "pino": "10.3.1",
+        "ws": "8.21.3",
         "yaml": "2.9.0",
         "zod": "4.4.3"
       },
@@ -29,6 +32,7 @@
       "devDependencies": {
         "@types/better-sqlite3": "7.6.13",
         "@types/node": "22.18.11",
+        "@types/ws": "8.18.1",
         "eslint": "10.6.0",
         "linkedom": "0.18.13",
         "prettier": "3.9.5",
@@ -38,6 +42,9 @@
       },
       "engines": {
         "node": ">=22"
+      },
+      "optionalDependencies": {
+        "node-pty": "1.1.0"
       }
     },
     "node_modules/@agentclientprotocol/sdk": {
@@ -1742,6 +1749,16 @@
       "license": "MIT",
       "optional": true
     },
+    "node_modules/@types/ws": {
+      "version": "8.18.1",
+      "resolved": "https://registry.npmjs.org/@types/ws/-/ws-8.18.1.tgz",
+      "integrity": "sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@types/node": "*"
+      }
+    },
     "node_modules/@typescript/typescript-aix-ppc64": {
       "version": "7.0.2",
       "resolved": "https://registry.npmjs.org/@typescript/typescript-aix-ppc64/-/typescript-aix-ppc64-7.0.2.tgz",
@@ -2204,6 +2221,21 @@
       "funding": {
         "url": "https://opencollective.com/vitest"
       }
+    },
+    "node_modules/@xterm/addon-fit": {
+      "version": "0.11.0",
+      "resolved": "https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.11.0.tgz",
+      "integrity": "sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==",
+      "license": "MIT"
+    },
+    "node_modules/@xterm/xterm": {
+      "version": "6.0.0",
+      "resolved": "https://registry.npmjs.org/@xterm/xterm/-/xterm-6.0.0.tgz",
+      "integrity": "sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==",
+      "license": "MIT",
+      "workspaces": [
+        "addons/*"
+      ]
     },
     "node_modules/acorn": {
       "version": "8.17.0",
@@ -4781,6 +4813,24 @@
         "node": ">=10"
       }
     },
+    "node_modules/node-addon-api": {
+      "version": "7.1.1",
+      "resolved": "https://registry.npmjs.org/node-addon-api/-/node-addon-api-7.1.1.tgz",
+      "integrity": "sha512-5m3bsyrjFWE1xf7nz7YXdN4udnVtXK6/Yfgn5qnahL6bCkf2yKt4k3nuTKAtT4r3IG8JNR2ncsIMdZuAzJjHQQ==",
+      "license": "MIT",
+      "optional": true
+    },
+    "node_modules/node-pty": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/node-pty/-/node-pty-1.1.0.tgz",
+      "integrity": "sha512-20JqtutY6JPXTUnL0ij1uad7Qe1baT46lyolh2sSENDd4sTzKZ4nmAFkeAARDKwmlLjPx6XKRlwRUxwjOy+lUg==",
+      "hasInstallScript": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "node-addon-api": "^7.1.0"
+      }
+    },
     "node_modules/nth-check": {
       "version": "3.0.1",
       "resolved": "https://registry.npmjs.org/nth-check/-/nth-check-3.0.1.tgz",
@@ -6004,9 +6054,9 @@
       "license": "ISC"
     },
     "node_modules/ws": {
-      "version": "8.21.0",
-      "resolved": "https://registry.npmjs.org/ws/-/ws-8.21.0.tgz",
-      "integrity": "sha512-Vsp28b7DRcimFQvrqu2Wek3z1iYxDCWqHYB8Qsnk/S4RfaCQzPGPyBNuVjJV3cd6UiKtUtp6sNM77gWvzcCH+g==",
+      "version": "8.21.3",
+      "resolved": "https://registry.npmjs.org/ws/-/ws-8.21.3.tgz",
+      "integrity": "sha512-201TZ/kPWxoPr/OKWjquZR1SWKXcvxdH+e1xrx89b3YbmzLMFCLfnaG1HFIgWzJOEWZ7MvpK++odZufgYR50Rw==",
       "license": "MIT",
       "engines": {
         "node": ">=10.0.0"

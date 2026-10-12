@@ -38,6 +38,7 @@ export function formatServerStatus(data: unknown, language: CliLanguage = cliLan
     `${cliText("Supervisor: ", "Supervisor：", language)}${value.supervised ? cliText("enabled", "已启用", language) : cliText("disabled", "未启用", language)}`,
     ...agents,
     `${cliText("Running tasks: ", "运行中任务：", language)}${activity.runningSessions ?? 0}`,
+    ...(activity.activeTerminals ? [`${cliText("Active terminals: ", "活动终端：", language)}${activity.activeTerminals}`] : []),
     `${cliText("Pending final deliveries: ", "待发送最终结果：", language)}${activity.pendingFinalDeliveries ?? 0}`,
     `${cliText("Safe restart: ", "安全重启：", language)}${safeRestart}`,
     "",

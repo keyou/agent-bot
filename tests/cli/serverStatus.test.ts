@@ -5,6 +5,11 @@ import {
 } from "../../src/cli/serverStatus.js";
 
 describe("server status output", () => {
+  test("reports terminal sessions separately from running Agent tasks", () => {
+    const output = formatServerStatus({ activity: { runningSessions: 0, activeTerminals: 2 } }, "en");
+    expect(output).toContain("Running tasks: 0");
+    expect(output).toContain("Active terminals: 2");
+  });
   test("includes the running server's Lark App ID in English output", () => {
     const status = withConfiguredFeishuAppId({
       ready: true,

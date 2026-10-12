@@ -84,11 +84,12 @@ describe("SafeRestartNotifier", () => {
       reason: "active conversations",
       notificationTargets: [{ contextKey: "chat_id:requester" }],
       phase: "waiting_tasks",
-      activity: { runningSessions: 1, pendingFinalDeliveries: 0 },
+      activity: { runningSessions: 1, pendingFinalDeliveries: 0, activeTerminals: 2 },
     });
 
     expect(sendInteractiveCard).toHaveBeenCalledOnce();
     expect(sendInteractiveCard).toHaveBeenCalledWith("chat_id:requester", expect.any(Object));
+    expect(JSON.stringify(sendInteractiveCard.mock.calls)).toContain("活动终端");
     expect(sendInteractiveCard).not.toHaveBeenCalledWith("chat_id:active-group", expect.any(Object));
     expect(sendInteractiveCard).not.toHaveBeenCalledWith("chat_id:active-private", expect.any(Object));
     expect(sendInteractiveCard).not.toHaveBeenCalledWith("chat_id:stale-group", expect.any(Object));

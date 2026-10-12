@@ -14,6 +14,7 @@ import type {
 import type { TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
 import type { UpdateNotice } from "../updates/types.js";
+import type { TerminalCardView } from "../terminal/TerminalServer.js";
 import { localCardImage } from "./LocalCardImage.js";
 
 export interface StartupStatusView {
@@ -58,6 +59,7 @@ export interface InitializationWelcomeView {
 }
 
 export interface SafeRestartStatusView {
+  activeTerminals?: number;
   scheduleId: number;
   reason: string;
   phase: "waiting_tasks" | "waiting_delivery" | "countdown" | "restarting" | "cancelled" | "superseded";
@@ -267,6 +269,7 @@ export interface DismissGroupCardView {
 }
 
 export interface ShellCommandCardView {
+  terminalUrl?: string;
   jobId?: string;
   contextKey?: string;
   command: string;
@@ -512,6 +515,9 @@ export class CardRenderer {
         ...(outputWasTruncated ? ["输出过长，已保留开头和结尾并截断中间内容。"] : []),
       ].join("\n")),
     ];
+    if (view.terminalUrl) {
+      elements.push(markdown(`[Open Terminal](${view.terminalUrl}) · 独立终端，需在本会话由所有者授权`));
+    }
     if (view.status === "running" && view.jobId && view.contextKey) {
       elements.push({
         tag: "button",
@@ -1017,6 +1023,24 @@ export class CardRenderer {
       view.status === "completed" ? "green" : view.status === "cancelled" ? "grey" : "blue");
   }
 
+  renderTerminalAuthorization(view: TerminalCardView): Record<string, unknown> {
+    const action = (decision: string) => ({ action: "terminal_authorize", contextKey: view.contextKey, requestId: view.requestId, token: view.approvalToken, decision });
+    const elements: Record<string, unknown>[] = [markdown(`**目录**：${inlineCode(view.cwd)}\n**终端**：${inlineCode(view.reopenToken)}`)];
+    if (view.state === "pending") {
+      elements.push(markdown(`**验证码**：${inlineCode(view.code)}\n仅 AgentBot 所有者可授权。授权后，该浏览器可在本机执行任意命令，拥有 AgentBot 的系统用户权限。请核对网页验证码，仅批准本人发起的请求。5 分钟内有效。${view.recovery ? (view.shellStarted ? "恢复原 Shell，不创建新终端；授权后旧网页失去访问权限。拒绝不影响原终端。" : "继续打开同一个终端；授权后旧网页失去访问权限，Shell 在连接成功后启动。拒绝不影响原授权。") : "不执行原卡片命令。"}`),
+        taskActionRow([{ text: "Allow", value: action("allow") }, { text: "Deny", type: "danger", value: action("deny") }, { text: "刷新", value: action("refresh") }]));
+    } else if (view.state === "closed") {
+      elements.push(markdown(`**状态**：${view.message ? escapeCardHtml(view.message) : "已关闭"}\n原终端已结束时，请从命令卡片创建新终端。`));
+    } else {
+      const waiting = view.state === "approved";
+      const label = waiting ? "打开终端" : "重新打开终端";
+      elements.push(markdown(`**状态**：${waiting ? "已授权，等待网页连接" : view.connected ? "已连接" : "网页已断开，Shell 仍在运行"}\n${waiting ? "请返回原网页连接；原网页已关闭时，点击下方“打开终端”。Shell 尚未启动。" : "点击下方“重新打开终端”恢复原 Shell。前台连接时不因空闲关闭；后台空闲 30 分钟或网页断开 3 分钟后会自动关闭 Shell，成功重连取消断开计时并重置空闲计时；“关闭终端”会中断其中的命令。"}`));
+      elements.push(markdown(`[${label}](${view.reopenUrl}) · 新网页需核对验证码重新授权${waiting ? "，连接成功后启动 Shell" : "，恢复原 Shell"}`));
+      elements.push(taskActionRow([{ text: "关闭终端", type: "danger", value: action("close") }, { text: "刷新", value: action("refresh") }]));
+    }
+    return sectionCard(view.state === "pending" ? "网页终端授权" : "网页终端管理", elements, view.state === "closed" ? "grey" : view.state === "pending" ? "orange" : "blue");
+  }
+
   renderSafeRestartStatus(view: SafeRestartStatusView): Record<string, unknown> {
     const actionable = view.phase !== "restarting" && view.phase !== "cancelled" && view.phase !== "superseded";
     const countdown = view.phase === "countdown"
@@ -1044,6 +1068,7 @@ export class CardRenderer {
       `**重启原因**：${inlineCode(view.reason)}`,
       `**重启倒计时**：${countdown}`,
       `**待投递结果**：${view.pendingFinalDeliveries} 条`,
+      ...(view.activeTerminals ? [`**活动终端**：${view.activeTerminals} 个，请在网页或原会话的终端管理卡中关闭。ForceRestart 会中断终端。`] : []),
     ];
     const elements: Record<string, unknown>[] = [markdown(lines.join("\n"))];
     if (view.waitingTasks.length > 0) {

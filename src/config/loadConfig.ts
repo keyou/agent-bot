@@ -30,6 +30,10 @@ updates:
   # Daily stable update check, private 60-second cancellation window, then safe update.
   enabled: true
 
+terminal:
+  enabled: true
+  # Shares fileViewer host, port and publicBaseUrl; keeps independent owner authorization.
+
 fileViewer:
   enabled: true
   # Use 0.0.0.0 to accept LAN connections and automatically prefer

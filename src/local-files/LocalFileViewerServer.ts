@@ -3,6 +3,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import path from "node:path";
 import hljs from "highlight.js/lib/common";
 import dos from "highlight.js/lib/languages/dos";
@@ -283,11 +284,18 @@ export interface LocalFileViewerAddress {
   publicConnectionKind?: NetworkConnectionKind;
 }
 
+export interface LocalFileViewerService {
+  handleRequest(request: IncomingMessage, response: ServerResponse): void;
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
+  close(): Promise<void>;
+}
+
 export class LocalFileViewerServer {
   private server?: http.Server;
   private secret?: Buffer;
   private address?: LocalFileViewerAddress;
   private basePath = "";
+  private readonly services = new Map<string, LocalFileViewerService>();
 
   constructor(private readonly options: LocalFileViewerServerOptions) {}
 
@@ -315,6 +323,11 @@ export class LocalFileViewerServer {
       });
     });
     server.on("clientError", (_error, socket) => socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"));
+    server.on("upgrade", (request, socket, head) => {
+      const service = this.serviceFor(request);
+      if (service) service.handleUpgrade(request, socket, head);
+      else socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    });
 
     let selectedPort = preferredPort;
     try {
@@ -361,10 +374,34 @@ export class LocalFileViewerServer {
   }
 
   async close(): Promise<void> {
+    await Promise.all([...this.services.values()].map((service) => service.close()));
+    this.services.clear();
     const server = this.server;
     this.server = undefined;
     this.address = undefined;
     if (server) await closeServer(server);
+  }
+
+  mountService(name: string, service: LocalFileViewerService): { publicBaseUrl: string; unmount(): void } {
+    if (!this.address || !this.server) throw new Error("Preview server is not running.");
+    if (!/^[a-z][a-z0-9-]*$/u.test(name) || ["preview", "turn-preview", "assets", "view", "raw"].includes(name)) {
+      throw new Error("Invalid Preview service route.");
+    }
+    const basePath = `${this.basePath}/${name}`;
+    if (this.services.has(basePath)) throw new Error("Preview service route is already mounted.");
+    this.services.set(basePath, service);
+    const url = new URL(this.address.publicBaseUrl);
+    url.pathname = basePath;
+    return { publicBaseUrl: url.toString(), unmount: () => {
+      if (this.services.get(basePath) === service) this.services.delete(basePath);
+    } };
+  }
+
+  private serviceFor(request: IncomingMessage): LocalFileViewerService | undefined {
+    try {
+      const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+      return [...this.services].find(([base]) => pathname === base || pathname.startsWith(`${base}/`))?.[1];
+    } catch { return undefined; }
   }
 
   createFileUrl(filePath: string, reference?: string): string | undefined {
@@ -397,6 +434,8 @@ export class LocalFileViewerServer {
   }
 
   private async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const service = this.serviceFor(request);
+    if (service) { service.handleRequest(request, response); return; }
     if (request.method !== "GET" && request.method !== "HEAD") {
       response.setHeader("Allow", "GET, HEAD");
       this.sendHtml(response, 405, errorPage("不支持的请求", "该服务只接受只读请求。"), request.method === "HEAD");
@@ -965,6 +1004,9 @@ export class LocalFileViewerServer {
     if (renderHtml) {
       // A response-level sandbox also isolates this document when opened outside the viewer iframe.
       response.setHeader("Content-Security-Policy", "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'");
+    } else {
+      // Raw HTML/SVG/XML must not gain the shared origin's storage or execution privileges.
+      response.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'");
     }
     response.setHeader("Accept-Ranges", "bytes");
     response.setHeader("Cache-Control", "no-store");

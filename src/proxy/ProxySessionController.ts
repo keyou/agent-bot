@@ -512,6 +512,8 @@ export interface ControlTaskReleaseResult {
 }
 
 export interface ProxyLifecycle {
+  terminalUrl?(jobId: string): string | undefined;
+  authorizeTerminal?(action: CardAction): Promise<string>;
   supervised?: boolean;
   restart(contextKey: string, force: boolean, replyTarget?: MessageReplyTarget): Promise<void>;
   cancelSafeRestart?(scheduleId: number): Promise<boolean>;
@@ -1028,7 +1030,10 @@ export class ProxySessionController {
     await this.outbound.withReplyTarget(contextKey, replyTarget, async () => {
       try {
         const kind = String(scopedAction.value.action ?? "");
-        if (kind === "agentbot_update_cancel") {
+        if (kind === "terminal_authorize") {
+          if (!this.lifecycle?.authorizeTerminal) throw new Error("网页终端未启用。");
+          await this.outbound.sendText(contextKey, await this.lifecycle.authorizeTerminal(scopedAction));
+        } else if (kind === "agentbot_update_cancel") {
           if (!this.lifecycle?.cancelAutomaticUpdate) throw new Error("自动更新功能未启用。");
           await this.lifecycle.cancelAutomaticUpdate(scopedAction);
         } else if (kind === "agentbot_update_select") {
@@ -6155,6 +6160,7 @@ export class ProxySessionController {
     const created = await this.shellCommandJobs.createJob({ contextKey, sourceMessageId, command, cwd });
     let cardMessageId: string | undefined;
     const initialState: ShellCommandCardView = {
+      terminalUrl: this.lifecycle?.terminalUrl?.(created.id),
       jobId: created.id,
       contextKey,
       command,
@@ -6181,7 +6187,7 @@ export class ProxySessionController {
           await this.outbound.updateInteractiveCard(
             contextKey,
             cardMessageId,
-            this.cardRenderer.renderShellCommandCard(shellCommandJobCardView(failed)),
+            this.cardRenderer.renderShellCommandCard({ ...shellCommandJobCardView(failed), terminalUrl: this.lifecycle?.terminalUrl?.(failed.id) }),
           );
           await this.shellCommandJobs.markPresented(created.id);
         } catch (cardError) {
@@ -6239,7 +6245,7 @@ export class ProxySessionController {
   ): void {
     if (!job.cardMessageId || this.shellCommandJobMonitors.has(job.id)) return;
     const scheduler = new CardUpdateScheduler<ShellCommandCardView>({
-      render: (state) => this.cardRenderer.renderShellCommandCard(state),
+      render: (state) => this.cardRenderer.renderShellCommandCard({ ...state, terminalUrl: this.lifecycle?.terminalUrl?.(job.id) }),
       write: (card) => this.outbound.updateInteractiveCard(job.contextKey, job.cardMessageId!, card),
       onError: (error) => this.logger.warn(
         { error, jobId: job.id, contextKey: job.contextKey, messageId: job.cardMessageId },

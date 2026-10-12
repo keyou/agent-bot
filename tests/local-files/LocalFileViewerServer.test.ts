@@ -9,6 +9,23 @@ import { runInNewContext } from "node:vm";
 import { parseHTML } from "linkedom";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
+
+test.each(["html", "svg", "xml"])("raw %s cannot execute in the shared Preview/terminal origin", async (extension) => {
+  const directory = createTemporaryDirectory();
+  const file = path.join(directory, `hostile.${extension}`);
+  const source = '<script src="/preview/script"></script><svg onload="alert(1)"></svg>';
+  fs.writeFileSync(file, source);
+  const server = await startServer(directory);
+  const url = new URL(server.createFileUrl(file)!); url.searchParams.set("raw", "1");
+  const response = await fetch(url);
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe(source);
+  const policy = response.headers.get("content-security-policy");
+  expect(policy).toContain("sandbox;");
+  expect(policy).toContain("default-src 'none'");
+  expect(policy).not.toContain("allow-same-origin");
+  expect(policy).not.toContain("allow-scripts");
+});
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 
 const temporaryDirectories: string[] = [];

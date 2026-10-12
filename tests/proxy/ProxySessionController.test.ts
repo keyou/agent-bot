@@ -588,6 +588,8 @@ function fixture(
   const restart = vi.fn(async () => undefined);
   const cancelSafeRestart = vi.fn(async () => true);
   const forceSafeRestart = vi.fn(async () => true);
+  const terminalUrl = vi.fn((id: string) => `https://terminal.example/open/${id}/signature`);
+  const authorizeTerminal = vi.fn(async () => "已授权终端");
   const cancelAutomaticUpdate = vi.fn(async () => undefined);
   const showUpdates = vi.fn(async () => undefined);
   const selectUpdate = vi.fn(async () => undefined);
@@ -616,6 +618,8 @@ function fixture(
       supervised: true,
       cancelSafeRestart,
       forceSafeRestart,
+      terminalUrl,
+      authorizeTerminal,
       cancelAutomaticUpdate,
       showUpdates,
       selectUpdate,
@@ -646,6 +650,8 @@ function fixture(
     restart,
     cancelSafeRestart,
     forceSafeRestart,
+    terminalUrl,
+    authorizeTerminal,
     cancelAutomaticUpdate,
     showUpdates,
     selectUpdate,
@@ -3444,6 +3450,40 @@ describe("ProxySessionController", () => {
       process.cwd(),
       expect.objectContaining({ onOutput: expect.any(Function) }),
     );
+  });
+
+  test("adds an independent terminal link without replaying the original command", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("! echo once"));
+    await vi.waitFor(() => expect(f.shellCommandExecutor).toHaveBeenCalledOnce());
+    const cards = JSON.stringify(vi.mocked(f.outbound.sendInteractiveCard).mock.calls);
+    expect(cards).toContain("https://terminal.example/open/");
+    await f.controller.onCardAction({ actionId: "terminal-action", contextKey: "chat_id:c1", userId: "ou_owner", messageId: "approval",
+      value: { action: "terminal_authorize", requestId: "request", token: "token", decision: "allow" } });
+    expect(f.authorizeTerminal).toHaveBeenCalledOnce();
+    expect(f.shellCommandExecutor).toHaveBeenCalledOnce();
+  });
+
+  test.each(["close", "refresh"])("routes source terminal management %s without starting a command", async (decision) => {
+    const f = fixture();
+    const action = { actionId: `terminal-${decision}`, contextKey: "open_id:ou_owner", userId: "ou_owner", messageId: "management-card",
+      value: { action: "terminal_authorize", requestId: "request", token: "token", decision } };
+    await f.controller.onCardAction(action);
+    expect(f.authorizeTerminal).toHaveBeenCalledWith(action);
+    expect(f.shellCommandExecutor).not.toHaveBeenCalled();
+  });
+
+  test.each(["allow", "close", "refresh"])("terminal %s callback and its reply stay in the original topic", async (decision) => {
+    const f = fixture();
+    const contextKey = "chat_id:c1:thread_id:original-topic";
+    const action = { actionId: "terminal-topic-" + decision, contextKey: "chat_id:c1", userId: "ou_owner", messageId: "management-card",
+      value: { action: "terminal_authorize", contextKey, requestId: "request", token: "token", decision } };
+    await f.controller.onCardAction(action);
+    expect(f.authorizeTerminal).toHaveBeenCalledWith({ ...action, contextKey });
+    expect(f.outbound.replyText).toHaveBeenCalledWith(contextKey,
+      { messageId: "management-card", replyInThread: true }, "已授权终端");
+    expect(f.outbound.sendText).not.toHaveBeenCalled();
+    expect(f.shellCommandExecutor).not.toHaveBeenCalled();
   });
 
   test("starts another bang command without waiting for the previous command", async () => {

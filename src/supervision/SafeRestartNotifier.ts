@@ -132,6 +132,7 @@ export class SafeRestartNotifier {
         phase: status.phase,
         remainingMs: status.remainingMs,
         pendingFinalDeliveries: status.activity.pendingFinalDeliveries,
+        activeTerminals: status.activity.activeTerminals,
         waitingTasks,
       });
       const cardHash = JSON.stringify(card);
