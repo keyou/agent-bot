@@ -174,6 +174,37 @@ describe("TurnStateReducer", () => {
     expect(reduceTurnEvent(state, event("approval_resolved", { requestId: "r1", decision: "accept" }))).toBe(state);
   });
 
+  test.each(["accept", "acceptForSession", "decline", "cancel"] as const)("retains the approval request and %s choice exactly once", (decision) => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    const request = { id: "r1", title: "Review operation", command: "npm test", reason: "Verify the changes",
+      options: [{ id: decision, label: "User choice: " + decision }] };
+    state = reduceTurnEvent(state, event("approval_requested", { request }));
+    const resolved = event("approval_resolved", { requestId: "r1", decision });
+    state = reduceTurnEvent(state, resolved);
+    state = reduceTurnEvent(state, resolved);
+    state = reduceTurnEvent(state, event("turn_completed", { finalResponse: "done" }));
+    expect(state.approval).toBeUndefined();
+    expect(state.activities).toHaveLength(1);
+    const record = state.activities[0]!;
+    expect(record.kind).toBe("assistant");
+    if (record.kind === "tool") throw new Error("Expected approval text");
+    for (const text of [request.title, request.command, request.reason, "User choice: " + decision]) expect(record.text).toContain(text);
+  });
+
+  test("restores manual controls after automatic approval fails and records the later user choice", () => {
+    let state = createTurnViewState("s1", "turn_1", 1_000);
+    const request = { id: "auto", kind: "mode_change" as const, automatic: true, title: "Plan", options: [] };
+    state = reduceTurnEvent(state, event("approval_requested", { request }));
+    expect(state.status).toBe("running");
+    state = reduceTurnEvent(state, event("approval_requested", { request: { ...request, automatic: false, reason: "自动同意失败，请手动确认。" } }));
+    expect(state.status).toBe("waiting_for_approval");
+    state = reduceTurnEvent(state, event("approval_resolved", { requestId: "auto", decision: "decline" }));
+    expect(state.activities).toHaveLength(1);
+    expect(state.activities[0]).toMatchObject({ text: expect.stringContaining("用户选择：拒绝") });
+    expect(state.activities[0]).toMatchObject({ text: expect.stringContaining("自动同意失败") });
+    expect(state.approval).toBeUndefined();
+  });
+
   test("keeps the active tool visible and moves successful tools to bounded history", () => {
     let state = createTurnViewState("s1", "turn_1", 1_000);
     state = reduceTurnEvent(state, event("tool_started", { tool: tool("t1", "npm test", "running") }));

@@ -5,6 +5,10 @@ import type { FeishuOutbound } from "../../src/feishu/types.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import type { AgentEvent } from "../../src/runtime/types.js";
 import type { TurnPresentationStore } from "../../src/feishu/FeishuTurnPresenter.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { TurnPreviewJournal } from "../../src/state/TurnPreviewJournal.js";
 
 function completed(finalResponse = "answer"): AgentEvent {
   return { type: "turn_completed", sessionId: "s1", turnId: "turn_1", finalResponse, durationMs: 1_000 };
@@ -42,6 +46,182 @@ function createFixture(delivered = false, renderer?: CardRenderer) {
 }
 
 describe("FeishuTurnPresenter", () => {
+  test("keeps approval and implementation on one card and one complete preview journal", async () => {
+    const { outbound } = createFixture();
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agentbot-plan-card-"));
+    const store = new MemoryStore();
+    store.previews = new TurnPreviewJournal(directory);
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, { normalIntervalMs: 1, criticalGapMs: 0,
+      turnPreviewUrl: (id) => "https://preview.test/?turn=" + id });
+    const id = { sessionId: "s1", turnId: "plan" };
+    const startedAt = Date.now() - 10_000;
+    try {
+      presenter.registerSession("s1", "chat_id:c1:thread_id:topic", "Task");
+      await presenter.startPendingTurn("s1", "chat_id:c1:thread_id:topic", "Task",
+        { messageId: "root", replyInThread: true }, "original prompt", ["prompt.png"]);
+      await presenter.onEvent({ ...id, type: "turn_started", startedAt });
+      await presenter.onEvent({ ...id, type: "progress", activityId: "commentary:plan", text: "Plan: preserve the old content" });
+      const fullOutput = "original output\n".repeat(10_000);
+      await presenter.onEvent({ ...id, type: "tool_updated", tool: { id: "before", title: "Inspect", kind: "command",
+        status: "completed", output: fullOutput } });
+      const request = { id: "approval-1", kind: "mode_change" as const, title: "Review implementation", reason: "Run tests",
+        options: [{ id: "accept" as const, label: "Approve Plan" }] };
+      await presenter.onEvent({ ...id, type: "approval_requested", request });
+      await presenter.onEvent({ ...id, type: "approval_resolved", requestId: request.id, decision: "accept" });
+      const before = fs.statSync(store.previews.file("plan")).size;
+      await presenter.onEvent({ ...id, type: "turn_completed", approvedPlan: true, finalResponse: "Do not send the plan as final" });
+      expect(outbound.replyMarkdown).not.toHaveBeenCalled();
+      expect(outbound.deleteReaction).not.toHaveBeenCalled();
+      expect(store.getTurnSnapshot("plan")).toMatchObject({ status: "running" });
+      await presenter.startPendingTurn("s1", "chat_id:c1:thread_id:topic", "Task", undefined, "synthetic implementation prompt");
+      await presenter.onEvent({ sessionId: "s1", turnId: "implementation", type: "turn_started", startedAt: startedAt + 5000 });
+      await presenter.onEvent({ sessionId: "s1", turnId: "implementation", type: "progress", activityId: "commentary:impl", text: "Implementing" });
+      await presenter.onEvent({ sessionId: "s1", turnId: "implementation", type: "tool_started", tool: {
+        id: "before", title: "Repeated ID", kind: "command", status: "running", command: "npm test",
+      } });
+      await presenter.onEvent({ sessionId: "s1", turnId: "implementation", type: "tool_output_delta", toolId: "before", delta: "new output" });
+      await presenter.onEvent({ sessionId: "s1", turnId: "implementation", type: "tool_updated", tool: {
+        id: "before", title: "Repeated ID", kind: "command", status: "completed",
+      } });
+      await presenter.flushAll();
+      expect(outbound.replyInteractiveCard).toHaveBeenCalledOnce();
+      expect(outbound.sendInteractiveCard).not.toHaveBeenCalled();
+      const card = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+      for (const text of ["Plan: preserve", "审批请求", "Review implementation", "用户选择", "Approve Plan", "Implementing"])
+        expect(card).toContain(text);
+      expect(card).toContain('"action":"turn_cancel","sessionId":"s1","turnId":"implementation"');
+      expect(card).toContain("https://preview.test/?turn=plan");
+      expect(card).not.toContain('"action":"approval"');
+      expect(store.getTurnSnapshot("plan")).toMatchObject({ status: "completed", continuedToTurnId: "implementation" });
+      expect(store.getTurnSnapshot("implementation")).toMatchObject({ status: "running", prompt: "original prompt",
+        promptImagePaths: ["prompt.png"], previewTurnId: "plan", startedAt });
+      expect(store.previews.has("implementation")).toBe(false);
+      expect(fs.statSync(store.previews.file("plan")).size - before).toBeLessThan(15_000);
+      expect(store.previews.load("plan")?.fullToolOutputs?.before).toBe(fullOutput);
+      expect(store.previews.load("plan")?.fullToolOutputs?.["implementation:before"]).toBe("new output");
+      const history = store.previews.load("plan")!;
+      expect(history.activities.filter((a) => a.id.startsWith("approval:"))).toHaveLength(1);
+      const reopened = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0,
+        turnPreviewUrl: (id) => "https://preview.test/?turn=" + id });
+      expect(reopened.getTurnPreviewUrl("implementation")).toBe("https://preview.test/?turn=plan");
+      await reopened.onEvent({ sessionId: "s1", turnId: "implementation", type: "progress", activityId: "commentary:recovered", text: "After recovery" });
+      await reopened.onEvent({ sessionId: "s1", turnId: "implementation", type: "turn_completed", finalResponse: "Done", durationMs: 2500 });
+      expect(store.previews.load("plan")).toMatchObject({ status: "completed", durationMs: 7500 });
+      expect(store.previews.load("plan")?.activities.some((a) => a.kind === "assistant" && a.text === "After recovery")).toBe(true);
+      await reopened.onEvent({ ...id, type: "turn_completed", finalResponse: "stale plan" });
+      await reopened.showActivityPage("chat_id:c1:thread_id:topic", "plan", "latest", "thread_progress_1");
+      expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1])).toContain("After recovery");
+      expect(outbound.replyMarkdown).toHaveBeenCalledExactlyOnceWith("chat_id:c1:thread_id:topic",
+        { messageId: "root", replyInThread: true }, "Done", expect.any(String));
+      expect(outbound.replyInteractiveCard).toHaveBeenCalledOnce();
+      // Stop the original in-memory timer without changing the persisted result.
+      await presenter.onEvent({ sessionId: "s1", turnId: "implementation", type: "turn_completed", finalResponse: "", durationMs: 2500 });
+    } finally { store.previews.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test("retains distinct approval decisions across repeated plan handoffs on one card", async () => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
+    presenter.registerSession("s1", "chat_id:c1");
+    const startedAt = Date.now() - 10_000;
+    const turns = ["plan", "implementation", "revision"];
+    await presenter.onEvent({ sessionId: "s1", turnId: turns[0]!, type: "turn_started", startedAt });
+    for (const [index, turnId] of turns.entries()) {
+      const id = { sessionId: "s1", turnId };
+      await presenter.onEvent({ ...id, type: "approval_requested", request: {
+        id: "repeated-id", title: "Request " + turnId, options: [{ id: "accept", label: "Approve " + turnId }],
+      } });
+      await presenter.onEvent({ ...id, type: "approval_resolved", requestId: "repeated-id", decision: "accept" });
+      if (index < turns.length - 1) {
+        await presenter.onEvent({ ...id, type: "turn_completed", approvedPlan: true, finalResponse: "" });
+        await presenter.startPendingTurn("s1", "chat_id:c1");
+        await presenter.onEvent({ sessionId: "s1", turnId: turns[index + 1]!, type: "turn_started", startedAt: startedAt + (index + 1) * 1_000 });
+      }
+    }
+    await presenter.onEvent({ sessionId: "s1", turnId: "revision", type: "progress", activityId: "commentary:final", text: "Draft answer" });
+    await presenter.onEvent({ sessionId: "s1", turnId: "revision", type: "agent_text_delta", replacesActivityId: "commentary:final", text: "Final answer" });
+    await presenter.onEvent({ sessionId: "s1", turnId: "revision", type: "turn_completed", finalResponse: "Final answer", durationMs: 3_000 });
+    const snapshot = store.getTurnSnapshot("revision") as TurnViewState;
+    expect(snapshot).toMatchObject({ startedAt, durationMs: 5_000, previewTurnId: "plan", continuedFromTurnId: "implementation" });
+    expect(snapshot.activities).toHaveLength(3);
+    for (const [index, turnId] of turns.entries()) expect(snapshot.activities[index]).toMatchObject({
+      id: "approval:" + turnId + ":repeated-id", text: expect.stringContaining("Approve " + turnId),
+    });
+    await presenter.showActivityPage("chat_id:c1", "plan", "latest", "progress_1");
+    const card = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    for (const turnId of turns) expect(card).toContain("Approve " + turnId);
+    expect(card).not.toContain("Draft answer");
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    expect(outbound.sendMarkdown).toHaveBeenCalledOnce();
+  });
+
+  test("retries handoff on the same card and stops reusing it after cancellation", async () => {
+    const { outbound } = createFixture();
+    const store = new MemoryStore();
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
+    presenter.registerSession("s1", "chat_id:c1");
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "plan", startedAt: Date.now() });
+    await presenter.onEvent({ type: "turn_completed", sessionId: "s1", turnId: "plan", approvedPlan: true, finalResponse: "" });
+    await presenter.failPendingTurn("s1", "transient failure; retrying");
+    await presenter.startPendingTurn("s1", "chat_id:c1");
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    expect(store.getTurnSnapshot("plan")).toMatchObject({ status: "running", error: undefined });
+    await presenter.onEvent({ type: "turn_cancelled", sessionId: "s1", turnId: "plan" });
+    await presenter.startPendingTurn("s1", "chat_id:c1", undefined, undefined, "unrelated prompt");
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledTimes(2);
+    await presenter.failPendingTurn("s1", "cleanup");
+  });
+
+  test.each(["accept", "acceptForSession", "decline", "cancel"] as const)("keeps %s approval history visible with no live buttons", async (decision) => {
+    const { presenter, outbound } = createFixture();
+    const id = { sessionId: "s1", turnId: "turn_1" };
+    await presenter.onEvent({ ...id, type: "turn_started", startedAt: Date.now() });
+    await presenter.onEvent({ ...id, type: "approval_requested", request: {
+      id: "approval", title: "Check the operation", reason: "Explain why", command: "npm test",
+      options: [{ id: decision, label: "Choice " + decision }],
+    } });
+    await presenter.flushAll();
+    let card = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain('"action":"approval"');
+    expect(card).not.toContain("等待选择");
+    await presenter.onEvent({ ...id, type: "approval_resolved", requestId: "approval", decision });
+    await presenter.onEvent({ ...id, type: "approval_resolved", requestId: "approval", decision });
+    await presenter.onEvent(completed("done"));
+    card = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    for (const text of ["Check the operation", "Explain why", "npm test", "Choice " + decision]) expect(card).toContain(text);
+    expect(card).not.toContain('"action":"approval"');
+    expect(card.match(/用户选择/g)).toHaveLength(1);
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+  });
+  test("keeps automatic approval history without prompting or attributing a user choice", async () => {
+    const { presenter, outbound } = createFixture();
+    const id = { sessionId: "s1", turnId: "turn_1" };
+    await presenter.onEvent({ ...id, type: "turn_started", startedAt: Date.now() });
+    await presenter.onEvent({ ...id, type: "approval_requested", request: {
+      id: "auto-plan", kind: "mode_change", automatic: true, title: "确认方案并开始执行", reason: "Implement and test",
+      options: [{ id: "accept", label: "Approve Plan" }],
+    } });
+    await presenter.onEvent({ ...id, type: "tool_updated", tool: { id: "exit", kind: "function", title: "ExitPlanMode", status: "completed" } });
+    await presenter.flushAll();
+    let card = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("正在自动同意");
+    expect(card).not.toContain('"action":"approval"');
+    expect(card).not.toContain("等待确认");
+    await presenter.onEvent({ ...id, type: "approval_resolved", requestId: "auto-plan", decision: "accept", automatic: true });
+    await presenter.onEvent({ ...id, type: "turn_completed", approvedPlan: true, finalResponse: "" });
+    await presenter.startPendingTurn("s1", "chat_id:c1");
+    await presenter.onEvent({ sessionId: "s1", turnId: "impl", type: "turn_started", startedAt: Date.now() });
+    await presenter.onEvent({ sessionId: "s1", turnId: "impl", type: "turn_completed", finalResponse: "Done" });
+    card = JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]);
+    expect(card).toContain("自动同意（auto）");
+    expect(card).toContain("Implement and test");
+    expect(card).not.toContain("用户选择");
+    expect(card).not.toContain('"action":"approval"');
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    expect(outbound.sendMarkdown).toHaveBeenCalledOnce();
+  });
+
   test("links known external Turn origins without inventing a snapshot and hides unknown or disabled previews", () => {
     const { store, outbound } = createFixture();
     const origins = { ...store, getTurnRuntimeOrigin: vi.fn((id: string) => id === "external" ? { agentName: "codex", remoteSessionId: "thread" } : undefined) };
@@ -1068,6 +1248,7 @@ describe("FeishuTurnPresenter", () => {
 });
 
 class MemoryStore implements TurnPresentationStore {
+  previews?: TurnPreviewJournal;
   private readonly snapshots = new Map<string, unknown>();
   private readonly contexts = new Map<string, string>();
   private readonly deliveries = new Map<
@@ -1103,10 +1284,10 @@ class MemoryStore implements TurnPresentationStore {
     });
   }
   saveFinalDeliveryProgress(turnId: string, messageIds: string[]): void {
-    this.deliveries.set(turnId, { finalDelivered: false, finalMessageIds: [...messageIds] });
+    this.deliveries.set(turnId, { ...this.deliveries.get(turnId), finalDelivered: false, finalMessageIds: [...messageIds] });
   }
   markFinalDelivered(turnId: string, messageIds: string[]): void {
-    this.deliveries.set(turnId, { finalDelivered: true, finalMessageIds: [...messageIds] });
+    this.deliveries.set(turnId, { ...this.deliveries.get(turnId), finalDelivered: true, finalMessageIds: [...messageIds] });
   }
   getTurnDelivery(turnId: string) { return this.deliveries.get(turnId); }
 }

@@ -5,6 +5,38 @@ import { AcpRuntimeAdapter } from "../../src/runtime/AcpRuntimeAdapter.js";
 import type { RuntimeEvent } from "../../src/runtime/types.js";
 
 describe("AcpRuntimeAdapter tool updates", () => {
+  test.each(["accept", "decline"] as const)("reports the %s approval decision before continuing the turn", async (decision) => {
+    let onPermissionRequest: Parameters<AcpSessionManager["create"]>[0]["onPermissionRequest"] | undefined;
+    const acp = {
+      create: vi.fn(async (input: Parameters<AcpSessionManager["create"]>[0]) => {
+        onPermissionRequest = input.onPermissionRequest;
+        return { acpSessionId: "remote" };
+      }),
+      prompt: vi.fn(() => new Promise<void>(() => {})),
+      shutdown: vi.fn(),
+    } as unknown as AcpSessionManager;
+    const runtime = new AcpRuntimeAdapter(acp);
+    const events: RuntimeEvent[] = [];
+    runtime.onEvent((event) => events.push(event));
+    try {
+      await runtime.createSession({ localSessionId: "s1", agentName: "acp", cwd: process.cwd(), permissionMode: "confirm" });
+      const turnId = await runtime.startTurn("s1", "inspect");
+      const response = onPermissionRequest!({} as never, {
+        sessionId: "remote", toolCall: { toolCallId: "tool", title: "Inspect files" }, options: [
+          { optionId: "yes", name: "Allow", kind: "allow_once" },
+          { optionId: "no", name: "Deny", kind: "reject_once" },
+        ],
+      });
+      const request = events.find((event) => event.type === "approval_requested");
+      if (request?.type !== "approval_requested") throw new Error("Expected approval request");
+      await runtime.respondToApproval("s1", request.request.id, decision);
+      expect(events.at(-1)).toEqual({ type: "approval_resolved", sessionId: "s1", turnId, requestId: request.request.id, decision });
+      await expect(response).resolves.toEqual({ outcome: { outcome: "selected", optionId: decision === "accept" ? "yes" : "no" } });
+      await expect(runtime.respondToApproval("s1", request.request.id, decision)).rejects.toThrow("no longer pending");
+      expect(events.filter((event) => event.type === "approval_resolved")).toHaveLength(1);
+    } finally { runtime.close(); }
+  });
+
   test("updates the local title for an ACP session", async () => {
     const acp = {
       create: vi.fn(async () => ({ acpSessionId: "acp_remote_title" })),

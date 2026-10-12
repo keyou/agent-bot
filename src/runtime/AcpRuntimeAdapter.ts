@@ -29,7 +29,7 @@ export class AcpRuntimeAdapter implements AgentRuntime {
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   private readonly approvals = new Map<
     string,
-    { sessionId: string; resolve: (value: JsonValue) => void; optionIds: Map<ApprovalDecision, string> }
+    { sessionId: string; turnId: string; resolve: (value: JsonValue) => void; optionIds: Map<ApprovalDecision, string> }
   >();
 
   constructor(private readonly acp: AcpSessionManager) {}
@@ -59,11 +59,12 @@ export class AcpRuntimeAdapter implements AgentRuntime {
               optionIds.set("decline", option.optionId);
             }
           }
-          this.approvals.set(requestId, { sessionId: input.localSessionId, resolve, optionIds });
+          const turnId = active?.turnId ?? "unknown";
+          this.approvals.set(requestId, { sessionId: input.localSessionId, turnId, resolve, optionIds });
           this.emit({
             type: "approval_requested",
             sessionId: input.localSessionId,
-            turnId: active?.turnId ?? "unknown",
+            turnId,
             request: {
               id: requestId,
               title: typeof params.toolCall.title === "string" ? params.toolCall.title : "ACP permission request",
@@ -185,6 +186,7 @@ export class AcpRuntimeAdapter implements AgentRuntime {
     this.approvals.delete(requestId);
     const optionId = pending.optionIds.get(decision) ?? pending.optionIds.get(decision === "cancel" ? "decline" : "accept");
     pending.resolve({ outcome: { outcome: "selected", optionId: optionId ?? decision } });
+    this.emit({ type: "approval_resolved", sessionId, turnId: pending.turnId, requestId, decision });
   }
 
   async listModels(): Promise<ModelOption[]> {

@@ -4,6 +4,7 @@ import type {
   AgentRuntime,
   AgentProcessInfo,
   ApprovalDecision,
+  ApprovalRequest,
   CreateRuntimeSessionInput,
   ConversationTurn,
   ForkRuntimeSessionInput,
@@ -84,6 +85,7 @@ interface CodexSession extends RuntimeSession {
   activeTurnStartedAt?: number;
   terminalTurnIds: Set<string>;
   modeChangeRequestIds: Set<string>;
+  planContinuationTurnId?: string;
   finalText: string;
   generatedImagePaths: string[];
   messagePhases: Map<string, "commentary" | "final_answer">;
@@ -109,6 +111,10 @@ interface PendingModeChange {
   requestId: string;
   targetMode: "plan" | "default";
   responding: boolean;
+  decision?: ApprovalDecision;
+  automatic?: boolean;
+  continued?: boolean;
+  terminalEvent?: Extract<RuntimeEvent, { type: "turn_completed" }>;
 }
 
 export class CodexRuntime implements AgentRuntime {
@@ -270,6 +276,12 @@ export class CodexRuntime implements AgentRuntime {
       cwd: session.cwd,
       model: session.model,
       effort: session.reasoningEffort,
+      ...(typeof prompt !== "string" && prompt.collaborationMode ? {
+        collaborationMode: {
+          mode: prompt.collaborationMode,
+          settings: { model: session.model, reasoning_effort: session.reasoningEffort ?? null, developer_instructions: null },
+        },
+      } : {}),
       summary: "auto",
       approvalPolicy: session.permissionMode === "auto" ? "never" : "on-request",
       sandboxPolicy: await this.turnSandboxPolicy(session, client),
@@ -648,6 +660,12 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async interruptRemoteTurn(remoteSessionId: string, turnId: string, sessionId?: string): Promise<void> {
+    for (const session of this.sessions.values()) {
+      if (session.remoteSessionId === remoteSessionId) session.planContinuationTurnId = undefined;
+    }
+    for (const pending of this.modeChanges.values()) {
+      if (pending.turnId === turnId) pending.decision = "cancel";
+    }
     await (await this.client()).request(
       "turn/interrupt",
       { threadId: remoteSessionId, turnId },
@@ -907,6 +925,15 @@ export class CodexRuntime implements AgentRuntime {
     requestId: string,
     decision: ApprovalDecision,
   ): Promise<void> {
+    return this.resolveApproval(sessionId, requestId, decision);
+  }
+
+  private async resolveApproval(
+    sessionId: string,
+    requestId: string,
+    decision: ApprovalDecision,
+    automatic = false,
+  ): Promise<void> {
     const modeChange = this.modeChanges.get(requestId);
     if (modeChange) {
       if (modeChange.sessionId !== sessionId
@@ -918,6 +945,8 @@ export class CodexRuntime implements AgentRuntime {
       }
       if (modeChange.responding) throw new Error("Approval response is already in progress.");
       modeChange.responding = true;
+      modeChange.decision = decision;
+      modeChange.automatic = automatic;
       try {
         const client = await this.client();
         if (this.modeChanges.get(requestId) !== modeChange) throw new Error("Approval request is no longer pending.");
@@ -927,11 +956,14 @@ export class CodexRuntime implements AgentRuntime {
           decision: decision === "accept" ? "approved" : decision === "decline" ? "rejected" : "cancelled",
         }, CONTROL_REQUEST_TIMEOUT_MS);
         if (this.modeChanges.get(requestId) === modeChange) {
+          this.confirmPlanContinuation(modeChange, decision);
           this.modeChanges.delete(requestId);
-          this.emit({ type: "approval_resolved", sessionId, turnId: modeChange.turnId, requestId, decision });
+          this.emit({ type: "approval_resolved", sessionId, turnId: modeChange.turnId, requestId, decision,
+            ...(automatic ? { automatic: true } : {}) });
         }
       } finally {
         modeChange.responding = false;
+        if (modeChange.terminalEvent) this.emit(modeChange.terminalEvent);
       }
       return;
     }
@@ -1182,34 +1214,45 @@ export class CodexRuntime implements AgentRuntime {
       const requestId = `mode:${mapped.threadId}:${mapped.requestId}`;
       if (session.modeChangeRequestIds.has(requestId)) return;
       session.modeChangeRequestIds.add(requestId);
-      this.modeChanges.set(requestId, {
+      const pending: PendingModeChange = {
         sessionId, turnId: mapped.turnId, requestId: mapped.requestId,
         targetMode: mapped.targetMode, responding: false,
-      });
-      this.emit({
-        type: "approval_requested", sessionId, turnId: mapped.turnId,
-        request: {
-          id: requestId,
-          kind: "mode_change",
-          title: mapped.targetMode === "default" ? "确认方案并开始执行" : "确认进入规划模式",
-          reason: [mapped.reason, ...(mapped.allowedPrompts ?? []).map((entry) => `- ${entry.tool}: ${entry.prompt}`)]
-            .filter(Boolean).join("\n"),
-          options: [
-            { id: "accept", label: mapped.targetMode === "default" ? "Approve Plan" : "Enter Plan Mode" },
-            { id: "decline", label: "Reject" },
-            { id: "cancel", label: "Cancel Request" },
-          ],
-        },
-      });
+      };
+      this.modeChanges.set(requestId, pending);
+      const automatic = session.permissionMode === "auto" && this.provider.getAgentFamily?.() === "traex";
+      const request: ApprovalRequest = {
+        id: requestId,
+        kind: "mode_change",
+        ...(automatic ? { automatic: true } : {}),
+        title: mapped.targetMode === "default" ? "确认方案并开始执行" : "确认进入规划模式",
+        reason: [mapped.reason, ...(mapped.allowedPrompts ?? []).map((entry) => `- ${entry.tool}: ${entry.prompt}`)]
+          .filter(Boolean).join("\n"),
+        options: [
+          { id: "accept", label: mapped.targetMode === "default" ? "Approve Plan" : "Enter Plan Mode" },
+          { id: "decline", label: "Reject" },
+          { id: "cancel", label: "Cancel Request" },
+        ],
+      };
+      this.emit({ type: "approval_requested", sessionId, turnId: mapped.turnId, request });
+      if (automatic) {
+        void this.resolveApproval(sessionId, requestId, "accept", true).catch((error: unknown) => {
+          this.logger.warn({ error, sessionId, requestId }, "Failed to automatically approve the TraeX mode change.");
+          if (this.modeChanges.get(requestId) !== pending || session.activeTurnId !== mapped.turnId) return;
+          this.emit({ type: "approval_requested", sessionId, turnId: mapped.turnId,
+            request: { ...request, automatic: false, reason: ["自动同意失败，请手动确认。", request.reason].filter(Boolean).join("\n\n") } });
+        });
+      }
     } else if (mapped.kind === "mode_change_resolved") {
       const requestId = `mode:${mapped.threadId}:${mapped.requestId}`;
       const pending = this.modeChanges.get(requestId);
       if (!pending || pending.sessionId !== sessionId || pending.turnId !== mapped.turnId
         || pending.targetMode !== mapped.targetMode) return;
+      this.confirmPlanContinuation(pending, mapped.decision === "approved" ? "accept" : "decline");
       this.modeChanges.delete(requestId);
       this.emit({
         type: "approval_resolved", sessionId, turnId: mapped.turnId, requestId,
         decision: mapped.decision === "approved" ? "accept" : mapped.decision === "rejected" ? "decline" : "cancel",
+        ...(pending.automatic && mapped.decision === "approved" ? { automatic: true } : {}),
       });
     } else if (mapped.kind === "token_usage") {
       this.emit({
@@ -1240,6 +1283,7 @@ export class CodexRuntime implements AgentRuntime {
       if (mapped.phase === "final_answer") this.promoteUnphasedMessage(session, mapped.turnId, mapped.itemId);
       else if (session.unphasedFinalMessageId === mapped.itemId) session.unphasedFinalMessageId = undefined;
     } else if (mapped.kind === "agent_delta") {
+      this.clearPlanContinuation(session, mapped.turnId);
       const phase = session.messagePhases.get(mapped.itemId);
       if (phase !== "final_answer") {
         // Providers may omit phase. Keep their text in sequence until a tool or completion disambiguates it.
@@ -1291,6 +1335,8 @@ export class CodexRuntime implements AgentRuntime {
     } else if (mapped.kind === "plan") {
       this.emit({ type: "plan_updated", sessionId, turnId: mapped.turnId, steps: mapped.steps });
     } else if (mapped.kind === "tool") {
+      // A backend that resumes tool execution itself needs no client handoff.
+      if (mapped.phase === "started") this.clearPlanContinuation(session, mapped.turnId);
       if (mapped.phase === "started") session.unphasedFinalMessageId = undefined;
       if (
         mapped.phase === "updated"
@@ -1503,6 +1549,7 @@ export class CodexRuntime implements AgentRuntime {
     }
     session.activeTurnId = turnId;
     session.activeTurnStartedAt = startedAt;
+    session.planContinuationTurnId = undefined;
     session.modeChangeRequestIds.clear();
     session.unphasedMessages.clear();
     session.unphasedFinalMessageId = undefined;
@@ -1634,10 +1681,38 @@ export class CodexRuntime implements AgentRuntime {
     return session;
   }
 
+  private clearPlanContinuation(session: CodexSession, turnId: string): void {
+    session.planContinuationTurnId = undefined;
+    for (const pending of this.modeChanges.values()) {
+      if (pending.sessionId === session.localSessionId && pending.turnId === turnId && pending.responding) {
+        pending.continued = true;
+      }
+    }
+  }
+
+  private confirmPlanContinuation(pending: PendingModeChange, decision: ApprovalDecision): void {
+    const session = this.sessions.get(pending.sessionId);
+    // Do not start work approved in a different client.
+    if (session && pending.responding && !pending.continued && pending.decision === "accept" && decision === "accept"
+      && pending.targetMode === "default") session.planContinuationTurnId = pending.turnId;
+  }
+
   private emit(event: RuntimeEvent): void {
     if (event.type === "turn_completed" || event.type === "turn_cancelled" || event.type === "turn_failed") {
       for (const [requestId, pending] of this.modeChanges) {
-        if (pending.sessionId === event.sessionId && pending.turnId === event.turnId) this.modeChanges.delete(requestId);
+        if (pending.sessionId !== event.sessionId || pending.turnId !== event.turnId) continue;
+        if (event.type === "turn_completed" && pending.responding && pending.decision === "accept"
+          && pending.targetMode === "default") {
+          // The terminal notification may beat the approval RPC response.
+          pending.terminalEvent = event;
+          return;
+        }
+        this.modeChanges.delete(requestId);
+      }
+      const session = this.sessions.get(event.sessionId);
+      if (session?.planContinuationTurnId === event.turnId) {
+        session.planContinuationTurnId = undefined;
+        if (event.type === "turn_completed") event = { ...event, approvedPlan: true };
       }
     }
     for (const listener of this.listeners) listener(event);
@@ -1650,6 +1725,7 @@ export class CodexRuntime implements AgentRuntime {
     this.modeChanges.clear();
     for (const session of this.sessions.values()) {
       session.needsResume = true;
+      session.planContinuationTurnId = undefined;
       const turnId = session.activeTurnId;
       if (!turnId) continue;
       session.activeTurnId = undefined;

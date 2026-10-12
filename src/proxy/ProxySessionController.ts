@@ -119,6 +119,7 @@ interface StartTurnOptions {
   messageId?: string;
   displayPrompt?: string;
   preserveAttemptOnFailure?: boolean;
+  approvedPlanTurnId?: string;
 }
 
 interface PendingForwardAttachment {
@@ -564,6 +565,7 @@ export class ProxySessionController {
   private readonly lastSessionListings = new Map<string, string[]>();
   private readonly threadInitializations = new Map<string, Promise<void>>();
   private readonly llmRetryingSessions = new Set<string>();
+  private readonly planHandoffs = new Map<string, string>();
   private readonly retriedFailureTurnIds = new Set<string>();
   private readonly queuedPromptRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly recoveryRetryTimers = new Map<string, NodeJS.Timeout>();
@@ -1389,6 +1391,7 @@ export class ProxySessionController {
     this.queuedPromptCards.clear();
     this.queuedPromptCardWrites.clear();
     this.sessionResets.clear();
+    this.planHandoffs.clear();
     this.resetHistoryOperations.clear();
     this.remoteTurnHistoryRefreshes.clear();
     this.forkHistoryCursors.clear();
@@ -2646,6 +2649,16 @@ export class ProxySessionController {
     });
     const pendingAttempt = this.store.getTurnAttempt(attempt.attemptId);
     if (!pendingAttempt || !isIncompleteTurnAttemptStatus(pendingAttempt.status)) return;
+    const continued = turnViewSnapshot(this.store.getTurnSnapshot(turnId));
+    if (continued?.continuedFromTurnId && this.store.getTurnDelivery(turnId)?.progressMessageId) {
+      this.store.updateTurnAttempt(attempt.attemptId, { pendingTurnId: null, turnId, status: "running" });
+      await this.outbound.onEvent({ type: "turn_started", sessionId: session.localSessionId,
+        turnId, startedAt: continued.startedAt });
+      const synchronized = await loaded.runtime.synchronizeSession(session.localSessionId);
+      this.recoveryRetryStartedAt.delete(attempt.attemptId);
+      if (synchronized.activeTurnId) this.recoveredLiveAttempts.add(attempt.attemptId);
+      return;
+    }
     const oldCardTurnId = attempt.pendingTurnId ?? attempt.turnId;
     if (oldCardTurnId) {
       await this.outbound.interruptTurnForRecovery(
@@ -2779,7 +2792,7 @@ export class ProxySessionController {
     localImagePaths?: string[],
     displayPrompt?: string,
   ): Promise<void> {
-    if (this.llmRetryingSessions.has(record.localSessionId)) {
+    if (this.llmRetryingSessions.has(record.localSessionId) || this.planHandoffs.has(record.localSessionId)) {
       const queued = this.persistQueuedPrompt(record.localSessionId, contextKey, text, {
         localImagePaths,
         messageId,
@@ -4029,9 +4042,15 @@ export class ProxySessionController {
         this.store.updateTurnAttempt(attemptId, { pendingTurnId: pendingTurnId ?? null });
 
         try {
+          if (options.approvedPlanTurnId && (this.planHandoffs.get(loaded.record.localSessionId) !== options.approvedPlanTurnId
+            || this.sessionResets.has(loaded.record.localSessionId))) {
+            throw new Error("方案执行已取消。");
+          }
           turnId = await loaded.runtime.startTurn(
             loaded.record.localSessionId,
-            runtimePrompt(runtimeText, localImagePaths),
+            options.approvedPlanTurnId
+              ? { text: runtimeText, collaborationMode: "default" }
+              : runtimePrompt(runtimeText, localImagePaths),
           );
           break;
         } catch (error) {
@@ -4758,6 +4777,14 @@ export class ProxySessionController {
         );
       }
     }
+    if (event.type === "turn_completed" && event.approvedPlan) {
+      if (this.planHandoffs.get(event.sessionId) === event.turnId) return;
+      const attempt = this.store.findIncompleteTurnAttemptByTurnId(event.turnId);
+      if (attempt) {
+        await this.continueApprovedPlan(event, attempt);
+        return;
+      }
+    }
     const failedAttempt = event.type === "turn_failed"
       ? this.store.findIncompleteTurnAttemptByTurnId(event.turnId)
       : undefined;
@@ -4803,7 +4830,7 @@ export class ProxySessionController {
           ...event,
           turnCount: event.turnCount ?? this.store.countTaskTurns(event.sessionId),
         }
-      : event;
+      : event.type === "turn_completed" && event.approvedPlan ? { ...event, approvedPlan: false } : event;
     const presentationEvent = event.type === "turn_failed"
       && isRetryableLlmTurnFailure(event.message)
       && (failedAttempt?.retryCount ?? 0) >= MAX_LLM_TURN_RETRIES
@@ -4847,6 +4874,80 @@ export class ProxySessionController {
     }
 
     if (presentationError) throw presentationError;
+  }
+
+  private async continueApprovedPlan(
+    event: Extract<RuntimeEvent, { type: "turn_completed" }>,
+    attempt: TurnAttemptRecord,
+  ): Promise<void> {
+    const { sessionId, turnId } = event;
+    const source = this.store.getSession(sessionId);
+    if (!source || source.status === "closed" || source.lastTurnId !== turnId) return;
+    this.planHandoffs.set(sessionId, turnId);
+    this.store.markTurnAttemptTerminal(turnId, "completed");
+    this.store.updateRuntimeSession(sessionId, { lastTurnId: turnId, lastTurnStatus: "completed" });
+    let continued = false;
+    let failed = false;
+    try {
+      try {
+        await this.outbound.onEvent(event);
+      } catch (error) {
+        this.logger.warn({ error, sessionId, turnId }, "Failed to finalize the approved plan card.");
+      }
+      await this.settingsOperations.run(sessionId, async () => {
+        const current = this.store.getSessionForContext(sessionId, attempt.contextKey);
+        if (this.planHandoffs.get(sessionId) !== turnId || this.sessionResets.has(sessionId)
+          || !current || current.status === "closed" || current.remoteSessionId !== source.remoteSessionId) return;
+        const loaded = await this.loadSession(current);
+        await this.assertSessionTurnOwnership(current, loaded.runtime);
+        if (this.planHandoffs.get(sessionId) !== turnId || this.sessionResets.has(sessionId)) return;
+        // Another client may already have started the implementation.
+        let nextTurnId = loaded.session.activeTurnId;
+        if (!nextTurnId) {
+          if (current.lastTurnId !== turnId) return;
+          await this.applyPendingProviderSettings(loaded);
+          if (this.store.getPendingProviderSettings(sessionId)) throw new Error("Provider 切换尚未完成。");
+          if (this.planHandoffs.get(sessionId) !== turnId || this.sessionResets.has(sessionId)) return;
+          nextTurnId = await this.startTurnNow(
+            loaded,
+            "The proposed plan has been approved. Continue in the current task and workspace without asking for plan approval again; preserve the existing conversation and completed work. Implement the plan unless the user explicitly requested discussion or planning only, or prohibited implementation; those constraints still apply.",
+            attempt.replyMessageId ? { messageId: attempt.replyMessageId, replyInThread: true } : undefined,
+            undefined,
+            { messageId: attempt.messageId, displayPrompt: "方案已确认，继续执行", approvedPlanTurnId: turnId },
+          );
+        }
+        continued = true;
+        this.store.rebindPendingTurnMessages(sessionId, turnId, nextTurnId);
+        const latest = this.store.getSession(sessionId);
+        if (latest?.lastTurnId === nextTurnId && (latest.lastTurnStatus === "completed"
+          || latest.lastTurnStatus === "failed" || latest.lastTurnStatus === "cancelled")) {
+          await this.finalizeTurnMessageReactions(nextTurnId, latest.lastTurnStatus);
+        }
+        this.store.audit(attempt.contextKey, "approved_plan_continued", { sessionId, turnId, nextTurnId });
+      });
+    } catch (error) {
+      failed = true;
+      this.logger.error({ error, sessionId, turnId }, "Failed to continue an approved plan.");
+      await this.outbound.sendText(attempt.contextKey,
+        "方案已确认，但后续执行启动失败：" + runtimeErrorMessage(error) + "。请发送消息继续。");
+    } finally {
+      if (this.planHandoffs.get(sessionId) === turnId) this.planHandoffs.delete(sessionId);
+      if (!continued) {
+        try {
+          await this.outbound.onEvent(failed
+            ? { type: "turn_failed", sessionId, turnId, message: "方案已确认，但后续执行未能启动。" }
+            : { type: "turn_cancelled", sessionId, turnId });
+        } catch (error) {
+          this.logger.warn({ error, sessionId, turnId }, "Failed to finish the plan handoff card.");
+        }
+        await this.finalizeTurnMessageReactions(turnId, failed ? "failed" : "cancelled");
+      }
+      const latest = this.store.getSession(sessionId);
+      if (latest?.lastTurnId === turnId && latest.status !== "closed") {
+        this.store.updateSession(sessionId, { status: failed ? "failed" : "ready" });
+      }
+      await this.scheduleNextQueuedPrompt(sessionId);
+    }
   }
 
   private async retryFailedLlmTurn(
@@ -4960,6 +5061,7 @@ export class ProxySessionController {
   }
 
   private async startNextQueuedPromptIfIdleNow(sessionId: string): Promise<void> {
+    if (this.planHandoffs.has(sessionId) || this.sessionResets.has(sessionId)) return;
     if (this.store.countQueuedPrompts(sessionId) === 0) return;
     const baseRecord = this.store.getSession(sessionId);
     if (!baseRecord || baseRecord.status === "closed") return;
@@ -5185,6 +5287,7 @@ export class ProxySessionController {
   }
 
   private async cancelSession(record: SessionRecord): Promise<void> {
+    this.planHandoffs.delete(record.localSessionId);
     const runtime = this.runtimes.forAgent(record.agentName);
     if (runtime.kind === "codex" && record.remoteSessionId && runtime.interruptRemoteTurn) {
       if (runtime.getGoal && runtime.setGoal) {
@@ -5263,6 +5366,7 @@ export class ProxySessionController {
   }
 
   private async runSessionReset(sessionId: string, operation: () => Promise<void>): Promise<void> {
+    this.planHandoffs.delete(sessionId);
     const previous = this.sessionResets.get(sessionId) ?? Promise.resolve();
     const reset = previous.catch(() => undefined).then(operation);
     this.sessionResets.set(sessionId, reset);
@@ -6526,7 +6630,8 @@ export class ProxySessionController {
     const existing = this.turnDetailHydrations.get(turnId);
     if (existing) return existing;
     const snapshot = turnViewSnapshot(this.store.getTurnSnapshot(turnId));
-    if ((!snapshot || snapshot.previewJournal) && this.store.previews.has(turnId)) return this.store.previews.load(turnId);
+    const previewTurnId = snapshot?.previewTurnId ?? turnId;
+    if ((!snapshot || snapshot.previewJournal) && this.store.previews.has(previewTurnId)) return this.store.previews.load(previewTurnId);
     if (snapshot && !needsHistoricalDetails(snapshot)) return snapshot;
     const origin = !snapshot ? this.store.getTurnRuntimeOrigin(turnId) : undefined;
     if (!snapshot && (!origin || !this.runtimes.forAgent(origin.agentName).readRemoteTurn)) return undefined;
@@ -6552,7 +6657,7 @@ export class ProxySessionController {
     }
     // An Agent Bot turn may have arrived while the read-only request was in flight.
     const latest = turnViewSnapshot(this.store.getTurnSnapshot(origin.turnId));
-    if (latest) return latest.previewJournal ? this.store.previews.load(origin.turnId) ?? latest : latest;
+    if (latest) return latest.previewJournal ? this.store.previews.load(latest.previewTurnId ?? origin.turnId) ?? latest : latest;
     const state = hydrateTurnViewState(createTurnViewState(
       origin.localSessionId, origin.turnId, details.startedAt ?? 0,
       remote?.title, undefined, remote?.cwd, undefined, this.agentLabel(origin.agentName),

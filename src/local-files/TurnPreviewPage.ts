@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { approvalActivityId } from "../presentation/TurnStateReducer.js";
 import path from "node:path";
 import { enableDiagramFences, DIAGRAM_PREVIEW_CLIENT_SCRIPT, DIAGRAM_PREVIEW_CSS } from "./DiagramPreview.js";
 import MarkdownIt from "markdown-it";
@@ -693,7 +694,10 @@ function renderApprovalNotice(request: ApprovalRequest, renderText: (value: stri
     : `<div class="markdown">${renderText(reason)}</div>`;
   const details = commandApproval
     ? `<details class="approval-details" data-activity-id="approval:${escapeAttribute(request.id)}"><summary>${language === "zh" ? "查看完整命令" : "View full command"}</summary><pre data-scroll-id="approval:${escapeAttribute(request.id)}:command">${escapeHtml(request.command!)}</pre></details>` : "";
-  return `<section class="notice" data-preview-key="approval"><h2>${escapeHtml(title)}</h2>${description}${details}<p>${language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu."}</p></section>`;
+  const instruction = request.automatic
+    ? language === "zh" ? "自动执行模式：正在自动同意。" : "Auto mode: approving automatically."
+    : language === "zh" ? "请在飞书任务卡片中确认或拒绝。" : "Approve or reject using the task card in Feishu.";
+  return `<section class="notice" data-preview-key="approval"><h2>${escapeHtml(title)}</h2>${description}${details}<p>${instruction}</p></section>`;
 }
 
 function renderFinalAnswer(markdown: string, turnId: string, renderText: (value: string) => string, language: TurnPreviewLanguage): string {
@@ -726,7 +730,8 @@ function renderTimeline(
   projectCwd?: string,
   deferDetails = false,
 ): string {
-  const activities = state.activities ?? [];
+  const activities = state.approval
+    ? state.activities.filter((a) => a.id !== approvalActivityId(state.turnId, state.approval!.id)) : state.activities ?? [];
   const positions = new Map(activities.map((activity, index) => [activity.id, index]));
   const reasoning = new Map<number, TurnReasoningItem[]>();
   for (const item of turnReasoningItems(state)) {

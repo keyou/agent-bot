@@ -3018,22 +3018,23 @@ describe("CodexRuntime mode confirmations", () => {
     reason: "Review the implementation plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
   };
 
-  async function setup() {
+  async function setup(permissionMode: "auto" | "confirm" = "confirm", family: "codex" | "traex" = "traex") {
     const client = new FakeAppServerClient();
     let disconnect: ((error: Error) => void) | undefined;
     const runtime = new CodexRuntime({
       ...provider(client),
+      getAgentFamily: () => family,
       onDisconnect: (listener) => { disconnect = listener; return () => { disconnect = undefined; }; },
     }, logger());
     const events: RuntimeEvent[] = [];
     runtime.onEvent((event) => events.push(event));
-    await runtime.createSession({ localSessionId: "s1", agentName: "traex", cwd: process.cwd(), permissionMode: "auto" });
+    await runtime.createSession({ localSessionId: "s1", agentName: family, cwd: process.cwd(), permissionMode });
     await runtime.startTurn("s1", "create a plan");
     events.length = 0;
     return { client, runtime, events, disconnect: () => disconnect?.(new Error("process exited")) };
   }
 
-  test.each(["plan", "default"])("requires explicit confirmation for %s even with automatic permissions", async (targetMode) => {
+  test.each(["plan", "default"])("requires explicit confirmation for %s in confirm mode", async (targetMode) => {
     const { client, runtime, events } = await setup();
     client.emit("mode/changeRequested", { ...notification, targetMode });
     client.emit("mode/changeRequested", { ...notification, targetMode });
@@ -3052,6 +3053,106 @@ describe("CodexRuntime mode confirmations", () => {
     expect(client.requests.some((entry) => entry.method === "mode/change/respond")).toBe(false);
     expect(runtime.getSession("s1")?.activeTurnId).toBe("turn_1");
     runtime.close();
+  });
+
+  test.each(["plan", "default"])("automatically approves TraeX %s once in auto mode", async (targetMode) => {
+    const { client, runtime, events } = await setup("auto");
+    try {
+      client.emit("mode/changeRequested", { ...notification, targetMode });
+      client.emit("mode/changeRequested", { ...notification, targetMode });
+      await vi.waitFor(() => expect(events.filter((event) => event.type === "approval_resolved")).toHaveLength(1));
+      expect(client.requests.filter((r) => r.method === "mode/change/respond")).toEqual([{
+        method: "mode/change/respond", params: { threadId: "thr_1", requestId: "request_1", decision: "approved" },
+      }]);
+      expect(events[0]).toMatchObject({ type: "approval_requested", request: { automatic: true } });
+      expect(events[1]).toEqual({ type: "approval_resolved", sessionId: "s1", turnId: "turn_1", requestId, decision: "accept", automatic: true });
+      client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+      if (targetMode === "default") expect(events.at(-1)).toMatchObject({ type: "turn_completed", approvedPlan: true });
+      else expect(events.at(-1)).not.toHaveProperty("approvedPlan");
+    } finally { runtime.close(); }
+  });
+
+  test("does not auto approve mode changes from other runtimes", async () => {
+    const { client, runtime, events } = await setup("auto", "codex");
+    client.emit("mode/changeRequested", notification);
+    await Promise.resolve();
+    expect(client.requests.some((r) => r.method === "mode/change/respond")).toBe(false);
+    expect(events[0]).toMatchObject({ type: "approval_requested" });
+    expect(events[0]).not.toHaveProperty("request.automatic");
+    runtime.close();
+  });
+
+  test.each(["resolved-first", "terminal-first"])("hands off an automatically approved plan once (%s)", async (order) => {
+    const { client, runtime, events } = await setup("auto");
+    try {
+      client.modeChangeResponse = async () => {
+        if (order === "resolved-first") client.emit("mode/changeResolved", { ...notification, decision: "approved" });
+        client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+      };
+      client.emit("mode/changeRequested", notification);
+      await vi.waitFor(() => expect(events.filter((e) => e.type === "turn_completed")).toHaveLength(1));
+      expect(events.filter((e) => e.type === "approval_resolved")).toEqual([
+        expect.objectContaining({ decision: "accept", automatic: true }),
+      ]);
+      expect(events.at(-1)).toMatchObject({ type: "turn_completed", approvedPlan: true });
+    } finally { runtime.close(); }
+  });
+
+  test("falls back to manual confirmation after an automatic response fails", async () => {
+    const { client, runtime, events } = await setup("auto");
+    try {
+      client.modeChangeResponse = async () => { throw new Error("transport failed"); };
+      client.emit("mode/changeRequested", notification);
+      await vi.waitFor(() => expect(events.filter((e) => e.type === "approval_requested")).toHaveLength(2));
+      expect(events.at(-1)).toMatchObject({ request: { automatic: false, reason: expect.stringContaining("自动同意失败") } });
+      expect(events.some((e) => e.type === "approval_resolved")).toBe(false);
+      client.modeChangeResponse = undefined;
+      await runtime.respondToApproval("s1", requestId, "accept");
+      expect(events.at(-1)).toMatchObject({ type: "approval_resolved", decision: "accept" });
+      expect(events.at(-1)).not.toHaveProperty("automatic");
+    } finally { runtime.close(); }
+  });
+
+  test("does not approve or resurrect a cancelled automatic request", async () => {
+    const { client, runtime, events } = await setup("auto");
+    client.emit("mode/changeRequested", notification);
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "interrupted" } });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(client.requests.some((r) => r.method === "mode/change/respond")).toBe(false);
+    expect(events.filter((e) => e.type === "approval_requested")).toHaveLength(1);
+    expect(events.filter((e) => e.type === "approval_resolved")).toHaveLength(0);
+    runtime.close();
+  });
+
+  test("uses the current permission setting for each new plan request", async () => {
+    const { client, runtime, events } = await setup("auto");
+    try {
+      await runtime.setPermissionMode("s1", "confirm");
+      client.emit("mode/changeRequested", notification);
+      expect(events[0]).not.toHaveProperty("request.automatic");
+      expect(client.requests.some((r) => r.method === "mode/change/respond")).toBe(false);
+      await runtime.respondToApproval("s1", requestId, "decline");
+      await runtime.setPermissionMode("s1", "auto");
+      client.emit("mode/changeRequested", { ...notification, requestId: "request_2" });
+      await vi.waitFor(() => expect(events.at(-1)).toMatchObject({ type: "approval_resolved", automatic: true }));
+      expect(client.requests.filter((r) => r.method === "mode/change/respond")).toHaveLength(2);
+    } finally { runtime.close(); }
+  });
+
+  test("does not claim automatic approval or continue if the backend rejects the request", async () => {
+    const { client, runtime, events } = await setup("auto");
+    try {
+      client.modeChangeResponse = async () => {
+        client.emit("mode/changeResolved", { ...notification, decision: "rejected" });
+        client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+      };
+      client.emit("mode/changeRequested", notification);
+      await vi.waitFor(() => expect(events.at(-1)).toMatchObject({ type: "turn_completed" }));
+      const resolved = events.find((e) => e.type === "approval_resolved");
+      expect(resolved).toMatchObject({ decision: "decline" });
+      expect(resolved).not.toHaveProperty("automatic");
+      expect(events.at(-1)).not.toHaveProperty("approvedPlan");
+    } finally { runtime.close(); }
   });
 
   test.each([
@@ -3147,6 +3248,76 @@ describe("CodexRuntime mode confirmations", () => {
       { type: "progress", sessionId: "s1", turnId: "turn_1", activityId: "commentary:plan:plan_1", text: "Review and test", append: false },
     ]);
     expect(events).toContainEqual(expect.objectContaining({ type: "turn_completed", finalResponse: "" }));
+    runtime.close();
+  });
+
+  test.each(["resolved-first", "response-first", "terminal-first"])("hands off an approved plan once (%s)", async (order) => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", notification);
+    const completed = () => client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+    client.modeChangeResponse = async () => {
+      if (order === "resolved-first") client.emit("mode/changeResolved", { ...notification, decision: "approved" });
+      if (order !== "response-first") completed();
+    };
+    await runtime.respondToApproval("s1", requestId, "accept");
+    completed();
+    expect(events.filter((event) => event.type === "turn_completed")).toEqual([
+      expect.objectContaining({ turnId: "turn_1", approvedPlan: true }),
+    ]);
+    expect(events.filter((event) => event.type === "approval_resolved")).toHaveLength(1);
+    client.nextTurnId = "turn_2";
+    await runtime.startTurn("s1", { text: "Implement the approved plan", collaborationMode: "default" });
+    expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: {
+      threadId: "thr_1", model: "gpt-test", effort: "medium", approvalPolicy: "on-request",
+      collaborationMode: { mode: "default", settings: {
+        model: "gpt-test", reasoning_effort: "medium", developer_instructions: null,
+      } },
+    } });
+    client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_2", status: "completed" } });
+    expect(events.at(-1)).not.toHaveProperty("approvedPlan");
+    runtime.close();
+  });
+
+  test.each(["decline", "cancel", "enter-plan", "external", "failed", "interrupted", "tools-continued"])(
+    "does not hand off for %s", async (scenario) => {
+      const { client, runtime, events } = await setup();
+      client.emit("mode/changeRequested", { ...notification, targetMode: scenario === "enter-plan" ? "plan" : "default" });
+      if (scenario === "external") client.emit("mode/changeResolved", { ...notification, decision: "approved" });
+      else await runtime.respondToApproval("s1", requestId, scenario === "decline" || scenario === "cancel" ? scenario : "accept");
+      if (scenario === "tools-continued") client.emit("item/started", { threadId: "thr_1", turnId: "turn_1",
+        item: { id: "tool_1", type: "commandExecution", command: "echo implemented", status: "inProgress" } });
+      client.emit("turn/completed", { threadId: "thr_1", turn: {
+        id: "turn_1", status: scenario === "failed" || scenario === "interrupted" ? scenario : "completed",
+      } });
+      expect(events.at(-1)).not.toHaveProperty("approvedPlan");
+      runtime.close();
+    },
+  );
+
+  test("does not hang or continue when approval fails after a terminal notification", async () => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", notification);
+    client.modeChangeResponse = async () => {
+      client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+      throw new Error("approval rejected");
+    };
+    await expect(runtime.respondToApproval("s1", requestId, "accept")).rejects.toThrow("approval rejected");
+    expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+    expect(events.at(-1)).not.toHaveProperty("approvedPlan");
+    runtime.close();
+  });
+
+  test("does not hand off when the backend starts tools before the approval RPC completes", async () => {
+    const { client, runtime, events } = await setup();
+    client.emit("mode/changeRequested", notification);
+    client.modeChangeResponse = async () => {
+      client.emit("item/started", { threadId: "thr_1", turnId: "turn_1",
+        item: { id: "tool_1", type: "commandExecution", command: "echo implemented", status: "inProgress" } });
+      client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+    };
+    await runtime.respondToApproval("s1", requestId, "accept");
+    expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+    expect(events.at(-1)).not.toHaveProperty("approvedPlan");
     runtime.close();
   });
 });

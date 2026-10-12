@@ -4,6 +4,7 @@ import {
   appendSteerMessage as appendSteerMessageToState,
   createTurnViewState,
   compactTurnView,
+  continueTurnView,
   reduceTurnEvent,
 } from "../presentation/TurnStateReducer.js";
 import { splitMarkdown } from "../presentation/splitMarkdown.js";
@@ -74,6 +75,7 @@ interface TurnEntry {
   elapsedTimer?: ReturnType<typeof setInterval>;
   finalizing?: Promise<void>;
   lastFinalizedStatus?: TurnViewState["status"];
+  continuing?: boolean;
 }
 
 export class FeishuTurnPresenter {
@@ -158,6 +160,13 @@ export class FeishuTurnPresenter {
     const existing = this.pendingEntries.get(sessionId);
     if (existing) {
       await existing.initializing;
+      if (existing.continuing) {
+        existing.state = { ...existing.state, status: "running", error: undefined, completedAt: undefined, durationMs: undefined };
+        this.persist(existing.state.turnId, sessionId, existing.state, existing.contextKey);
+        existing.scheduler?.update(existing.state, "critical");
+        this.startElapsedUpdates(existing);
+        return existing.state.turnId;
+      }
       const images = localImagePaths === undefined ? existing.state.promptImagePaths : [...new Set(localImagePaths)];
       if ((prompt && existing.state.prompt !== prompt) || JSON.stringify(images) !== JSON.stringify(existing.state.promptImagePaths)) {
         existing.state = { ...existing.state, ...(prompt ? { prompt } : {}), ...(images ? { promptImagePaths: images } : {}) };
@@ -204,15 +213,15 @@ export class FeishuTurnPresenter {
   ): Promise<boolean> {
     const entry = this.pendingEntries.get(sessionId);
     if (!entry) return false;
-    this.pendingEntries.delete(sessionId);
-    this.stopElapsedUpdates(entry);
+    if (!entry.continuing) this.pendingEntries.delete(sessionId);
+    if (!entry.continuing) this.stopElapsedUpdates(entry);
     const completedAt = Date.now();
     entry.state = {
       ...entry.state,
-      status: "failed",
+      status: entry.continuing ? "running" : "failed",
       error: message,
-      completedAt,
-      durationMs: Math.max(0, completedAt - entry.state.startedAt),
+      completedAt: entry.continuing ? undefined : completedAt,
+      durationMs: entry.continuing ? undefined : Math.max(0, completedAt - entry.state.startedAt),
     };
     this.persist(entry.state.turnId, sessionId, entry.state, entry.contextKey);
     await entry.initializing;
@@ -298,7 +307,7 @@ export class FeishuTurnPresenter {
             status: "running" as const,
           };
       this.store.previews?.seed(initial);
-      this.store.previews?.user(turnId, activityId, text, localImagePaths);
+      this.store.previews?.user(initial.previewTurnId ?? turnId, activityId, text, localImagePaths);
       const state = this.cardState(appendSteerMessageToState(initial, activityId, text, localImagePaths));
       entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
       this.entries.set(turnId, entry);
@@ -309,7 +318,7 @@ export class FeishuTurnPresenter {
     }
 
     await entry.initializing;
-    this.store.previews?.user(turnId, activityId, text, localImagePaths);
+    this.store.previews?.user(entry.state.previewTurnId ?? turnId, activityId, text, localImagePaths);
     entry.state = this.cardState(appendSteerMessageToState(entry.state, activityId, text, localImagePaths));
     this.persist(turnId, sessionId, entry.state, entry.contextKey);
     if (!entry.historySnapshot) entry.scheduler?.update(entry.state, "critical");
@@ -317,10 +326,50 @@ export class FeishuTurnPresenter {
 
   async onEvent(event: AgentEvent): Promise<void> {
     let existing = this.entries.get(event.turnId);
+    if (!existing) {
+      const saved = this.store.getTurnSnapshot(event.turnId);
+      if (isTurnViewState(saved) && saved.continuedToTurnId) return;
+    }
     let eventApplied = false;
+    if (event.type === "turn_completed" && event.approvedPlan) {
+      const entry = existing ?? this.createEntry({ type: "progress", sessionId: event.sessionId,
+        turnId: event.turnId, activityId: "plan-handoff", text: "方案已确认，继续执行" });
+      if (!entry || entry.continuing) return;
+      entry.continuing = true;
+      entry.historySnapshot = undefined;
+      this.store.previews?.seed(entry.state);
+      entry.state = { ...entry.state, status: "running", approval: undefined };
+      this.pendingEntries.set(event.sessionId, entry);
+      this.persist(event.turnId, event.sessionId, entry.state, entry.contextKey);
+      await entry.initializing;
+      await entry.scheduler?.flush(entry.state);
+      return;
+    }
     if (!existing && event.type === "turn_started") {
       const pending = this.pendingEntries.get(event.sessionId);
-      if (pending) {
+      if (pending?.continuing) {
+        const previous = pending.state;
+        const previewTurnId = previous.previewTurnId ?? previous.turnId;
+        this.flushPersistence();
+        const state = continueTurnView(previous, event.turnId, event.startedAt);
+        this.store.previews?.handoff(previewTurnId, event.turnId, event.startedAt);
+        this.store.saveTurnSnapshot(previous.turnId, event.sessionId, {
+          ...previous, status: "completed", completedAt: event.startedAt,
+          durationMs: Math.max(0, event.startedAt - previous.startedAt),
+          finalResponse: "", continuedToTurnId: event.turnId, previewTurnId,
+        }, pending.contextKey);
+        if (pending.messageId) this.store.saveTurnDelivery(event.turnId, { progressMessageId: pending.messageId });
+        this.entries.delete(previous.turnId);
+        this.pendingEntries.delete(event.sessionId);
+        pending.state = state;
+        pending.continuing = false;
+        pending.lastFinalizedStatus = undefined;
+        pending.historySnapshot = undefined;
+        this.entries.set(event.turnId, pending);
+        this.persist(event.turnId, event.sessionId, state, pending.contextKey);
+        existing = pending;
+        eventApplied = true;
+      } else if (pending) {
         const pendingTurnId = pending.state.turnId;
         const state = reduceTurnEvent(
           createTurnViewState(
@@ -362,8 +411,9 @@ export class FeishuTurnPresenter {
     if (!entry) return;
 
     if (existing && !eventApplied) {
+      event = presentationEvent(event, entry.state);
       this.store.previews?.seed(entry.state);
-      this.store.previews?.event(event);
+      this.store.previews?.event(event, entry.state.previewTurnId);
       const previousStatus = entry.state.status;
       entry.state = this.cardState(reduceTurnEvent(entry.state, event));
       if (isTerminalViewStatus(previousStatus) && !event.type.startsWith("turn_")) entry.state.status = previousStatus;
@@ -374,6 +424,8 @@ export class FeishuTurnPresenter {
     if (!entry.scheduler) return;
 
     if (isTerminalEvent(event)) {
+      if (this.pendingEntries.get(event.sessionId) === entry) this.pendingEntries.delete(event.sessionId);
+      entry.continuing = false;
       this.stopElapsedUpdates(entry);
       if (entry.finalizing) await entry.finalizing;
       const terminalState = entry.state;
@@ -394,7 +446,8 @@ export class FeishuTurnPresenter {
   }
 
   async showDetails(contextKey: string, turnId: string): Promise<void> {
-    const snapshot = this.store.previews?.load(turnId) ?? this.store.getTurnSnapshot(turnId);
+    const saved = this.store.getTurnSnapshot(turnId);
+    const snapshot = this.store.previews?.load(isTurnViewState(saved) ? saved.previewTurnId ?? turnId : turnId) ?? saved;
     if (!isTurnViewState(snapshot)) {
       await this.outbound.sendText(contextKey, "未找到这次执行的详情。可能已被清理。");
       return;
@@ -408,6 +461,7 @@ export class FeishuTurnPresenter {
     page: number | "latest",
     messageId?: string,
   ): Promise<void> {
+    turnId = this.latestPresentationTurn(turnId, contextKey, messageId);
     const entry = this.entries.get(turnId);
     if (entry) await entry.initializing;
     const ownsProgressCard = entry
@@ -430,7 +484,7 @@ export class FeishuTurnPresenter {
       }
 
       if (!entry.historySnapshot) {
-        entry.historySnapshot = this.store.previews?.load(turnId) ?? entry.state;
+        entry.historySnapshot = this.store.previews?.load(entry.state.previewTurnId ?? turnId) ?? entry.state;
         await entry.scheduler?.flush();
       }
       const card = this.renderActivityHistory(entry.historySnapshot, page);
@@ -439,7 +493,8 @@ export class FeishuTurnPresenter {
       return;
     }
 
-    const snapshot = this.store.previews?.load(turnId) ?? this.store.getTurnSnapshot(turnId);
+    const saved = this.store.getTurnSnapshot(turnId);
+    const snapshot = this.store.previews?.load(isTurnViewState(saved) ? saved.previewTurnId ?? turnId : turnId) ?? saved;
     if (!isTurnViewState(snapshot)) throw new Error("未找到这次执行的活动历史。");
     const card = page === "latest"
       ? this.renderTurn(snapshot)
@@ -477,9 +532,9 @@ export class FeishuTurnPresenter {
     const compact = compactTurnView(state);
     this.dirty.set(turnId, { state: compact, contextKey });
     if (!event || isTerminalViewStatus(state.status) || state.status === "waiting_for_approval") {
-      this.store.previews.flush(turnId, true);
+      this.store.previews.flush(state.previewTurnId ?? turnId, true);
       this.flushPersistence();
-      if (isTerminalViewStatus(state.status)) this.store.previews.release(turnId);
+      if (isTerminalViewStatus(state.status)) this.store.previews.release(state.previewTurnId ?? turnId);
     } else if (!this.persistTimer) {
       this.persistTimer = setTimeout(() => {
         try { this.flushPersistence(); } catch (error) { this.options.onError?.(error); }
@@ -519,7 +574,8 @@ export class FeishuTurnPresenter {
           this.sessionModelProviders.get(event.sessionId),
         );
     this.store.previews?.seed(initial);
-    this.store.previews?.event(event);
+    event = presentationEvent(event, initial);
+    this.store.previews?.event(event, initial.previewTurnId);
     const state = this.cardState(reduceTurnEvent(initial, event));
     const entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
     this.entries.set(event.turnId, entry);
@@ -596,7 +652,21 @@ export class FeishuTurnPresenter {
   private turnPreviewUrl(state: TurnViewState): string | undefined {
     return state.turnId.startsWith("pending_")
       ? undefined
-      : this.options.turnPreviewUrl?.(state.turnId);
+      : this.options.turnPreviewUrl?.(state.previewTurnId ?? state.turnId);
+  }
+
+  private latestPresentationTurn(turnId: string, contextKey: string, messageId?: string): string {
+    const seen = new Set<string>();
+    while (!seen.has(turnId)) {
+      seen.add(turnId);
+      const saved = this.store.getTurnSnapshot(turnId);
+      if (!isTurnViewState(saved) || !saved.continuedToTurnId) break;
+      const next = saved.continuedToTurnId;
+      if (this.store.getTurnContextKey?.(next) !== contextKey
+        || (messageId && this.store.getTurnDelivery(next)?.progressMessageId !== messageId)) break;
+      turnId = next;
+    }
+    return turnId;
   }
 
   private startElapsedUpdates(entry: TurnEntry): void {
@@ -715,6 +785,28 @@ export class FeishuTurnPresenter {
       }
     }
   }
+}
+
+function presentationEvent(event: AgentEvent, state: TurnViewState): AgentEvent {
+  if (event.type === "turn_started" && state.segmentStartedAt !== undefined) return { ...event, startedAt: state.startedAt };
+  if (event.type === "turn_completed" && event.durationMs !== undefined && state.segmentStartedAt !== undefined) {
+    return { ...event, durationMs: Math.max(0, state.segmentStartedAt - state.startedAt) + event.durationMs };
+  }
+  if (state.continuedFromTurnId) {
+    // Tool/item IDs are only required to be unique within one runtime Turn.
+    const scoped = (id: string) => event.turnId + ":" + id;
+    if (event.type === "tool_started" || event.type === "tool_updated") return { ...event, tool: { ...event.tool, id: scoped(event.tool.id) } };
+    if (event.type === "tool_output_delta") return { ...event, toolId: scoped(event.toolId) };
+    if (event.type === "reasoning_delta" || event.type === "reasoning_completed") return { ...event, itemId: scoped(event.itemId) };
+    if (event.type === "progress") return { ...event,
+      activityId: (event.activityId?.startsWith("commentary:") ? "commentary:" : "") + scoped(event.activityId ?? "progress"),
+      ...(event.reasoning ? { reasoning: { ...event.reasoning, itemId: scoped(event.reasoning.itemId) } } : {}) };
+    if (event.type === "agent_text_delta" && event.replacesActivityId) return {
+      ...event, replacesActivityId: "commentary:" + scoped(event.replacesActivityId),
+    };
+    if (event.type === "context_compaction" && event.compactionId) return { ...event, compactionId: scoped(event.compactionId) };
+  }
+  return event;
 }
 
 function normalizeTurnCardMarkdown(

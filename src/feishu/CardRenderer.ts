@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { approvalActivityId } from "../presentation/TurnStateReducer.js";
 import path from "node:path";
 import type { JsonValue } from "../acp/acpTypes.js";
 import type { RuntimeSession } from "../acp/AcpSessionManager.js";
@@ -1830,6 +1831,10 @@ function renderApprovalElements(state: TurnViewState, request: ApprovalRequest):
       request.reason,
     ].filter(Boolean).join("\n")));
   }
+  if (request.automatic) {
+    elements.push(markdown("自动执行模式：正在自动同意。"));
+    return elements;
+  }
   elements.push({
     tag: "column_set",
     flex_mode: "flow",
@@ -2294,7 +2299,8 @@ function removeMarkdownBold(value: string): string {
 }
 
 function turnActivities(state: TurnViewState): TurnActivity[] {
-  if (state.activities?.length) return state.activities;
+  if (state.activities?.length) return state.approval
+    ? state.activities.filter((a) => a.id !== approvalActivityId(state.turnId, state.approval!.id)) : state.activities;
 
   const activities: TurnActivity[] = [];
   if (state.progressText) {

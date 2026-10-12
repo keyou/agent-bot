@@ -1,4 +1,4 @@
-import type { AgentEvent, RemoteTurnDetails, ToolState } from "../runtime/types.js";
+import type { AgentEvent, ApprovalDecision, ApprovalRequest, RemoteTurnDetails, ToolState } from "../runtime/types.js";
 import { appendGeneratedImageMarkdown } from "../utils/generatedImageMarkdown.js";
 import type { MessageReplyTarget } from "../feishu/types.js";
 import { formatStorageSize } from "../utils/formatStorageSize.js";
@@ -113,6 +113,13 @@ export function reduceTurnEvent(state: TurnViewState, event: AgentEvent, complet
   if (event.type === "turn_completed") next.finalResponse = event.finalResponse;
   if (event.type === "agent_text_delta") next.assistantText = state.assistantText + event.text;
   if (event.type === "plan_updated") next.plan = event.steps;
+  if (event.type === "approval_requested" || event.type === "approval_resolved") {
+    const request = event.type === "approval_requested" ? event.request
+      : state.approval?.id === event.requestId ? state.approval : undefined;
+    if (request) next.activities = next.activities.map((a) => a.id === approvalActivityId(event.turnId, request.id) && a.kind === "assistant"
+      ? { ...a, text: approvalHistoryText(request, event.type === "approval_resolved" ? event.decision : undefined,
+        event.type === "approval_resolved" && event.automatic) } : a);
+  }
   if (event.type === "progress") {
     const id = event.activityId ?? "progress";
     const old = state.activities.find((a) => a.id === id);
@@ -305,7 +312,7 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
       return {
         ...state,
         ...tracking,
-        status: state.approval ? "waiting_for_approval" : "tool_running",
+        status: state.approval && !state.approval.automatic ? "waiting_for_approval" : "tool_running",
         activeTool: bounded,
         activities: activityUpdate.activities,
         activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
@@ -317,10 +324,21 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
     case "tool_output_delta":
       return reduceToolOutputDelta(state, event.toolId, event.delta);
     case "approval_requested":
-      return { ...state, status: "waiting_for_approval", approval: event.request };
+      return { ...state, status: event.request.automatic ? state.activeTool ? "tool_running" : "running" : "waiting_for_approval", approval: event.request,
+        activities: [...state.activities.filter((a) => a.id !== approvalActivityId(event.turnId, event.request.id)), {
+          kind: "assistant", id: approvalActivityId(event.turnId, event.request.id), text: bound(approvalHistoryText(event.request)),
+        }],
+      };
     case "approval_resolved":
       if (state.approval?.id !== event.requestId) return state;
-      return { ...state, status: state.activeTool ? "tool_running" : "running", approval: undefined };
+      return {
+        ...state, status: state.activeTool ? "tool_running" : "running", approval: undefined,
+        activities: upsertActivity(state.activities,
+          state.activities.findIndex((a) => a.id === approvalActivityId(event.turnId, event.requestId)), {
+            kind: "assistant", id: approvalActivityId(event.turnId, event.requestId),
+            text: bound(approvalHistoryText(state.approval, event.decision, event.automatic)),
+          }).activities,
+      };
     case "turn_completed": {
       const durationMs = Math.max(0, event.durationMs ?? Date.now() - state.startedAt);
       return {
@@ -361,6 +379,27 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
       };
     }
   }
+}
+
+export function approvalActivityId(turnId: string, requestId: string): string {
+  return "approval:" + turnId + ":" + requestId;
+}
+
+export function continueTurnView(state: TurnViewState, turnId: string, startedAt: number): TurnViewState {
+  return { ...state, turnId, previewTurnId: state.previewTurnId ?? state.turnId,
+    continuedFromTurnId: state.turnId, continuedToTurnId: undefined, segmentStartedAt: startedAt,
+    status: "running", completedAt: undefined, durationMs: undefined, finalResponse: undefined,
+    error: undefined, approval: undefined, activeTool: undefined, assistantText: "", progressText: undefined };
+}
+
+function approvalHistoryText(request: ApprovalRequest, decision?: ApprovalDecision, automatic = false): string {
+  const labels = { accept: "允许一次", acceptForSession: "本会话允许", decline: "拒绝", cancel: "取消请求" };
+  const choice = decision ? request.options.find((option) => option.id === decision)?.label ?? labels[decision] : undefined;
+  const heading = choice ? automatic ? "自动同意（auto）" : "用户选择：" + choice
+    : request.automatic ? "正在自动同意（auto）" : "等待选择";
+  return ["**审批请求 · " + heading + "**", request.title, request.reason,
+    request.command ? "~~~\n" + request.command + "\n~~~" : undefined,
+  ].filter(Boolean).join("\n\n");
 }
 
 export function appendSteerMessage(state: TurnViewState, id: string, text: string, localImagePaths?: string[]): TurnViewState {
@@ -442,7 +481,7 @@ function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: st
       ...tracking,
       fullToolOutputs,
       fullToolErrors,
-      status: state.approval ? "waiting_for_approval" : "tool_running",
+      status: state.approval && !state.approval.automatic ? "waiting_for_approval" : "tool_running",
       activeTool: bounded,
       activities: activityUpdate.activities,
       activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
@@ -458,7 +497,7 @@ function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: st
       ...tracking,
       fullToolOutputs,
       fullToolErrors,
-      status: state.approval ? "waiting_for_approval" : activeTool ? "tool_running" : "running",
+      status: state.approval && !state.approval.automatic ? "waiting_for_approval" : activeTool ? "tool_running" : "running",
       activeTool,
       activities: activityUpdate.activities,
       activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,
@@ -473,7 +512,7 @@ function reduceToolUpdate(state: TurnViewState, tool: ToolState, fullOutput?: st
     ...tracking,
     fullToolOutputs,
     fullToolErrors,
-    status: state.approval ? "waiting_for_approval" : activeTool ? "tool_running" : "running",
+    status: state.approval && !state.approval.automatic ? "waiting_for_approval" : activeTool ? "tool_running" : "running",
     activeTool,
     activities: activityUpdate.activities,
     activitiesTruncated: state.activitiesTruncated || activityUpdate.truncated,

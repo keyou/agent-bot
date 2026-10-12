@@ -208,6 +208,52 @@ describe("LocalFileViewerServer", () => {
     } finally { abort.abort(); journal.close(); }
   });
 
+  test("keeps SSE open across plan approval and serves both turns from the same journal", async () => {
+    const directory = createTemporaryDirectory();
+    const journal = new TurnPreviewJournal(path.join(directory, "journal"));
+    const id = { sessionId: "s", turnId: "plan" };
+    journal.seed(createTurnViewState("s", "plan", Date.now(), undefined, undefined, undefined, "Original request"));
+    journal.event({ ...id, type: "turn_started", startedAt: Date.now() });
+    journal.event({ ...id, type: "progress", activityId: "commentary:plan-text", text: "The proposed plan" });
+    const request = { id: "r", title: "Review plan", reason: "Keep history", options: [{ id: "accept" as const, label: "Approve Plan" }] };
+    journal.event({ ...id, type: "approval_requested", request });
+    const server = new LocalFileViewerServer({ host: "127.0.0.1", port: 0, stateDirectory: directory,
+      previewJournal: journal, turnPreviewPollIntervalMs: 50,
+      getTurnSnapshot: (turnId) => turnId === "impl" ? { ...createTurnViewState("s", "impl", Date.now()), previewTurnId: "plan" } : undefined,
+    });
+    servers.push(server);
+    await server.start();
+    const abort = new AbortController();
+    try {
+      const url = server.createTurnPreviewUrl("plan")!;
+      const html = await (await fetch(url)).text();
+      const eventUrl = /data-events-url="([^"]+)"/u.exec(html)![1]!.replaceAll("&amp;", "&");
+      const events = createServerSentEventReader(await fetch(eventUrl, { signal: abort.signal }));
+      journal.event({ ...id, type: "approval_resolved", requestId: "r", decision: "accept" });
+      journal.flush();
+      const approved = JSON.parse(await events.next("patch"));
+      expect(approved.terminal).toBe(false);
+      expect(approved.content).toContain("用户选择");
+      expect(approved.content).toContain("Approve Plan");
+      expect(approved.content).not.toContain('data-preview-key="approval"');
+      journal.handoff("plan", "impl", Date.now());
+      journal.event({ sessionId: "s", turnId: "impl", type: "tool_updated", tool: { id: "test", title: "Test", command: "npm test",
+        kind: "command", status: "completed", output: "full result ".repeat(2000) } }, "plan");
+      journal.flush();
+      expect(JSON.parse(await events.next("patch"))).toMatchObject({ terminal: false });
+      const detailUrl = new URL(server.createTurnPreviewUrl("impl")!);
+      const latest = await (await fetch(detailUrl)).text();
+      expect(latest).toContain("The proposed plan");
+      expect(latest).toContain("Approve Plan");
+      detailUrl.searchParams.set("detail", "tool:test");
+      const detail = await (await fetch(detailUrl)).json() as { content: string };
+      expect(detail.content).toContain("full result ".repeat(2000).trim());
+      journal.event({ sessionId: "s", turnId: "impl", type: "turn_completed", finalResponse: "Implemented" }, "plan");
+      journal.flush();
+      expect(JSON.parse(await events.next("patch"))).toMatchObject({ terminal: true });
+    } finally { abort.abort(); journal.close(); }
+  });
+
   test("serves signed text previews with stable line anchors and raw content", async () => {
     const directory = createTemporaryDirectory();
     const filePath = path.join(directory, "example.ts");

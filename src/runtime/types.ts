@@ -34,6 +34,7 @@ export interface RuntimeGoalUpdate {
 export type RuntimePrompt = string | {
   text: string;
   localImagePaths?: string[];
+  collaborationMode?: "default";
 };
 
 export interface PlanStep {
@@ -60,6 +61,7 @@ export interface ToolState {
 export interface ApprovalRequest {
   id: string;
   kind?: "mode_change";
+  automatic?: boolean;
   title: string;
   command?: string;
   reason?: string;
@@ -108,8 +110,8 @@ export type AgentEvent =
   | { type: "tool_updated"; sessionId: string; turnId: string; tool: ToolState }
   | { type: "tool_output_delta"; sessionId: string; turnId: string; toolId: string; delta: string }
   | { type: "approval_requested"; sessionId: string; turnId: string; request: ApprovalRequest }
-  | { type: "approval_resolved"; sessionId: string; turnId: string; requestId: string; decision: ApprovalDecision }
-  | { type: "turn_completed"; sessionId: string; turnId: string; finalResponse: string; durationMs?: number }
+  | { type: "approval_resolved"; sessionId: string; turnId: string; requestId: string; decision: ApprovalDecision; automatic?: boolean }
+  | { type: "turn_completed"; sessionId: string; turnId: string; finalResponse: string; durationMs?: number; approvedPlan?: boolean }
   | { type: "turn_cancelled"; sessionId: string; turnId: string }
   | { type: "turn_failed"; sessionId: string; turnId: string; message: string };
 

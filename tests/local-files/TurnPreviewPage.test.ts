@@ -23,6 +23,22 @@ function state(tool?: Partial<ToolState>): TurnViewState {
 }
 
 describe("Turn Preview", () => {
+  test("shows automatic approval in live Preview without asking the user to respond", () => {
+    const id = { sessionId: "session", turnId: "turn" };
+    let input = reduceTurnEvent(state(), { ...id, type: "approval_requested", request: {
+      id: "auto-plan", kind: "mode_change", automatic: true, title: "Plan", reason: "Review and test",
+      options: [{ id: "accept", label: "Approve Plan" }],
+    } }, true);
+    expect(input.status).toBe("running");
+    const pending = renderTurnPreviewSnapshot(input, undefined, "en");
+    expect(pending.content).toContain("Auto mode: approving automatically.");
+    expect(pending.content).not.toContain("Approve or reject using");
+    input = reduceTurnEvent(input, { ...id, type: "approval_resolved", requestId: "auto-plan", decision: "accept", automatic: true }, true);
+    const resolved = renderTurnPreviewSnapshot(input);
+    expect(resolved.content).toContain("自动同意（auto）");
+    expect(resolved.content).toContain("Review and test");
+    expect(resolved.content).not.toContain("用户选择");
+  });
 
   test.each(["zh", "en"] as const)("adds accessible Markdown export icons only to final answers in %s", (language) => {
     const markdown = '\n# 报告 👋\r\n\r\n|a|b|\r\n|-|-|\r\n|1|2|\r\n\n[File](dir/file.md)\n<img src=x onerror="bad()">\n</section><script>alert(1)</script>\n';

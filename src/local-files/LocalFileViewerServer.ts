@@ -472,14 +472,16 @@ export class LocalFileViewerServer {
         return;
       }
       const journal = this.options.previewJournal;
-      const recorded = journal?.has(turnId);
+      const stored = journal?.has(turnId) ? undefined : this.options.getTurnSnapshot?.(turnId);
+      const journalId = isTurnPreviewState(stored) ? stored.previewTurnId ?? turnId : turnId;
+      const recorded = journal?.has(journalId);
       if (recorded && requestUrl.searchParams.get("events") === "1") {
-        this.serveJournalEvents(request, response, turnId, journal!);
+        this.serveJournalEvents(request, response, journalId, journal!);
         return;
       }
       const detailKey = requestUrl.searchParams.get("detail");
       let snapshot = recorded
-        ? journal!.load(turnId, detailKey ?? false)
+        ? journal!.load(journalId, detailKey ?? false)
         : this.options.getTurnSnapshot?.(turnId);
       if (!recorded && this.options.loadTurnSnapshot && request.method !== "HEAD"
         && requestUrl.searchParams.get("events") !== "1" && !requestUrl.searchParams.has("detail")) {
@@ -506,7 +508,7 @@ export class LocalFileViewerServer {
         const after = requestUrl.searchParams.get("detailAfter");
         const outputAppend = recorded && after && tool?.kind === "tool" && tool.tool.kind === "command" && !tool.tool.error
           && !/repl/i.test(tool.tool.title) && snapshot.previewCursor !== undefined
-          ? journal!.outputAppend(turnId, tool.id, Number(after), snapshot.previewCursor) : undefined;
+          ? journal!.outputAppend(journalId, tool.id, Number(after), snapshot.previewCursor) : undefined;
         const detail = outputAppend !== undefined && tool?.kind === "tool"
           && (snapshot.fullToolOutputs?.[tool.id]?.length ?? 0) > outputAppend.length
           ? { key, revision: String(tool.tool.previewRevision), content: "", outputAppend,

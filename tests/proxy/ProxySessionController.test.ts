@@ -1433,6 +1433,31 @@ describe("ProxySessionController", () => {
     });
   });
 
+  test("reattaches a live approved-plan continuation to its existing card after restart", async () => {
+    const { controller, runtime, remoteSessions, presenter, store } = fixture();
+    remoteSessions.push({ id: "thread", cwd: process.cwd(), source: "agent-bot", status: "active",
+      lastTurnId: "implementation", lastTurnStatus: "inProgress" });
+    store.getOrCreateUserContext("chat_id:c1", "codex");
+    store.createSession({ localSessionId: "session", contextKey: "chat_id:c1", agentName: "codex",
+      cwd: process.cwd(), status: "running" });
+    store.updateRuntimeSession("session", { runtimeKind: "codex", remoteSessionId: "thread",
+      lastTurnId: "implementation", lastTurnStatus: "running" });
+    store.saveTurnSnapshot("implementation", "session", {
+      sessionId: "session", turnId: "implementation", status: "running", startedAt: 1,
+      continuedFromTurnId: "plan", previewTurnId: "plan", segmentStartedAt: 2,
+      prompt: "original request", assistantText: "", plan: [], activities: [], completedTools: [], failedTools: [], fileSummary: [],
+    }, "chat_id:c1");
+    store.saveTurnDelivery("implementation", { progressMessageId: "original-card" });
+    store.createTurnAttempt({ attemptId: "attempt", localSessionId: "session", contextKey: "chat_id:c1",
+      promptText: "implement approved plan", turnId: "implementation", status: "running" });
+    await controller.recoverInterruptedTasks();
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(presenter.startPendingTurn).not.toHaveBeenCalled();
+    expect(presenter.interruptTurnForRecovery).not.toHaveBeenCalled();
+    expect(presenter.onEvent).toHaveBeenCalledWith({ type: "turn_started", sessionId: "session", turnId: "implementation", startedAt: 1 });
+    expect(store.getTurnDelivery("implementation")?.progressMessageId).toBe("original-card");
+  });
+
   test("retries transient LLM turn failures three times before making the task terminal", async () => {
     const { controller, runtime, sessions, outbound, presenter, store, listeners } = fixture();
     (outbound.addReaction as ReturnType<typeof vi.fn>)
@@ -9595,6 +9620,119 @@ describe("ProxySessionController", () => {
     expect(card).toContain(JSON.stringify({ type: "open_url", default_url: url }));
     expect(card.indexOf(">Refresh</font>")).toBeLessThan(card.indexOf(">Preview</font>"));
     if (status === "running") expect(card.indexOf(">Stop</font>")).toBeLessThan(card.indexOf(">Preview</font>"));
+  });
+
+  test("continues an approved plan in the original conversation before queued prompts", async () => {
+    const { controller, runtime, store, sessions, remoteSessions, listeners, presenter, outbound } = fixture();
+    vi.mocked(outbound.addReaction!).mockResolvedValue("reaction_on_it");
+    await controller.onMessage(message("implement the pagination"));
+    const task = store.listSessions("chat_id:c1")[0]!;
+    const attempt = store.findIncompleteTurnAttemptForSession(task.localSessionId)!;
+    store.updateTurnAttempt(attempt.attemptId, { replyMessageId: "topic-root" });
+    const emit = (event: RuntimeEvent) => { for (const listener of listeners) listener(event); };
+    let finishCard!: () => void;
+    vi.mocked(presenter.onEvent).mockImplementationOnce(() => new Promise<void>((resolve) => { finishCard = resolve; }));
+    sessions.get(task.localSessionId)!.activeTurnId = undefined;
+    Object.assign(remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+    const event = { type: "turn_completed", sessionId: task.localSessionId, turnId: "turn_1", finalResponse: "", approvedPlan: true } as const;
+    emit(event);
+    emit(event);
+    expect(store.getServerActivityState().runningSessions).toBe(1);
+    await controller.onMessage(message("also test the last page"));
+    expect(store.countQueuedPrompts(task.localSessionId)).toBe(1);
+    expect(runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
+    expect(store.getMessageReaction("m-implement the pagination")?.status).toBe("pending");
+    vi.mocked(runtime.startTurn).mockImplementationOnce(async (sessionId) => {
+      sessions.get(sessionId)!.activeTurnId = "turn_implementation";
+      Object.assign(remoteSessions[0]!, { status: "active", lastTurnId: "turn_implementation", lastTurnStatus: "inProgress" });
+      emit({ type: "turn_started", sessionId, turnId: "turn_implementation", startedAt: Date.now() });
+      return "turn_implementation";
+    });
+    finishCard();
+    await vi.waitFor(() => expect(store.getMessageReaction("m-implement the pagination")).toMatchObject({
+      status: "pending", turnId: "turn_implementation",
+    }));
+    expect(runtime.startTurn).toHaveBeenCalledTimes(2);
+    expect(runtime.startTurn).toHaveBeenLastCalledWith(task.localSessionId, {
+      text: expect.stringContaining("The proposed plan has been approved"), collaborationMode: "default",
+    });
+    expect(vi.mocked(runtime.startTurn).mock.calls.at(-1)?.[1]).toMatchObject({
+      text: expect.stringContaining("user explicitly requested discussion or planning only"),
+    });
+    expect(presenter.startPendingTurn).toHaveBeenLastCalledWith(
+      task.localSessionId, "chat_id:c1", expect.any(String),
+      { messageId: "topic-root", replyInThread: true }, "方案已确认，继续执行",
+    );
+    expect(store.getTurnAttempt(attempt.attemptId)?.status).toBe("completed");
+    expect(store.findIncompleteTurnAttemptForSession(task.localSessionId)).toMatchObject({
+      turnId: "turn_implementation", contextKey: "chat_id:c1", replyMessageId: "topic-root",
+    });
+    expect(store.countQueuedPrompts(task.localSessionId)).toBe(1);
+    sessions.get(task.localSessionId)!.activeTurnId = undefined;
+    Object.assign(remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+    emit({ type: "turn_completed", sessionId: task.localSessionId, turnId: "turn_implementation", finalResponse: "Done" });
+    await vi.waitFor(() => expect(runtime.startTurn).toHaveBeenCalledTimes(3));
+    expect(runtime.startTurn).toHaveBeenLastCalledWith(task.localSessionId, "also test the last page");
+  });
+
+  test.each(["stopped", "reset", "closed", "backend-continued", "start-failed"])(
+    "handles approved plan handoff when %s", async (scenario) => {
+      const { controller, runtime, store, sessions, remoteSessions, listeners, presenter, outbound } = fixture();
+      vi.mocked(outbound.addReaction!).mockResolvedValue("reaction_on_it");
+      await controller.onMessage(message("implement the plan"));
+      const task = store.listSessions("chat_id:c1")[0]!;
+      sessions.get(task.localSessionId)!.activeTurnId = undefined;
+      Object.assign(remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+      let finishCard!: () => void;
+      vi.mocked(presenter.onEvent).mockImplementationOnce(() => new Promise<void>((resolve) => { finishCard = resolve; }));
+      for (const listener of listeners) listener({
+        type: "turn_completed", sessionId: task.localSessionId, turnId: "turn_1", finalResponse: "", approvedPlan: true,
+      });
+      if (scenario === "stopped") await controller.onMessage(message("/stop"));
+      if (scenario === "reset") {
+        // A reset to different history changes the same local task's remote thread.
+        store.updateRuntimeSession(task.localSessionId, { remoteSessionId: "reset-thread" });
+      }
+      if (scenario === "closed") store.updateSession(task.localSessionId, { status: "closed" });
+      if (scenario === "backend-continued") {
+        sessions.get(task.localSessionId)!.activeTurnId = "backend-turn";
+        for (const listener of listeners) listener({
+          type: "turn_started", sessionId: task.localSessionId, turnId: "backend-turn", startedAt: Date.now(),
+        });
+      }
+      if (scenario === "start-failed") vi.mocked(runtime.startTurn).mockRejectedValueOnce(new Error("invalid model configuration"));
+      finishCard();
+      if (scenario === "backend-continued") {
+        await vi.waitFor(() => expect(store.getMessageReaction("m-implement the plan")?.turnId).toBe("backend-turn"));
+      } else {
+        await vi.waitFor(() => expect(store.getMessageReaction("m-implement the plan")?.status).not.toBe("pending"));
+      }
+      expect(runtime.startTurn).toHaveBeenCalledTimes(scenario === "start-failed" ? 2 : 1);
+      if (scenario === "start-failed") {
+        expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("后续执行启动失败"));
+      }
+    },
+  );
+
+  test("does not start implementation if Stop arrives while sending its pending card", async () => {
+    const { controller, runtime, store, sessions, remoteSessions, listeners, presenter } = fixture();
+    await controller.onMessage(message("implement the plan"));
+    const task = store.listSessions("chat_id:c1")[0]!;
+    sessions.get(task.localSessionId)!.activeTurnId = undefined;
+    Object.assign(remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+    let finishCard: (() => void) | undefined;
+    vi.mocked(presenter.startPendingTurn).mockImplementationOnce(() => new Promise<undefined>((resolve) => {
+      finishCard = () => resolve(undefined);
+    }));
+    for (const listener of listeners) listener({
+      type: "turn_completed", sessionId: task.localSessionId, turnId: "turn_1", finalResponse: "", approvedPlan: true,
+    });
+    await vi.waitFor(() => expect(finishCard).toBeDefined());
+    await controller.onMessage(message("/stop"));
+    finishCard!();
+    await vi.waitFor(() => expect(presenter.failPendingTurn).toHaveBeenCalled());
+    expect(runtime.startTurn).toHaveBeenCalledTimes(1);
   });
 
   test("uses the active Turn rather than a stale last Turn and refreshes Preview in place", async () => {

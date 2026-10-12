@@ -36,6 +36,11 @@ export interface TurnViewState {
   previewJournal?: boolean;
   /** Byte cursor for the on-demand preview, never needed for recovery. */
   previewCursor?: number;
+  /** Shared presentation journal across a plan/implementation handoff. */
+  previewTurnId?: string;
+  continuedFromTurnId?: string;
+  continuedToTurnId?: string;
+  segmentStartedAt?: number;
   sessionId: string;
   turnId: string;
   agentLabel?: string;

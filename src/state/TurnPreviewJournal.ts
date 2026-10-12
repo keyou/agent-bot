@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, type Hash } from "node:crypto";
 import type { AgentEvent, ToolState } from "../runtime/types.js";
-import { reduceTurnEvent } from "../presentation/TurnStateReducer.js";
+import { approvalActivityId, continueTurnView, reduceTurnEvent } from "../presentation/TurnStateReducer.js";
 import type { TurnViewState } from "../presentation/turnViewTypes.js";
 
 type TextChange = { key: string; field: string; append: boolean; text: string };
@@ -10,6 +10,7 @@ export type PreviewRecord =
   | { kind: "seed"; state: TurnViewState }
   | { kind: "state"; patch: Partial<TurnViewState> }
   | { kind: "user"; id: string; text: string; images?: string[] }
+  | { kind: "handoff"; turnId: string; startedAt: number }
   | { kind: "event"; event: AgentEvent; texts: TextChange[] };
 type Stream = { length: number; hash: Hash };
 type Writer = { seeded?: boolean; pending: string[]; bytes: number; dirtyDisk?: boolean; streams: Map<string, Stream>; timings: Map<string, number>; timer?: NodeJS.Timeout; error?: unknown };
@@ -29,9 +30,10 @@ export class TurnPreviewJournal {
   has(turnId: string): boolean { return this.writers.has(turnId) || fs.existsSync(this.file(turnId)); }
 
   seed(state: TurnViewState): void {
-    const writer = this.writer(state.turnId);
+    const turnId = state.previewTurnId ?? state.turnId;
+    const writer = this.writer(turnId);
     if (writer.seeded) return;
-    this.append(state.turnId, { kind: "seed", state: { ...state, previewJournal: true } });
+    this.append(turnId, { kind: "seed", state: { ...state, previewJournal: true } });
     writer.seeded = true;
     for (const change of seedTexts(state)) this.track(writer, change);
   }
@@ -42,15 +44,19 @@ export class TurnPreviewJournal {
     const { activities, reasoningItems, fullToolOutputs, fullToolErrors, toolStatuses,
       completedTools, failedTools, activeTool, assistantText, progressText, plan, fileSummary,
       activitiesTruncated, previewCursor, ...patch } = state;
-    this.append(state.turnId, { kind: "state", patch });
+    this.append(state.previewTurnId ?? state.turnId, { kind: "state", patch });
   }
 
   user(turnId: string, id: string, text: string, images?: string[]): void {
     this.append(turnId, { kind: "user", id, text, images });
   }
 
-  event(event: AgentEvent): void {
-    const writer = this.writer(event.turnId);
+  handoff(journalId: string, turnId: string, startedAt: number): void {
+    this.append(journalId, { kind: "handoff", turnId, startedAt });
+  }
+
+  event(event: AgentEvent, journalId = event.turnId): void {
+    const writer = this.writer(journalId);
     const texts: TextChange[] = [];
     const copy = { ...event } as AgentEvent;
     const capture = (key: string, field: string, text: string, append = false) => {
@@ -96,7 +102,7 @@ export class TurnPreviewJournal {
         });
       }
     }
-    this.append(event.turnId, { kind: "event", event: copy, texts });
+    this.append(journalId, { kind: "event", event: copy, texts });
   }
 
   flush(turnId?: string, durable = false): void {
@@ -320,6 +326,10 @@ export class TurnPreviewProjection {
       return;
     }
     if (!this.state) return;
+    if (record.kind === "handoff") {
+      this.state = continueTurnView(this.state, record.turnId, record.startedAt);
+      return;
+    }
     if (record.kind === "state") {
       this.state = { ...this.state, ...record.patch, historyDetail: "full", previewJournal: true };
       return;
@@ -376,6 +386,8 @@ export class TurnPreviewProjection {
     if (event.type === "context_compaction") {
       for (const a of this.state.activities) if (!old.activities.includes(a)) this.changed.add(a.id);
     }
+    if (event.type === "approval_resolved") this.changed.add(approvalActivityId(event.turnId, event.requestId));
+    if (old.approval && !this.state.approval) this.changed.add(approvalActivityId(event.turnId, old.approval.id));
     if (this.details !== true && this.state.reasoningItems) this.state.reasoningItems = this.state.reasoningItems.map((r) => ({ ...r,
       summary: r.summary.map((t) => this.wantsFull(`reasoning:${r.itemId}:`) ? t : t.slice(0, 6000)), content: r.content.map((t) => this.wantsFull(`reasoning:${r.itemId}:`) ? t : t.slice(0, 6000)) }));
     this.state.activitiesTruncated = false;

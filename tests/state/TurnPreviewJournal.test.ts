@@ -49,6 +49,28 @@ test("uses a single hash-sharded path and creates only the required buckets on w
   expect(entries).toHaveLength(new Set(ids.map((id) => path.basename(path.dirname(journal.file(id))))).size);
 });
 
+test("preserves complete approval requests and ignores unrelated or duplicate decisions", () => {
+  const journal = setup();
+  const request = { id: "request", title: "Review", reason: "Detailed reason\n".repeat(1_000),
+    command: "long command\n".repeat(1_000), options: [{ id: "accept" as const, label: "Approve Plan" }] };
+  journal.event({ ...identity, type: "approval_requested", request });
+  journal.event({ ...identity, type: "approval_resolved", requestId: "unrelated", decision: "decline" });
+  let state = journal.load("t")!;
+  let record = state.activities.find((a) => a.id === "approval:t:request");
+  expect(record).toMatchObject({ text: expect.stringContaining("等待选择") });
+  journal.event({ ...identity, type: "approval_resolved", requestId: request.id, decision: "accept" });
+  journal.event({ ...identity, type: "approval_resolved", requestId: request.id, decision: "decline" });
+  journal.handoff("t", "next", 2_000);
+  state = journal.load("t")!;
+  record = state.activities.find((a) => a.id === "approval:t:request");
+  expect(record).toMatchObject({ text: expect.stringContaining("Approve Plan") });
+  if (!record || record.kind === "tool") throw new Error("Expected approval history");
+  expect(record.text).toContain(request.reason);
+  expect(record.text).toContain(request.command);
+  expect(state).toMatchObject({ turnId: "next", previewTurnId: "t", status: "running" });
+  expect(journal.has("next")).toBe(false);
+});
+
 test("writes 1 MiB of chunked output linearly, including repeated cumulative values", () => {
   const journal = setup();
   const delta = "x".repeat(8192);
