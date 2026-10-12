@@ -10,6 +10,7 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### 中文
 
+- 修复 node-pty 预编译包缺少执行权限导致的 macOS 终端启动失败；限制 Windows CI 测试并发，避免磁盘争用引起的超时。
 - 命令卡片新增独立网页终端，支持连续输入、ANSI 颜色、调整尺寸、复制粘贴与断线重连。终端与 Preview 共用地址，在原会话/话题核对验证码并由所有者授权，以主机用户权限运行，不重放原命令；原始 HTML/SVG/XML 保持沙箱隔离。
 - 终端管理卡支持打开、恢复、关闭和刷新；使用稳定的 8 位链接标识，丢失页面后可重新授权恢复原 Shell。支持手机授权后自动恢复连接，避免历史回放产生多余输入。断开三分钟、后台无输入输出三十分钟或总时长八小时后回收；安全重启等待活动终端关闭。
 - 支持运行中预选 Provider 和模型，本轮结束后应用最后选择，待生效设置跨重启保留。切换始终保留任务 ID 和完整历史，不隐式 Fork 或替换空任务；切换失败验证回退，无法确认恢复时暂停后续消息并明确提示。设置入口不再被故障的旧 Provider 阻塞，修复默认配置并发保存、恢复/重连校验及认证失败误重试。
@@ -21,6 +22,7 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### English
 
+- Restore missing executable permissions on node-pty's macOS helper before opening a terminal; limit Windows CI test concurrency to avoid disk-contention timeouts.
 - Add independent browser terminals to command cards, with continuous input, ANSI colors, resizing, clipboard support and reconnects. Share Preview addressing, require owner approval of a matching code in the original conversation/topic, and run as the host user without replaying the original command. Keep raw HTML/SVG/XML documents sandboxed.
 - Add terminal management cards for opening, recovering, closing and refreshing the same Shell through stable eight-character links and fresh recovery approval. Recover after mobile authorization and network interruptions without replay-generated input. Reclaim terminals after three disconnected minutes, thirty minutes of background I/O inactivity, or eight hours total; safe restart waits for active terminals.
 - Stage Provider/model choices during active turns and apply the latest selection afterward, preserving pending settings across restarts. Keep task IDs and complete history without implicit forks or empty-thread replacement. Verify rollback on failure and pause further messages if recovery cannot be confirmed. Keep settings accessible with a broken old Provider; fix concurrent defaults persistence, resume/reconnect verification and retries of permanent authentication failures.
