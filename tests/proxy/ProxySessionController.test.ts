@@ -3863,6 +3863,169 @@ describe("ProxySessionController", () => {
     expect(store.getMessageReaction("om_image_instruction")).toMatchObject({ turnId: "turn_1" });
   });
 
+  test.each([false, true])("uses the attached instruction as the main Prompt for a rich-text forward (images: %s)", async (withImages) => {
+    const { controller, runtime, outbound, presenter, store } = fixture();
+    vi.mocked(outbound.addReaction!).mockImplementation(async (id) => "reaction-" + id);
+    const sourceText = "反馈内容: https://example.com/issue\n日志 ID: test-log";
+    const instruction = "排查下这个问题，为什么点击没有进入详情页";
+    const source: IncomingMessage = {
+      messageId: "om_forwarded_post",
+      messageType: "post",
+      contextKey: "chat_id:c1",
+      chatType: "p2p",
+      userId: "ou_owner",
+      text: sourceText,
+      ...(withImages ? { images: [{ imageKey: "img_forwarded_post" }] } : {}),
+    };
+
+    const processing = controller.onMessage(source);
+    // Include an attachment arriving after the old 800 ms window.
+    await new Promise((resolve) => setTimeout(resolve, withImages ? 1_000 : 20));
+    await Promise.all([processing, controller.onMessage({
+      messageId: "om_post_instruction",
+      contextKey: source.contextKey,
+      chatType: "p2p",
+      userId: source.userId,
+      parentMessageId: source.messageId,
+      text: instruction,
+    })]);
+
+    const prompt = instruction + "\n\n引用消息：\n" + sourceText;
+    const images = withImages ? [path.join(process.cwd(), "img_forwarded_post.png")] : undefined;
+    expect(runtime.createSession).toHaveBeenCalledOnce();
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(
+      expect.any(String), images ? { text: prompt, localImagePaths: images } : prompt,
+    );
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
+    expect(outbound.readReferencedMessage).not.toHaveBeenCalled();
+    expect(outbound.downloadImage).toHaveBeenCalledTimes(withImages ? 1 : 0);
+    if (withImages) expect(outbound.downloadImage).toHaveBeenCalledWith(source.messageId, "img_forwarded_post");
+    expect(presenter.startPendingTurn).toHaveBeenCalledWith(
+      expect.any(String), source.contextKey, instruction, undefined, instruction, ...(images ? [images] : []),
+    );
+    expect(store.listSessions(source.contextKey)[0]).toMatchObject({ title: instruction });
+    expect(store.getMessageReaction(source.messageId)).toMatchObject({ turnId: "turn_1" });
+    expect(store.getMessageReaction("om_post_instruction")).toMatchObject({ turnId: "turn_1" });
+  });
+
+  test("keeps a reserved forward instruction while its Reaction is still pending", async () => {
+    const { controller, runtime, outbound } = fixture();
+    let acknowledge!: () => void;
+    const reaction = new Promise<string>((resolve) => { acknowledge = () => resolve("reaction_slow"); });
+    vi.mocked(outbound.addReaction!).mockImplementation(async (id) =>
+      id === "om_slow_instruction" ? reaction : "reaction_source");
+    const processing = controller.onMessage({
+      messageId: "om_slow_forward",
+      contextKey: "chat_id:c1",
+      userId: "ou_owner",
+      text: "",
+      images: [{ imageKey: "img_slow" }],
+    });
+    const attachment = controller.onMessage({
+      messageId: "om_slow_instruction",
+      contextKey: "chat_id:c1",
+      userId: "ou_owner",
+      parentMessageId: "om_slow_forward",
+      text: "分析图片",
+    });
+    let submittedBeforeAcknowledgement = false;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1_800));
+      submittedBeforeAcknowledgement = vi.mocked(runtime.startTurn).mock.calls.length > 0;
+    } finally {
+      acknowledge();
+      await Promise.all([processing, attachment]);
+    }
+
+    expect(submittedBeforeAcknowledgement).toBe(false);
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(expect.any(String), {
+      text: "分析图片", localImagePaths: [path.join(process.cwd(), "img_slow.png")],
+    });
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
+  });
+
+  test("preserves both rich-text resources and the attachment's own images and files", async () => {
+    const { controller, runtime, outbound } = fixture();
+    const sourceText = "Code: <p>keep this literally</p> &amp;\n  indented";
+    const processing = controller.onMessage({
+      messageId: "om_post_resources", messageType: "post", contextKey: "chat_id:c1",
+      text: sourceText, images: [{ imageKey: "img_source" }],
+      files: [{ fileKey: "file_source", fileName: "source.log" }],
+    });
+    await Promise.all([processing, controller.onMessage({
+      messageId: "om_post_more_resources", contextKey: "chat_id:c1", parentMessageId: "om_post_resources",
+      text: "请对比", images: [{ imageKey: "img_attachment" }],
+      files: [{ fileKey: "file_attachment", fileName: "attachment.log" }],
+    })]);
+
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(expect.any(String), {
+      text: "请对比\n\n引用消息：\n" + sourceText + "\n\n参考文件（已下载到本地）：\n"
+        + "[文件 1：source.log] " + path.join(process.cwd(), "source.log") + "\n"
+        + "[文件 2：attachment.log] " + path.join(process.cwd(), "attachment.log"),
+      localImagePaths: [path.join(process.cwd(), "img_source.png"), path.join(process.cwd(), "img_attachment.png")],
+    });
+    expect(outbound.downloadImage).toHaveBeenCalledTimes(2);
+    expect(outbound.downloadFile).toHaveBeenCalledTimes(2);
+    expect(outbound.downloadFile).toHaveBeenCalledWith("om_post_resources", "file_source", "source.log");
+    expect(outbound.downloadFile).toHaveBeenCalledWith("om_post_more_resources", "file_attachment", "attachment.log");
+  });
+
+  test("submits a standalone rich-text message unchanged and treats a later reply as steering", async () => {
+    const { controller, runtime, outbound, presenter } = fixture();
+    const original = "请检查 https://example.com";
+    await controller.onMessage({
+      messageId: "om_post_standalone", messageType: "post", contextKey: "chat_id:c1",
+      text: original, images: [{ imageKey: "img_standalone" }],
+    });
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(expect.any(String), {
+      text: original, localImagePaths: [path.join(process.cwd(), "img_standalone.png")],
+    });
+    await controller.onMessage({
+      messageId: "om_later_reply", contextKey: "chat_id:c1", parentMessageId: "om_post_standalone",
+      text: "再看看别的地方",
+    });
+    expect(runtime.startTurn).toHaveBeenCalledOnce();
+    expect(runtime.steerTurn).toHaveBeenCalledOnce();
+    expect(presenter.appendSteerMessage).toHaveBeenCalled();
+    expect(outbound.readReferencedMessage).toHaveBeenCalledWith("om_post_standalone");
+  });
+
+  test.each([
+    { name: "a different sender", reply: { userId: "ou_other" } },
+    { name: "a different context", reply: { contextKey: "chat_id:c2" } },
+    { name: "a different parent", reply: { parentMessageId: "om_unrelated" } },
+    { name: "a slash command", reply: { text: "/help" } },
+    { name: "a shell command", reply: { text: "!echo ok" } },
+  ])("does not coalesce $name into a pending forward", async ({ reply }) => {
+    const { controller, runtime, store } = fixture();
+    const processing = controller.onMessage({
+      messageId: "om_source_guard", messageType: "post", contextKey: "chat_id:c1",
+      userId: "ou_owner", text: "original reference",
+    });
+    await Promise.all([processing, controller.onMessage({
+      messageId: "om_guard_reply", contextKey: "chat_id:c1", parentMessageId: "om_source_guard",
+      userId: "ou_owner", text: "separate request", ...reply,
+    })]);
+    const prompts = [
+      ...vi.mocked(runtime.startTurn).mock.calls.map((call) => call[1]),
+      ...vi.mocked(runtime.steerTurn).mock.calls.map((call) => call[2]),
+    ];
+    expect(prompts).toContain("original reference");
+    expect(store.findTurnAnchorByMessageId("om_source_guard")).toBeDefined();
+  });
+
+  test("keeps a plain-text prompt immediate and does not wait on a rich-text command or quote", async () => {
+    const { controller, runtime, outbound } = fixture();
+    const delay = vi.spyOn(globalThis, "setTimeout");
+    await controller.onMessage({ ...message("hello"), messageType: "text" });
+    await controller.onMessage({ ...message("/help"), messageType: "post" });
+    await controller.onMessage({ ...message("question"), messageType: "post", parentMessageId: "om_quote" });
+    expect(runtime.startTurn).toHaveBeenCalledOnce();
+    expect(runtime.steerTurn).toHaveBeenCalledOnce();
+    expect(outbound.readReferencedMessage).toHaveBeenCalledWith("om_quote");
+    expect(delay.mock.calls.some((call) => call[1] === 1_500)).toBe(false);
+  });
+
   test("combines a forwarded file and its attached instruction into one Agent turn", async () => {
     const { controller, runtime, outbound, presenter, store } = fixture();
     vi.mocked(outbound.addReaction!).mockImplementation(async (messageId) => `reaction-${messageId}`);

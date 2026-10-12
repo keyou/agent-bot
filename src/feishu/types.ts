@@ -7,6 +7,7 @@ export type { MergedForwardContent, ReferencedMessageContent } from "./MergedFor
 
 export interface IncomingMessage {
   messageId: string;
+  messageType?: string;
   createdAt?: number;
   contextKey: string;
   chatId?: string;

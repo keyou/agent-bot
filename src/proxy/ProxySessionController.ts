@@ -123,6 +123,7 @@ interface StartTurnOptions {
 
 interface PendingForwardAttachment {
   contextKey: string;
+  userId?: string;
   attachmentMessageId?: string;
   attachmentPromise: Promise<IncomingMessage | undefined>;
   resolveAttachment: (message: IncomingMessage | undefined) => void;
@@ -200,7 +201,7 @@ const RECOVERY_HEARTBEAT_INTERVAL_MS = 60 * 1_000;
 const SHELL_COMMAND_JOB_POLL_INTERVAL_MS = 1_000;
 const SHELL_COMMAND_JOB_RELAUNCH_DELAY_MS = 5_000;
 const APP_SERVER_RELEASE_POLL_INTERVAL_MS = 500;
-const FORWARD_ATTACHMENT_WINDOW_MS = 800;
+const FORWARD_ATTACHMENT_WINDOW_MS = 1_500;
 const DEFAULT_MERGED_FORWARD_INSTRUCTION = "请参考以下内容回复用户";
 const DEFAULT_REFERENCED_MESSAGE_INSTRUCTION = "请参考引用消息回复用户";
 const TURN_STOP_REQUESTED_MESSAGE = "已发送停止信号，任务会自动停止。";
@@ -642,7 +643,7 @@ export class ProxySessionController {
     const pendingMergedForward = message.mergedForwardMessageId
       ? this.registerPendingForwardAttachment(message, this.pendingMergedForwards)
       : undefined;
-    const pendingResourceForward = !attachmentReservation && isStandaloneResourceMessage(message)
+    const pendingResourceForward = !attachmentReservation && isForwardAttachmentSource(message)
       ? this.registerPendingForwardAttachment(message, this.pendingResourceForwards)
       : undefined;
     try {
@@ -692,7 +693,9 @@ export class ProxySessionController {
       );
       if (attachment) {
         coalescedForwardAttachment = true;
-        const instruction = normalizeFeishuPostText(attachment.text) || defaultResourcePrompt(resourceMessage);
+        const sourceText = resourceMessage.text.trim();
+        const instruction = normalizeFeishuPostText(attachment.text)
+          || (sourceText ? DEFAULT_REFERENCED_MESSAGE_INSTRUCTION : defaultResourcePrompt(resourceMessage));
         forwardedImages = (resourceMessage.images ?? []).map((image) => ({
           messageId: resourceMessage.messageId,
           imageKey: image.imageKey,
@@ -704,7 +707,7 @@ export class ProxySessionController {
         }));
         message = {
           ...attachment,
-          text: instruction,
+          text: sourceText ? referencedMessagePrompt(instruction, sourceText) : instruction,
           displayText: instruction,
         };
         this.relatedReactionMessageIds.set(message.messageId, [resourceMessage.messageId]);
@@ -5037,6 +5040,7 @@ export class ProxySessionController {
     });
     const pending = {
       contextKey: message.contextKey,
+      userId: message.userId,
       attachmentPromise,
       resolveAttachment,
     };
@@ -5045,14 +5049,15 @@ export class ProxySessionController {
   }
 
   private reserveForwardAttachment(message: IncomingMessage): ForwardAttachmentReservation | undefined {
-    if (!message.parentMessageId) return undefined;
+    if (!message.parentMessageId || isCommandMessage(message)) return undefined;
     const candidates = [
       { sourceKind: "merged_forward" as const, registry: this.pendingMergedForwards },
       { sourceKind: "resource" as const, registry: this.pendingResourceForwards },
     ];
     for (const candidate of candidates) {
       const pending = candidate.registry.get(message.parentMessageId);
-      if (!pending || pending.contextKey !== message.contextKey || pending.attachmentMessageId) continue;
+      if (!pending || pending.contextKey !== message.contextKey
+        || pending.userId !== message.userId || pending.attachmentMessageId) continue;
       pending.attachmentMessageId = message.messageId;
       return {
         sourceMessageId: message.parentMessageId,
@@ -5081,15 +5086,17 @@ export class ProxySessionController {
     pending: PendingForwardAttachment,
     registry: Map<string, PendingForwardAttachment>,
   ): Promise<IncomingMessage | undefined> {
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<undefined>((resolve) => {
-      timer = setTimeout(() => resolve(undefined), FORWARD_ATTACHMENT_WINDOW_MS);
-      timer.unref?.();
-    });
+    const timer = setTimeout(() => {
+      // Arrival reserves the pair before acknowledgement. A slow Reaction must not split it.
+      if (pending.attachmentMessageId) return;
+      if (registry.get(messageId) === pending) registry.delete(messageId);
+      pending.resolveAttachment(undefined);
+    }, FORWARD_ATTACHMENT_WINDOW_MS);
+    timer.unref?.();
     try {
-      return await Promise.race([pending.attachmentPromise, timeout]);
+      return await pending.attachmentPromise;
     } finally {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       if (registry.get(messageId) === pending) {
         registry.delete(messageId);
       }
@@ -9615,10 +9622,18 @@ function defaultResourcePromptFromCounts(imageCount: number, fileCount: number):
   return imageCount === 1 ? "请查看这张图片" : "请查看这些图片";
 }
 
-function isStandaloneResourceMessage(message: IncomingMessage): boolean {
+function isCommandMessage(message: IncomingMessage): boolean {
+  const text = normalizeFeishuPostText(message.text).trimStart();
+  return text.startsWith("/") || text.startsWith("!");
+}
+
+function isForwardAttachmentSource(message: IncomingMessage): boolean {
   return !message.mergedForwardMessageId
-    && message.text.trim().length === 0
-    && ((message.images?.length ?? 0) > 0 || (message.files?.length ?? 0) > 0);
+    && !message.parentMessageId
+    && !message.contextKey.startsWith("console:")
+    && !isCommandMessage(message)
+    && (message.messageType === "post"
+      || (message.images?.length ?? 0) > 0 || (message.files?.length ?? 0) > 0);
 }
 
 function deduplicateImageReferences(

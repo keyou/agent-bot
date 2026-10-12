@@ -262,6 +262,7 @@ function toIncomingMessage(
   const messageId = message.message_id ?? `${Date.now()}`;
   return {
     messageId,
+    ...(typeof messageType === "string" ? { messageType } : {}),
     ...(Number.isFinite(Number(message.create_time)) && Number(message.create_time) > 0
       ? { createdAt: Number(message.create_time) } : {}),
     contextKey: chatId
