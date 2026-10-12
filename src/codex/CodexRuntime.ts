@@ -666,14 +666,48 @@ export class CodexRuntime implements AgentRuntime {
     });
   }
 
-  async archiveRemoteSession(remoteSessionId: string): Promise<void> {
-    await (await this.client()).request(
-      "thread/archive",
-      { threadId: remoteSessionId },
-      CONTROL_REQUEST_TIMEOUT_MS,
-    );
+  async archiveRemoteSession(remoteSessionId: string, options: { allowUnmaterialized?: boolean } = {}): Promise<void> {
+    const client = await this.client();
+    try {
+      await client.request("thread/archive", { threadId: remoteSessionId }, CONTROL_REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      if (!options.allowUnmaterialized || !(error instanceof AppServerRequestError)
+        || error.method !== "thread/archive" || error.code !== -32600
+        || error.serverMessage !== `no rollout found for thread id ${remoteSessionId}`
+        || !await this.isUnmaterializedThread(client, remoteSessionId)) throw error;
+      // Codex has nothing to move to its archive before the first user message.
+      const result = await client.request<{ status: string }>(
+        "thread/unsubscribe", { threadId: remoteSessionId }, CONTROL_REQUEST_TIMEOUT_MS,
+      );
+      if (!["unsubscribed", "notLoaded", "notSubscribed"].includes(result.status)) {
+        throw new Error(`Cannot release empty App Server task: ${result.status}`);
+      }
+      this.logger.info({ remoteSessionId }, "Released an empty App Server task without a materialized rollout.");
+    }
     for (const [localSessionId, session] of this.sessions) {
       if (session.remoteSessionId === remoteSessionId) this.sessions.delete(localSessionId);
+    }
+  }
+
+  private async isUnmaterializedThread(client: AppServerClient, remoteSessionId: string): Promise<boolean> {
+    const { thread } = await client.request<ThreadReadResponse>(
+      "thread/read", { threadId: remoteSessionId, includeTurns: false }, CONTROL_REQUEST_TIMEOUT_MS,
+    );
+    if (thread.id !== remoteSessionId || thread.preview !== "" || thread.forkedFromId !== null
+      || !["idle", "notLoaded"].includes(thread.status?.type ?? "") || !thread.path
+      || (thread.turns?.length ?? 0) > 0) return false;
+    for (const session of this.sessions.values()) {
+      if (session.remoteSessionId === remoteSessionId && (session.activeTurnId
+        || session.knownTurnIds.size > 0 || (session.turnCount ?? 0) > 0)) return false;
+    }
+    const active = await this.localActivityDetector?.activeThreads([remoteSessionId]);
+    if (active?.has(remoteSessionId)) return false;
+    try {
+      statSync(thread.path);
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
     }
   }
 

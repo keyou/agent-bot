@@ -18,6 +18,23 @@ afterEach(() => {
 });
 
 describe("StateStore runtime metadata", () => {
+  test("remembers even failed turn attempts when checking whether a task is pristine", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-empty-task-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "state.sqlite");
+    const first = new StateStore(file);
+    first.createSession({ localSessionId: "s", contextKey: "c", agentName: "codex", cwd: directory, status: "ready" });
+    expect(first.hasTurnAttemptsForSession("s")).toBe(false);
+    first.createTurnAttempt({ attemptId: "a", localSessionId: "s", contextKey: "c", promptText: "hello" });
+    first.updateTurnAttempt("a", { status: "failed" });
+    first.close();
+    const second = new StateStore(file);
+    stores.push(second);
+    expect(second.findIncompleteTurnAttemptForSession("s")).toBeUndefined();
+    expect(second.hasTurnAttemptsForSession("s")).toBe(true);
+    expect(second.hasTurnAttemptsForSession("other")).toBe(false);
+  });
+
   test("persists pending Provider settings separately and removes them on archive", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-pending-settings-"));
     tempDirectories.push(directory);

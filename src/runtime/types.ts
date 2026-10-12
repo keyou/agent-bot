@@ -305,7 +305,7 @@ export interface AgentRuntime {
   steerTurn(sessionId: string, turnId: string, prompt: RuntimePrompt): Promise<void>;
   cancelTurn(sessionId: string, turnId: string): Promise<void>;
   interruptRemoteTurn?(remoteSessionId: string, turnId: string): Promise<void>;
-  archiveRemoteSession?(remoteSessionId: string): Promise<void>;
+  archiveRemoteSession?(remoteSessionId: string, options?: { allowUnmaterialized?: boolean }): Promise<void>;
   closeSession(sessionId: string): Promise<void>;
   setTitle?(sessionId: string, title: string): Promise<void>;
   getGoal?(sessionId: string): Promise<RuntimeGoal | undefined>;

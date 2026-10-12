@@ -715,6 +715,11 @@ export class StateStore {
     return row ? mapTurnAttempt(row) : undefined;
   }
 
+  hasTurnAttemptsForSession(localSessionId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM turn_attempts WHERE local_session_id = ? LIMIT 1")
+      .get(localSessionId));
+  }
+
   findIncompleteTurnAttemptForSession(localSessionId: string): TurnAttemptRecord | undefined {
     const row = this.db.prepare(`
       SELECT * FROM turn_attempts

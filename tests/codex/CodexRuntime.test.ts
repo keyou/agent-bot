@@ -564,6 +564,76 @@ describe("CodexRuntime", () => {
     expect(runtime.getSession("archive-local")).toBeUndefined();
   });
 
+  test.each([false, true])("releases an explicitly known empty task without a materialized rollout (loaded=%s)", async (loaded) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-archive-empty-"));
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    try {
+      if (loaded) {
+        client.startResult = { thread: { id: "empty" }, model: "gpt-test", reasoningEffort: "medium" };
+        await runtime.createSession({ localSessionId: "local", agentName: "codex", cwd: home, permissionMode: "auto" });
+        client.requests = [];
+      }
+      client.readResult = { thread: {
+        id: "empty", preview: "", forkedFromId: null, status: { type: "notLoaded" },
+        path: path.join(home, "missing.jsonl"),
+      } };
+      client.archiveErrors.push(new AppServerRequestError("thread/archive", -32600, "no rollout found for thread id empty"));
+      // The controller's persisted empty-task evidence must also work after a service restart.
+      await runtime.archiveRemoteSession("empty", { allowUnmaterialized: true });
+      expect(client.requests.map((request) => request.method)).toEqual([
+        "thread/archive", "thread/read", "thread/unsubscribe",
+      ]);
+      expect(client.requests).toContainEqual({ method: "thread/read", params: { threadId: "empty", includeTurns: false } });
+      expect(runtime.getSession("local")).toBeUndefined();
+    } finally {
+      runtime.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    "no opt-in", "timeout", "permission", "fork", "history", "active", "unknown status",
+    "unknown origin", "existing rollout", "recorded turn", "unsubscribe failure", "unsubscribe unknown",
+  ])("refuses the empty-archive fallback for %s", async (scenario) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-archive-guard-"));
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    try {
+      const file = path.join(home, "rollout.jsonl");
+      client.startResult = { thread: { id: "thr_1" }, model: "gpt-test", reasoningEffort: "medium" };
+      await runtime.createSession({ localSessionId: "local", agentName: "codex", cwd: home, permissionMode: "auto" });
+      if (scenario === "recorded turn") {
+        const turnId = await runtime.startTurn("local", "a real prompt");
+        client.emit("turn/completed", { threadId: "thr_1", turn: { id: turnId, status: "completed" } });
+      }
+      client.requests = [];
+      client.readResult = { thread: {
+        id: "thr_1", preview: scenario === "history" ? "previous prompt" : "",
+        forkedFromId: scenario === "fork" ? "parent" : scenario === "unknown origin" ? undefined : null,
+        status: { type: scenario === "active" ? "active" : scenario === "unknown status" ? undefined : "notLoaded" },
+        path: file,
+      } };
+      if (scenario === "existing rollout") fs.writeFileSync(file, "historical content");
+      const error = scenario === "timeout" ? new Error("App Server request timed out: thread/archive")
+        : new AppServerRequestError("thread/archive", -32600,
+          scenario === "permission" ? "permission denied" : "no rollout found for thread id thr_1");
+      client.archiveErrors.push(error);
+      if (scenario === "unsubscribe failure") client.unsubscribeErrors.push(new Error("unsubscribe failed"));
+      if (scenario === "unsubscribe unknown") client.unsubscribeResult = { status: "busy" };
+      await expect(runtime.archiveRemoteSession("thr_1", { allowUnmaterialized: scenario !== "no opt-in" })).rejects.toThrow();
+      expect(runtime.getSession("local")).toBeDefined();
+      if (!scenario.startsWith("unsubscribe")) {
+        expect(client.requests.some((request) => request.method === "thread/unsubscribe")).toBe(false);
+      }
+      expect(client.requests.some((request) => ["thread/turns/list", "turn/start", "thread/resume", "thread/fork"].includes(request.method))).toBe(false);
+      if (scenario === "existing rollout") expect(fs.readFileSync(file, "utf8")).toBe("historical content");
+    } finally {
+      runtime.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("releases the shared App Server only when idle unless forced", async () => {
     const client = new FakeAppServerClient();
     const release = vi.fn(async () => undefined);
@@ -3089,6 +3159,7 @@ class FakeAppServerClient {
   resumeResults: unknown[] = [];
   unsubscribeResult: unknown = { status: "unsubscribed" };
   unsubscribeErrors: Error[] = [];
+  archiveErrors: Error[] = [];
   forkResult: unknown = { thread: { id: "thr_forked", turns: [] }, model: "gpt-test", reasoningEffort: "medium" };
   forkErrors: Error[] = [];
   readResult: unknown = { thread: { id: "thr_1", name: null, preview: "" } };
@@ -3127,6 +3198,11 @@ class FakeAppServerClient {
       return {} as T;
     }
     if (method === "thread/start") return this.startResult as T;
+    if (method === "thread/archive") {
+      const error = this.archiveErrors.shift();
+      if (error) throw error;
+      return {} as T;
+    }
     if (method === "thread/resume") {
       const result = this.resumeResults.shift() ?? this.resumeResult;
       if (result instanceof Error) throw result;

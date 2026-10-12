@@ -8334,7 +8334,7 @@ describe("ProxySessionController", () => {
       },
     });
 
-    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith("archive_remote");
+    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith("archive_remote", { allowUnmaterialized: true });
     expect(store.getSession("archive_local")?.status).toBe("closed");
     expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBeUndefined();
     expect(outbound.sendText).toHaveBeenCalledWith(
@@ -8371,7 +8371,7 @@ describe("ProxySessionController", () => {
 
     await controller.onMessage(message("/archive"));
 
-    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith("archive_command_remote");
+    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith("archive_command_remote", { allowUnmaterialized: true });
     expect(store.getSession("archive_command_local")?.status).toBe("closed");
     expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBeUndefined();
     expect(outbound.sendText).toHaveBeenCalledWith(
@@ -8430,11 +8430,83 @@ describe("ProxySessionController", () => {
       },
     });
 
-    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith("dismiss_remote");
+    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith("dismiss_remote", { allowUnmaterialized: true });
     expect(outbound.deleteGroup).toHaveBeenCalledWith("oc_dismiss");
     expect(store.getSession("dismiss_local")?.status).toBe("closed");
     expect(store.getChatContext(contextKey)).toBeUndefined();
     expect(store.getUserContext(contextKey)).toBeUndefined();
+  });
+
+  test("dismisses a new projectless group without requiring a source rollout", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage({ ...message("/newgroup doubaocli --nodir"), userId: "ou_owner" });
+    const contextKey = "chat_id:oc_new_group";
+    const localSessionId = store.getUserContext(contextKey)!.currentSessionId!;
+    const task = store.getSession(localSessionId)!;
+    vi.mocked(runtime.readRemoteSession!).mockImplementation(async (id, view) => {
+      if (view !== "metadata") throw new Error("thread/turns/list failed: missing source rollout");
+      return { id, title: "doubaocli", cwd: task.cwd, source: "appServer", status: "idle" };
+    });
+    await controller.onMessage({ ...groupMessage("oc_new_group", "/dis"), userId: "ou_owner" });
+    expect(outbound.deleteGroup).not.toHaveBeenCalled();
+    await controller.onCardAction({
+      actionId: "dismiss-empty-confirm", contextKey, userId: "ou_owner", messageId: "empty-confirm-card",
+      value: { action: "group_dismiss_confirm", contextKey, sessionId: localSessionId, requestedBy: "ou_owner" },
+    });
+    expect(runtime.readRemoteSession).toHaveBeenCalledWith(task.remoteSessionId, "metadata");
+    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith(task.remoteSessionId, { allowUnmaterialized: true });
+    expect(outbound.deleteGroup).toHaveBeenCalledExactlyOnceWith("oc_new_group");
+    expect(store.getSession(localSessionId)?.status).toBe("closed");
+    expect(store.getChatContext(contextKey)).toBeUndefined();
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test.each(["history", "failed attempt", "fork"])("does not treat a task with %s as unmaterialized when archiving", async (evidence) => {
+    const { controller, runtime, store } = fixture();
+    await controller.onMessage(message("/new retained"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const remoteId = store.getSession(id)!.remoteSessionId;
+    if (evidence === "history") store.updateRuntimeSession(id, { lastTurnId: "previous", lastTurnStatus: "completed" });
+    if (evidence === "failed attempt") {
+      store.createTurnAttempt({ attemptId: "failed", localSessionId: id, contextKey: "chat_id:c1", promptText: "previous prompt" });
+      store.updateTurnAttempt("failed", { status: "failed" });
+    }
+    if (evidence === "fork") store.audit("chat_id:c1", "session_forked", {
+      forkedLocalSessionId: id, sourceTurnId: "parent-turn", sourceRemoteSessionId: "parent",
+    });
+    await controller.controlArchiveTask(id);
+    expect(runtime.archiveRemoteSession).toHaveBeenCalledWith(remoteId, { allowUnmaterialized: false });
+  });
+
+  test.each(["active", "queued", "read failure", "archive failure"])("does not dissolve a group after %s", async (failure) => {
+    const { controller, runtime, outbound, store, remoteSessions } = fixture();
+    await controller.onMessage({ ...message("/newgroup guarded"), userId: "ou_owner" });
+    const key = "chat_id:oc_new_group";
+    const id = store.getUserContext(key)!.currentSessionId!;
+    const remoteId = store.getSession(id)!.remoteSessionId;
+    if (failure === "active") remoteSessions.find((item) => item.id === remoteId)!.status = "active";
+    if (failure === "queued") store.enqueuePrompt({ promptId: "queued", localSessionId: id, contextKey: key, text: "wait" });
+    if (failure === "read failure") vi.mocked(runtime.readRemoteSession!).mockRejectedValue(new Error("read failed"));
+    if (failure === "archive failure") vi.mocked(runtime.archiveRemoteSession!).mockRejectedValue(new Error("archive failed"));
+    await expect(controller.controlDismissTask(id)).rejects.toThrow();
+    expect(outbound.deleteGroup).not.toHaveBeenCalled();
+    expect(store.getSession(id)?.status).not.toBe("closed");
+    expect(store.getUserContext(key)?.currentSessionId).toBe(id);
+  });
+
+  test("retries only group deletion when an empty task is already archived", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage({ ...message("/newgroup retry-dismiss"), userId: "ou_owner" });
+    const key = "chat_id:oc_new_group";
+    const id = store.getUserContext(key)!.currentSessionId!;
+    vi.mocked(outbound.deleteGroup!).mockRejectedValueOnce(new Error("Lark unavailable"));
+    await expect(controller.controlDismissTask(id)).rejects.toThrow("当前任务已归档，但解散群失败");
+    expect(store.getSession(id)?.status).toBe("closed");
+    expect(store.getChatContext(key)).toBeDefined();
+    await controller.controlDismissTask(id);
+    expect(runtime.archiveRemoteSession).toHaveBeenCalledOnce();
+    expect(outbound.deleteGroup).toHaveBeenCalledTimes(2);
+    expect(store.getChatContext(key)).toBeUndefined();
   });
 
   test("keeps the group when dismiss confirmation is cancelled", async () => {

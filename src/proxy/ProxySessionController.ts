@@ -7505,7 +7505,7 @@ export class ProxySessionController {
     const remoteReference = local
       ? remoteSessionReference(local.agentName, local.remoteSessionId!)
       : taskId;
-    const { agentName, runtime, remote } = await this.resolveRemoteCodexSession(remoteReference);
+    const { agentName, runtime, remote } = await this.resolveRemoteCodexSession(remoteReference, { view: "metadata" });
     if (isRemoteSessionActive(remote)) {
       throw new Error("任务正在执行，无法归档。请先停止任务或等待本轮完成。");
     }
@@ -7514,7 +7514,11 @@ export class ProxySessionController {
     }
 
     const wasCurrent = Boolean(local && this.store.getUserContext(contextKey)?.currentSessionId === local.localSessionId);
-    await runtime.archiveRemoteSession(remote.id);
+    const allowUnmaterialized = Boolean(local && !local.lastTurnId && !local.lastTurnStatus
+      && !this.store.hasTurnAttemptsForSession(local.localSessionId)
+      && !this.store.getForkHistorySource(local.localSessionId)
+      && this.store.listTaskTurnGraphIndex(local.localSessionId).length === 0);
+    await runtime.archiveRemoteSession(remote.id, { allowUnmaterialized });
     const title = local?.title ?? remote.title ?? remote.preview ?? remote.id;
     if (local) {
       this.store.archiveSession(local.localSessionId);
