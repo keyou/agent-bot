@@ -401,6 +401,66 @@ describe("CardRenderer", () => {
     }
   });
 
+  describe.each(["settings", "provider", "legacy"] as const)("%s model pagination", (kind) => {
+    const render = (count: number, modelPage?: number, currentModel?: string) => {
+      const models = Array.from({ length: count }, (_, index) => ({ id: `model-${index}`, supportedReasoningEfforts: [] }));
+      const common = { sessionId: "session_1", contextKey: "chat_id:c1:thread_id:t1", models, modelPage, currentModel,
+        warning: "Discovery warning", notice: "Settings notice" };
+      return kind === "settings"
+        ? new CardRenderer().renderExecutionSettings({
+            ...common, activeTab: "model", currentAgent: "codex", taskAgent: "codex",
+            agents: [{ name: "codex", title: "Codex" }, { name: "traex", title: "TraeX" }],
+            runtimeSettingsAvailable: true, currentProvider: "azure", currentPermissionMode: "confirm",
+            providerSupported: true, providers: [], reasoningOptions: [],
+          })
+        : new CardRenderer().renderModelSelector({ ...common, modelProvider: "azure", permissionMode: "confirm", unifiedSettings: kind === "provider" });
+    };
+    const modelIds = (card: unknown) => collectObjects(card)
+      .filter((item) => item.tag === "markdown" && /^`model-\d+`$/u.test(String(item.content)))
+      .map((item) => String(item.content).slice(1, -1));
+    const pages = (card: unknown) => collectObjects(card).filter((item) => typeof item.action === "string" && item.page !== undefined);
+
+    test.each([0, 1, 20, 21, 33, 40, 401])("keeps all %i models reachable within the element limit", (count) => {
+      const visited: string[] = [];
+      const pageCount = Math.max(1, Math.ceil(count / 20));
+      for (let page = 0; page < pageCount; page++) {
+        const card = render(count, page);
+        const ids = modelIds(card);
+        expect(ids).toHaveLength(Math.min(20, count - page * 20));
+        visited.push(...ids);
+        expect(collectObjects(card).filter((item) => typeof item.tag === "string").length).toBeLessThanOrEqual(200);
+        expect(card).toMatchObject({ header: { template: "orange" } });
+        expect(JSON.stringify(card)).toContain("Discovery warning");
+        expect(JSON.stringify(card)).toContain("Settings notice");
+        expect(pages(card).map((value) => value.page)).toEqual([
+          ...(page > 0 ? [String(page - 1)] : []),
+          ...(page < pageCount - 1 ? [String(page + 1)] : []),
+        ]);
+        for (const value of pages(card)) {
+          expect(value).toMatchObject({ sessionId: "session_1", contextKey: "chat_id:c1:thread_id:t1", provider: "azure" });
+          expect(value.action).toBe(kind === "settings" ? "settings_tab_open" : kind === "provider" ? "provider_model_open" : "model_open");
+          if (kind === "settings") expect(value.tab).toBe("model");
+          if (kind === "provider") expect(value.permissionMode).toBe("confirm");
+        }
+        if (pageCount > 1) expect(JSON.stringify(card)).toContain(`第 ${page + 1}/${pageCount} 页 · 共 ${count} 个模型`);
+        else expect(JSON.stringify(card)).not.toContain("下一页");
+        const switches = collectObjects(card).filter((item) => item.action === (kind === "settings" ? "settings_model_select" : kind === "provider" ? "provider_model_select" : "model_select"));
+        expect(switches.map((value) => value.model)).toEqual(ids);
+      }
+      expect(visited).toEqual(Array.from({ length: count }, (_, index) => `model-${index}`));
+    });
+
+    test("opens the current model's page and clamps pages when the list shrinks", () => {
+      const card = render(33, undefined, "model-21");
+      expect(modelIds(card)).toEqual(Array.from({ length: 13 }, (_, index) => `model-${index + 20}`));
+      expect(JSON.stringify(card)).toContain(kind === "provider" ? "Continue" : "当前");
+      expect(modelIds(render(33, 0, "model-21"))).toHaveLength(20);
+      expect(modelIds(render(33, undefined, "unavailable"))[0]).toBe("model-0");
+      expect(modelIds(render(21, 99))).toEqual(["model-20"]);
+      expect(modelIds(render(1, 99))).toEqual(["model-0"]);
+    });
+  });
+
   test("keeps auto-sized execution-setting tabs on one dot-separated row", () => {
     const card = new CardRenderer().renderExecutionSettings({
       sessionId: "session_1",

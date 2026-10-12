@@ -85,6 +85,7 @@ export interface ModelSelectorCardView {
   sessionId: string;
   contextKey: string;
   currentModel?: string;
+  modelPage?: number;
   reasoningEffort?: string;
   models: ModelOption[];
   modelProvider?: string;
@@ -154,6 +155,7 @@ export interface ExecutionSettingsCardView {
   runtimeSettingsAvailable: boolean;
   currentProvider?: string;
   currentModel?: string;
+  modelPage?: number;
   currentEffort?: string;
   currentPermissionMode: PermissionMode;
   providers: ModelProviderOption[];
@@ -603,7 +605,10 @@ export class CardRenderer {
       if (view.models.length === 0) {
         elements.push(markdown("当前运行时未返回可用模型。"));
       } else {
-        elements.push(...view.models.map((model) => settingsOptionRow({
+        const page = paginateModels(view.models, view.currentModel, view.modelPage, {
+          action: "settings_tab_open", ...baseAction, tab: "model", provider: view.currentProvider ?? "",
+        });
+        elements.push(...page.models.map((model) => settingsOptionRow({
           label: `${inlineCode(model.id)}${model.isDefault ? " · 默认" : ""}`,
           current: model.id === view.currentModel && !view.pendingFailed,
           currentLabel: view.pendingNotice ? "待生效" : undefined,
@@ -617,6 +622,7 @@ export class CardRenderer {
             },
           },
         })));
+        elements.push(...page.navigation);
       }
     } else if (view.activeTab === "thinking") {
       if (!view.currentModel) {
@@ -794,7 +800,14 @@ export class CardRenderer {
     if (view.models.length === 0) {
       elements.push(markdown("当前运行时未返回可用模型。"));
     } else {
-      elements.push(...view.models.map((model) => {
+      const page = paginateModels(view.models, view.currentModel, view.modelPage, {
+        action: view.unifiedSettings ? "provider_model_open" : "model_open",
+        sessionId: view.sessionId,
+        contextKey: view.contextKey,
+        ...(view.modelProvider ? { provider: view.modelProvider } : {}),
+        ...(view.permissionMode ? { permissionMode: view.permissionMode } : {}),
+      });
+      elements.push(...page.models.map((model) => {
         const isCurrent = model.id === view.currentModel;
         return {
           tag: "column_set",
@@ -832,6 +845,7 @@ export class CardRenderer {
           ],
         };
       }));
+      elements.push(...page.navigation);
     }
     if (view.unifiedSettings) {
       elements.push(
@@ -2852,6 +2866,24 @@ function acpPermissionOptionLabel(option: { name: string; kind: string }): strin
     reject_always: "Always Deny",
   };
   return labels[option.kind] ?? (/^[\x20-\x7E]+$/.test(option.name) ? option.name : "Select");
+}
+
+const MODEL_PAGE_SIZE = 20;
+
+function paginateModels(
+  models: ModelOption[],
+  currentModel: string | undefined,
+  requestedPage: number | undefined,
+  action: Record<string, string>,
+): { models: ModelOption[]; navigation: Record<string, unknown>[] } {
+  const totalPages = Math.max(1, Math.ceil(models.length / MODEL_PAGE_SIZE));
+  const currentPage = Math.floor(models.findIndex((model) => model.id === currentModel) / MODEL_PAGE_SIZE);
+  const page = Math.max(0, Math.min(requestedPage ?? currentPage, totalPages - 1));
+  const navigation = totalPages > 1 ? [taskActionRow([
+    ...(page > 0 ? [{ text: "上一页", value: { ...action, page: String(page - 1) } }] : []),
+    ...(page < totalPages - 1 ? [{ text: "下一页", value: { ...action, page: String(page + 1) } }] : []),
+  ], `第 ${page + 1}/${totalPages} 页 · 共 ${models.length} 个模型`)] : [];
+  return { models: models.slice(page * MODEL_PAGE_SIZE, (page + 1) * MODEL_PAGE_SIZE), navigation };
 }
 
 function settingsTabRow(

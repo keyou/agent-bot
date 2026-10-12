@@ -10976,6 +10976,89 @@ describe("ProxySessionController", () => {
     expect(result.models.map((model) => model.id)).toEqual(providerModels.map((model) => model.id));
   });
 
+  test("pages models in place and keeps selection, Provider changes and discovery warnings consistent", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const models = Array.from({ length: 45 }, (_, index) => ({ id: index === 21 ? "gpt-test" : `model-${index}`, supportedReasoningEfforts: [] }));
+    vi.mocked(runtime.listModels).mockResolvedValue(models);
+    runtime.listModelsWithStatus = vi.fn(async () => ({ models, warning: "Discovery warning" }));
+    await controller.onMessage(message("/model"));
+    const initial = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(initial)).toContain("第 2/3 页");
+    const original = { ...runtime.getSession(id)! };
+    vi.mocked(outbound.sendInteractiveCard).mockClear();
+    const previous = sessionOverflowActions(initial).find((action) => action.page === "0")!;
+    expect(previous).toMatchObject({ action: "settings_tab_open", sessionId: id, provider: "openai", tab: "model" });
+    await controller.onCardAction({ actionId: "models-previous", contextKey: "chat_id:c1", messageId: "model-card", value: previous });
+    const first = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(first)).toContain("第 1/3 页");
+    expect(JSON.stringify(first)).toContain("Discovery warning");
+    expect(sessionOverflowActions(first).filter((action) => action.action === "settings_model_select")).toHaveLength(20);
+    const next = sessionOverflowActions(first).find((action) => action.page === "1")!;
+    await controller.onCardAction({ actionId: "models-next", contextKey: "chat_id:c1", messageId: "model-card", value: next });
+    const second = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(second)).toContain("第 2/3 页");
+    expect(runtime.getSession(id)).toEqual(original);
+    expect(runtime.setModel).not.toHaveBeenCalled();
+    expect(runtime.setExecutionSettings).not.toHaveBeenCalled();
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    const selection = sessionOverflowActions(second).find((action) => action.action === "settings_model_select" && action.model === "model-25")!;
+    await controller.onCardAction({ actionId: "models-select", contextKey: "chat_id:c1", messageId: "model-card", value: selection });
+    expect(runtime.setModel).toHaveBeenLastCalledWith(id, "model-25");
+    const selected = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(selected)).toContain("第 2/3 页");
+    expect(sessionOverflowActions(selected).some((action) => action.action === "settings_model_select" && action.model === "model-25")).toBe(false);
+    runtime.getSession(id)!.modelProvider = "azure";
+    runtime.getSession(id)!.model = "model-0";
+    await controller.onCardAction({ actionId: "models-stale-provider", contextKey: "chat_id:c1", messageId: "model-card", value: next });
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1])).toContain("第 1/3 页");
+    expect(runtime.listModelsWithStatus).toHaveBeenLastCalledWith("azure", "model-0");
+    runtime.listModelsWithStatus = vi.fn(async () => ({ models: models.slice(0, 3), warning: "Discovery failed: timeout" }));
+    await controller.onCardAction({ actionId: "models-shrunk", contextKey: "chat_id:c1", messageId: "model-card", value: { ...next, provider: "azure", page: "99" } });
+    const shrunk = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(shrunk)).toContain("Discovery failed: timeout");
+    expect(JSON.stringify(shrunk)).not.toContain("下一页");
+    expect(outbound.sendInteractiveCard).not.toHaveBeenCalled();
+    expect(vi.mocked(outbound.updateInteractiveCard).mock.calls.every(([messageId]) => messageId === "model-card")).toBe(true);
+  });
+
+  test("pages the Provider model wizard without applying settings", async () => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const models = Array.from({ length: 33 }, (_, index) => ({ id: `azure-${index}`, supportedReasoningEfforts: [] }));
+    vi.mocked(runtime.listModels).mockResolvedValue(models);
+    await controller.onCardAction({ actionId: "wizard-open", contextKey: "chat_id:c1", messageId: "wizard-card",
+      value: { action: "provider_model_open", sessionId: id, provider: "azure", permissionMode: "confirm" } });
+    const first = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    const next = sessionOverflowActions(first).find((action) => action.page === "1")!;
+    expect(next).toMatchObject({ action: "provider_model_open", provider: "azure", permissionMode: "confirm" });
+    await controller.onCardAction({ actionId: "wizard-next", contextKey: "chat_id:c1", messageId: "wizard-card", value: next });
+    const last = vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)![1];
+    expect(JSON.stringify(last)).toContain("第 2/2 页");
+    const choices = sessionOverflowActions(last).filter((action) => action.action === "provider_model_select");
+    expect(choices).toHaveLength(13);
+    expect(choices[0]).toMatchObject({ provider: "azure", model: "azure-20", permissionMode: "confirm" });
+    expect(runtime.setExecutionSettings).not.toHaveBeenCalled();
+    expect(runtime.setModel).not.toHaveBeenCalled();
+    expect(runtime.getSession(id)?.modelProvider).toBe("openai");
+    expect(runtime.listModels).toHaveBeenLastCalledWith("azure", "gpt-test");
+  });
+
+  test.each(["-1", "1.5", "bad", "", "Infinity", "9007199254740992"])("rejects invalid model page %s without updating settings", async (page) => {
+    const { controller, runtime, outbound, store } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    vi.mocked(runtime.listModels).mockClear();
+    await controller.onCardAction({ actionId: "invalid-page", contextKey: "chat_id:c1", messageId: "model-card",
+      value: { action: "settings_tab_open", tab: "model", sessionId: id, page } });
+    expect(outbound.sendText).toHaveBeenLastCalledWith("chat_id:c1", expect.stringContaining("模型卡片页码无效"));
+    expect(outbound.updateInteractiveCard).not.toHaveBeenCalled();
+    expect(runtime.listModels).not.toHaveBeenCalled();
+    expect(runtime.setModel).not.toHaveBeenCalled();
+  });
+
   test("keeps the previous model when the selected Provider supports it and renders that Provider's models", async () => {
     const { controller, runtime, outbound, store } = fixture();
     await controller.onMessage(message("/new"));

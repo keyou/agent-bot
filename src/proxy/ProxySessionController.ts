@@ -409,6 +409,7 @@ interface ResetHistoryCardOptions {
 }
 
 interface ModelCardOptions {
+  modelPage?: number;
   expectedProvider?: string;
   sessionId?: string;
   updateMessageId?: string;
@@ -1247,6 +1248,8 @@ export class ProxySessionController {
           await this.openExecutionSettings(
             contextKey, executionSettingsTabValue(scopedAction.value.tab), {
               sessionId, updateMessageId: scopedAction.messageId,
+              modelPage: modelCardPageValue(scopedAction.value.page),
+              expectedProvider: typeof scopedAction.value.provider === "string" ? scopedAction.value.provider : undefined,
             },
           );
         } else if (kind === "settings_agent_select") {
@@ -1289,6 +1292,7 @@ export class ProxySessionController {
           await this.model(contextKey, undefined, {
             sessionId,
             updateMessageId: scopedAction.messageId,
+            modelPage: modelCardPageValue(scopedAction.value.page),
           });
         } else if (kind === "reasoning_select") {
           const sessionId = String(scopedAction.value.sessionId ?? "");
@@ -1311,6 +1315,7 @@ export class ProxySessionController {
             permissionModeValue(scopedAction.value.permissionMode),
             String(scopedAction.value.sessionId ?? ""),
             requiredCardMessageId(scopedAction.messageId),
+            modelCardPageValue(scopedAction.value.page),
           );
         } else if (kind === "provider_model_select" || kind === "provider_reasoning_open") {
           await this.openProviderReasoningSelector(
@@ -5512,6 +5517,8 @@ export class ProxySessionController {
       agents,
       runtimeSettingsAvailable: Boolean(record),
       ...runtimeSettings,
+      modelPage: options.expectedProvider !== undefined && options.expectedProvider !== (runtimeSettings.currentProvider ?? "")
+        ? undefined : options.modelPage,
       notice: options.notice,
       warning: [runtimeSettings.warning, options.warning].filter(Boolean).join("\n") || undefined,
     });
@@ -5572,6 +5579,7 @@ export class ProxySessionController {
     permissionMode: PermissionMode,
     sessionId: string,
     updateMessageId: string,
+    modelPage?: number,
   ): Promise<void> {
     const loaded = await this.loadSession(this.requireSession(contextKey, sessionId), true);
     await this.assertModelProvider(loaded, modelProvider);
@@ -5580,6 +5588,7 @@ export class ProxySessionController {
       sessionId,
       contextKey,
       currentModel: selectProviderModel(models, loaded.session.model)?.id,
+      modelPage,
       reasoningEffort: loaded.session.reasoningEffort,
       models,
       warning,
@@ -9213,6 +9222,13 @@ function permissionModeValue(value: unknown): PermissionMode {
 function executionSettingsTabValue(value: unknown): ExecutionSettingsTab {
   if (value === "agent" || value === "provider" || value === "model" || value === "thinking" || value === "permission") return value;
   throw new Error("设置卡片的 tab 无效，请重新发送设置命令。");
+}
+
+function modelCardPageValue(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const page = typeof value === "number" || (typeof value === "string" && value.trim()) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(page) || page < 0) throw new Error("模型卡片页码无效，请重新发送 /model。");
+  return page;
 }
 
 function resetHistoryPageValue(value: unknown): number {
