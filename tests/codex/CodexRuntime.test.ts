@@ -7,7 +7,7 @@ import type { RuntimeEvent, RuntimeExecutionSettings, RuntimeGoal } from "../../
 import { AppServerRequestError } from "../../src/codex/AppServerConnection.js";
 import { CodexRuntime, type AppServerClientProvider } from "../../src/codex/CodexRuntime.js";
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
-import { ProviderSwitchError } from "../../src/codex/ProviderSwitch.js";
+import { PROVIDER_SWITCH_EMPTY, ProviderSwitchError } from "../../src/codex/ProviderSwitch.js";
 
 describe("CodexRuntime", () => {
 
@@ -469,6 +469,7 @@ describe("CodexRuntime", () => {
       cwd: process.cwd(),
       permissionMode: "auto",
     });
+    client.resumeResults.push({ thread: { id: "thr_restored" }, model: "gpt-test", reasoningEffort: "medium" });
     await runtime.resumeSession({
       localSessionId: "restored",
       remoteSessionId: "thr_restored",
@@ -531,6 +532,7 @@ describe("CodexRuntime", () => {
       cwd: process.cwd(),
       permissionMode: "auto",
     });
+    client.resumeResult = { thread: { id: "thr_slow" }, model: "gpt-test", reasoningEffort: "medium" };
     await runtime.resumeSession({
       localSessionId: "slow-resume",
       remoteSessionId: "thr_slow",
@@ -1714,7 +1716,7 @@ describe("CodexRuntime", () => {
     const response = { thread: { id: "thr_restored" }, model: "gpt-test", reasoningEffort: "medium", sandbox: sandboxPolicy };
     client.resumeResult = response;
     client.forkResult = response;
-    const input = { localSessionId: "s1", remoteSessionId: "thr_source", agentName: "codex",
+    const input = { localSessionId: "s1", remoteSessionId: operation === "resume" ? "thr_restored" : "thr_source", agentName: "codex",
       cwd: process.cwd(), permissionMode: "confirm" as const };
     if (operation === "resume") await runtime.resumeSession(input);
     else await runtime.forkSession({ ...input, lastTurnId: "source_turn" });
@@ -1959,6 +1961,22 @@ describe("CodexRuntime", () => {
       if (path.dirname(home) !== path.resolve(os.tmpdir()) || !path.basename(home).startsWith("agentbot-crash-runtime-")) throw new Error("Unsafe cleanup path");
       fs.rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  test.each(["prepared", "resumed"] as const)("does not publish a %s saved turn ID as ownership of unknown remote activity", async (attachment) => {
+    const client = new FakeAppServerClient();
+    client.readResult = { thread: { id: "thr_1", status: { type: "active" } } };
+    const runtime = new CodexRuntime(provider(client), logger());
+    const input = { localSessionId: "s1", remoteSessionId: "thr_1", agentName: "codex", cwd: process.cwd(),
+      permissionMode: "auto" as const, reasoningEffort: "high", activeTurnId: "saved-turn" };
+    if (attachment === "prepared") await runtime.prepareSessionForSettings(input);
+    else await runtime.resumeSession(input);
+    client.requests = [];
+
+    await expect(runtime.inspectRemoteSessionActivity("thr_1")).resolves.toEqual({ active: true });
+    expect(runtime.getSession("s1")?.activeTurnId).toBe("saved-turn");
+    expect(client.requests).toEqual([{ method: "thread/read", params: { threadId: "thr_1", includeTurns: false } }]);
+    runtime.close();
   });
 
   test("local forgetting neither archives nor interrupts a remote thread", async () => {
@@ -2446,9 +2464,9 @@ describe("Provider switching", () => {
     expect(session).toMatchObject(target);
   });
 
-  test("forks the latest completed Turn when resume ignores Provider settings", async () => {
+  test("refuses ignored Provider settings without forking or reading history", async () => {
     const { client, runtime, session } = await setup();
-    client.resumeResults.push(oldResponse);
+    client.resumeResults.push(oldResponse, oldResponse);
     client.turnListResults.push({
       data: [
         { id: "turn_failed", status: "failed" },
@@ -2464,35 +2482,27 @@ describe("Provider switching", () => {
       reasoningEffort: "high",
     };
 
-    await runtime.setExecutionSettings("s", target);
-
-    expect(client.requests).toContainEqual({
-      method: "thread/fork",
-      params: expect.objectContaining({
-        threadId: "thr_1",
-        lastTurnId: "turn_latest",
-        modelProvider: "azure",
-        model: "gpt-test",
-        excludeTurns: true,
-      }),
+    const persist = vi.fn();
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toMatchObject({
+      previousSettingsRestored: true, message: expect.stringContaining("Provider 未生效"),
     });
-    expect(client.requests).toContainEqual({
-      method: "thread/name/set",
-      params: { threadId: "thr_provider_fork", name: "Original" },
-    });
-    expect(client.requests).toContainEqual({
-      method: "thread/unsubscribe",
-      params: { threadId: "thr_1" },
-    });
+    expect(persist).not.toHaveBeenCalled();
+    expect(client.requests.map((request) => request.method)).toEqual([
+      "thread/read", "thread/read", "thread/unsubscribe", "thread/resume",
+      "thread/read", "thread/unsubscribe", "thread/resume",
+    ]);
+    expect(client.turnListResults).toHaveLength(1);
     expect(session).toMatchObject({
-      ...target,
-      remoteSessionId: "thr_provider_fork",
+      modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto",
+      remoteSessionId: "thr_1",
       title: "Original",
     });
   });
 
-  test("does not fork unfinished history when no completed Turn exists", async () => {
+  test("refuses a failed-only loaded thread without requiring a completed Turn or releasing the process", async () => {
     const { client, runtime, session } = await setup();
+    client.readResult = { thread: { id: "thr_1", preview: "failed prompt", status: { type: "systemError" } } };
+    const release = vi.spyOn(runtime, "release");
     client.resumeResults.push(oldResponse, oldResponse);
     client.turnListResults.push({
       data: [{ id: "failed", status: "failed" }, { id: "interrupted", status: "interrupted" }],
@@ -2500,16 +2510,32 @@ describe("Provider switching", () => {
     });
     const persist = vi.fn();
 
-    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow("已完成的 Turn");
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow("安全重启");
 
-    expect(client.requests.some((request) => request.method === "thread/fork")).toBe(false);
+    expect(client.requests.some((request) => ["thread/fork", "thread/start", "thread/turns/list", "turn/start"].includes(request.method))).toBe(false);
+    expect(release).not.toHaveBeenCalled();
     expect(persist).not.toHaveBeenCalled();
     expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
   });
 
-  test("replaces only a proven empty thread and waits for persistence before starting a turn", async () => {
+  test.each(["empty summary", "no rollout found", "missing source rollout"])("refuses a pristine thread before detaching (%s)", async (history) => {
     const { client, runtime, session } = await setup(true);
-    client.startResult = { ...targetResponse, thread: { id: "replacement" } };
+    if (history !== "empty summary") client.turnListErrors.push(new AppServerRequestError("thread/turns/list", -32600, history));
+    const persist = vi.fn();
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toMatchObject({
+      message: PROVIDER_SWITCH_EMPTY, previousSettingsRestored: true,
+    });
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/read", "thread/turns/list"]);
+    expect(client.requests.at(-1)?.params).toEqual({ threadId: "thr_1", limit: 1, sortDirection: "desc", itemsView: "summary" });
+    expect(persist).not.toHaveBeenCalled();
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai", model: "gpt-test" });
+    client.requests = [];
+    await runtime.startTurn("s", "original thread is still usable");
+    expect(client.requests).toEqual([{ method: "turn/start", params: expect.objectContaining({ threadId: "thr_1", model: "gpt-test" }) }]);
+  });
+
+  test("waits for same-thread settings persistence before starting a turn", async () => {
+    const { client, runtime, session } = await setup();
     let finish!: () => void;
     const persisted = new Promise<void>((resolve) => { finish = resolve; });
     const persist = vi.fn(async () => persisted);
@@ -2522,15 +2548,12 @@ describe("Provider switching", () => {
     finish();
     await switching;
     await starting;
-    expect(client.requests).toContainEqual({ method: "thread/turns/list", params: {
-      threadId: "thr_1", limit: 1, sortDirection: "desc", itemsView: "summary",
-    } });
-    expect(client.requests).toContainEqual({ method: "thread/name/set", params: { threadId: "replacement", name: "Original" } });
+    expect(client.requests.some((request) => ["thread/turns/list", "thread/fork", "thread/start", "thread/name/set"].includes(request.method))).toBe(false);
     expect(client.requests).toContainEqual({ method: "thread/unsubscribe", params: { threadId: "thr_1" } });
     expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: {
-      threadId: "replacement", model: "gpt-test", effort: "high", approvalPolicy: "on-request",
+      threadId: "thr_1", model: "gpt-test", effort: "high", approvalPolicy: "on-request",
     } });
-    expect(session).toMatchObject({ ...target, remoteSessionId: "replacement", title: "Original", cwd: process.cwd() });
+    expect(session).toMatchObject({ ...target, remoteSessionId: "thr_1", title: "Original", cwd: process.cwd() });
   });
 
   test.each(["local", "remote"])("refuses an active %s turn without detaching", async (kind) => {
@@ -2555,7 +2578,7 @@ describe("Provider switching", () => {
     const { client, runtime } = await setup(true);
     client.forkResult = oldResponse;
     client.resumeResult = oldResponse;
-    const input = { localSessionId: "inherited", remoteSessionId: "source", agentName: "codex",
+    const input = { localSessionId: "inherited", remoteSessionId: "thr_1", agentName: "codex",
       cwd: process.cwd(), permissionMode: "auto" as const, modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium" };
     if (kind === "fork") await runtime.forkSession({ ...input, lastTurnId: "inherited-turn" });
     else await runtime.resumeSession(input);
@@ -2575,10 +2598,6 @@ describe("Provider switching", () => {
   ])("rejects %s and restores the old Provider without persisting", async (_name, response, expected) => {
     const { client, runtime, session } = await setup();
     client.resumeResults.push(response, oldResponse);
-    if (!(response instanceof Error)) {
-      client.turnListResults.push({ data: [{ id: "completed", status: "completed" }], nextCursor: null });
-      client.forkResult = response;
-    }
     const persist = vi.fn();
     await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow(String(expected));
     expect(persist).not.toHaveBeenCalled();
@@ -2587,14 +2606,12 @@ describe("Provider switching", () => {
     expect(client.requests.some((r) => r.method === "thread/start")).toBe(false);
   });
 
-  test.each([true, false])("preserves settings on persistence failure (empty=%s)", async (empty) => {
-    const { client, runtime, session } = await setup(empty);
-    client.startResult = { ...targetResponse, thread: { id: "unused" } };
+  test("preserves settings and the same thread on persistence failure", async () => {
+    const { client, runtime, session } = await setup();
     client.resumeResults.push(targetResponse, oldResponse);
     await expect(runtime.setExecutionSettings("s", target, async () => { throw new Error("disk full"); })).rejects.toThrow("disk full");
     expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
-    if (empty) expect(client.requests.at(-1)).toEqual({ method: "thread/unsubscribe", params: { threadId: "unused" } });
-    else expect(client.requests.at(-1)).toMatchObject({ method: "thread/resume", params: { modelProvider: "openai" } });
+    expect(client.requests.at(-1)).toMatchObject({ method: "thread/resume", params: { threadId: "thr_1", modelProvider: "openai" } });
   });
 
   test("blocks the next turn after failed recovery until settings are verified again", async () => {
@@ -2639,6 +2656,56 @@ describe("Provider switching", () => {
     await expect(runtime.setExecutionSettings("s", target)).rejects.toMatchObject({ previousSettingsRestored: false });
   });
 
+  test.each(["openai", "azure"])("verifies the metadata Provider when restoring a legacy settings snapshot (returned=%s)", async (restoredProvider) => {
+    const client = new FakeAppServerClient();
+    client.readResult = { thread: { id: "thr_1", modelProvider: "openai", preview: "existing history", status: { type: "idle" } } };
+    client.resumeResults.push(targetResponse, { ...oldResponse, modelProvider: restoredProvider });
+    const runtime = new CodexRuntime(provider(client), logger());
+    const session = await runtime.prepareSessionForSettings({ localSessionId: "s", remoteSessionId: "thr_1",
+      agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    const persist = vi.fn(async () => { throw new Error("state commit failed"); });
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toMatchObject({
+      previousSettingsRestored: restoredProvider === "openai",
+    });
+    expect(persist).toHaveBeenCalledOnce();
+    expect(client.requests.filter((request) => request.method === "thread/resume").map((request) => request.params)).toEqual([
+      expect.objectContaining({ threadId: "thr_1", modelProvider: "azure" }),
+      expect.objectContaining({ threadId: "thr_1", modelProvider: "openai" }),
+    ]);
+    expect(session.remoteSessionId).toBe("thr_1");
+    expect(session.modelProvider).toBeUndefined();
+    expect(session.model).toBeUndefined();
+    client.requests = [];
+    if (restoredProvider === "openai") {
+      await runtime.startTurn("s", "continue with verified effective Provider");
+      expect(client.requests.map((request) => request.method)).toEqual(["turn/start"]);
+    } else {
+      await expect(runtime.startTurn("s", "do not use the rejected Provider")).rejects.toThrow("远端恢复失败");
+      expect(client.requests).toEqual([]);
+    }
+  });
+
+  test.each([undefined, "", "   "])("blocks rollback when neither saved settings nor metadata identifies the old Provider (%j)", async (modelProvider) => {
+    const client = new FakeAppServerClient();
+    client.readResult = { thread: { id: "thr_1", modelProvider, preview: "existing history", status: { type: "idle" } } };
+    client.resumeResult = targetResponse;
+    const runtime = new CodexRuntime(provider(client), logger());
+    const session = await runtime.prepareSessionForSettings({ localSessionId: "s", remoteSessionId: "thr_1",
+      agentName: "codex", cwd: process.cwd(), permissionMode: "auto" });
+    await expect(runtime.setExecutionSettings("s", target, async () => { throw new Error("state commit failed"); }))
+      .rejects.toMatchObject({ previousSettingsRestored: false });
+    expect(session.remoteSessionId).toBe("thr_1");
+    expect(session.modelProvider).toBeUndefined();
+    expect(client.requests.filter((request) => request.method === "thread/resume")).toEqual([
+      { method: "thread/resume", params: expect.objectContaining({ threadId: "thr_1", modelProvider: "azure" }) },
+    ]);
+    client.requests = [];
+    await expect(runtime.startTurn("s", "unknown previous Provider must remain blocked")).rejects.toThrow("远端恢复失败");
+    expect(client.requests).toEqual([]);
+    await runtime.setExecutionSettings("s", target);
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", ...target });
+  });
+
   test("reports intact previous settings for preflight failures without detaching", async () => {
     const { client, runtime } = await setup();
     client.readErrors.push(new Error("metadata unavailable"));
@@ -2660,19 +2727,23 @@ describe("Provider switching", () => {
     expect(session.modelProvider).toBe("third");
   });
 
-  test("does not unload another client's task", async () => {
-    const { client, runtime } = await setup();
-    client.unsubscribeResult = { status: "notSubscribed" };
-    await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow("其他客户端加载");
-    expect(client.requests.some((r) => r.method === "thread/resume")).toBe(false);
+  test.each(["unsubscribed", "notLoaded", "notSubscribed"])("verifies same-thread settings after unsubscribe status %s", async (status) => {
+    const { client, runtime, session } = await setup();
+    client.unsubscribeResult = { status };
+    await runtime.setExecutionSettings("s", target);
+    expect(client.requests.map((request) => request.method)).toEqual([
+      "thread/read", "thread/read", "thread/unsubscribe", "thread/resume",
+    ]);
+    expect(session).toMatchObject({ ...target, remoteSessionId: "thr_1" });
   });
 
   test("does not replace a task with a Goal even before its first turn", async () => {
     const { client, runtime } = await setup(true);
     await runtime.setGoal("s", { objective: "keep this goal" });
     client.requests = [];
-    await runtime.setExecutionSettings("s", target);
-    expect(client.requests.some((r) => r.method === "thread/start")).toBe(false);
+    await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow(PROVIDER_SWITCH_EMPTY);
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/read", "thread/turns/list"]);
+    expect(runtime.getSession("s")?.remoteSessionId).toBe("thr_1");
     expect(client.goalResult?.objective).toBe("keep this goal");
   });
 
@@ -2688,6 +2759,185 @@ describe("Provider switching", () => {
     } finally {
       active.mockRestore();
     }
+  });
+
+  test.each([true, false])("verifies recovery after an ambiguous unsubscribe timeout (restored=%s)", async (restored) => {
+    const { client, runtime, session } = await setup();
+    client.unsubscribeErrors.push(new Error("App Server request timed out: thread/unsubscribe"));
+    client.resumeResults.push(restored ? oldResponse : new Error("restore unavailable"));
+    const persist = vi.fn();
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toMatchObject({ previousSettingsRestored: restored });
+    expect(persist).not.toHaveBeenCalled();
+    expect(client.requests.map((request) => request.method)).toEqual([
+      "thread/read", "thread/read", "thread/unsubscribe",
+      "thread/read", "thread/unsubscribe", "thread/resume",
+    ]);
+    expect(client.requests.at(-1)?.params).toMatchObject({ threadId: "thr_1", modelProvider: "openai" });
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
+    client.requests = [];
+    if (restored) {
+      await runtime.startTurn("s", "continue after verified recovery");
+      expect(client.requests.at(-1)?.method).toBe("turn/start");
+    } else {
+      await expect(runtime.startTurn("s", "must stay blocked")).rejects.toThrow("远端恢复失败");
+      expect(client.requests).toEqual([]);
+    }
+  });
+
+  test("keeps the original ID when the settings response returns another thread", async () => {
+    const { client, runtime, session } = await setup();
+    client.resumeResults.push({ ...targetResponse, thread: { id: "unexpected" } }, oldResponse);
+    const persist = vi.fn();
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toMatchObject({
+      previousSettingsRestored: true, message: expect.stringContaining("不同的任务 ID"),
+    });
+    expect(persist).not.toHaveBeenCalled();
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
+    expect(client.requests.filter((request) => request.method === "thread/resume").map((request) => request.params)).toEqual([
+      expect.objectContaining({ threadId: "thr_1", modelProvider: "azure" }),
+      expect.objectContaining({ threadId: "thr_1", modelProvider: "openai" }),
+    ]);
+  });
+
+  test("retains a same-ID attachment with an ignored Provider for explicit repair but blocks turns", async () => {
+    const client = new FakeAppServerClient();
+    client.resumeResult = oldResponse;
+    client.readResult = { thread: { id: "thr_1", preview: "existing history", status: { type: "idle" } } };
+    const runtime = new CodexRuntime(provider(client), logger());
+    const session = await runtime.resumeSession({ localSessionId: "s", remoteSessionId: "thr_1",
+      agentName: "codex", cwd: process.cwd(), ...target });
+    expect(runtime.getSession("s")).toBe(session);
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "azure" });
+    client.requests = [];
+    await expect(runtime.startTurn("s", "must not use openai")).rejects.toThrow("Provider 未生效");
+    expect(client.requests).toEqual([]);
+    client.resumeResult = targetResponse;
+    const persist = vi.fn(async () => undefined);
+    await runtime.setExecutionSettings("s", target, persist);
+    expect(persist).toHaveBeenCalledWith(expect.objectContaining({ remoteSessionId: "thr_1", ...target }));
+    await runtime.startTurn("s", "verified provider");
+    expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: { threadId: "thr_1" } });
+    expect(client.requests.some((request) => ["thread/start", "thread/fork", "thread/turns/list"].includes(request.method))).toBe(false);
+  });
+
+  test("rejects a different ID during ordinary resume without replacing an existing attachment", async () => {
+    const { client, runtime, session } = await setup();
+    client.resumeResult = { ...targetResponse, thread: { id: "unexpected" } };
+    await expect(runtime.resumeSession({ localSessionId: "s", remoteSessionId: "thr_1",
+      agentName: "codex", cwd: process.cwd(), ...target })).rejects.toThrow("不同的任务 ID");
+    expect(runtime.getSession("s")).toBe(session);
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
+    await expect(runtime.resumeSession({ localSessionId: "new-local", remoteSessionId: "thr_1",
+      agentName: "codex", cwd: process.cwd(), ...target })).rejects.toThrow("不同的任务 ID");
+    expect(runtime.getSession("new-local")).toBeUndefined();
+  });
+
+  test.each(["provider", "id"])("verifies %s before starting a turn after reconnect", async (mismatch) => {
+    const first = new FakeAppServerClient();
+    const second = new FakeAppServerClient();
+    first.startResult = targetResponse;
+    second.resumeResult = mismatch === "provider" ? oldResponse : { ...targetResponse, thread: { id: "unexpected" } };
+    let current = first;
+    let disconnected: ((error: Error) => void) | undefined;
+    const runtime = new CodexRuntime({ ...provider(first), getClient: async () => current,
+      onDisconnect: (listener) => { disconnected = listener; return () => { disconnected = undefined; }; } }, logger());
+    await runtime.createSession({ localSessionId: "s", agentName: "codex", cwd: process.cwd(), ...target });
+    current = second;
+    disconnected?.(new Error("process exited"));
+    await expect(runtime.startTurn("s", "do not send yet")).rejects.toThrow(mismatch === "provider" ? "Provider 未生效" : "不同的任务 ID");
+    expect(second.requests.map((request) => request.method)).toEqual(["thread/resume"]);
+    expect(runtime.getSession("s")).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "azure" });
+    second.resumeResult = targetResponse;
+    await runtime.startTurn("s", "retry verified");
+    expect(second.requests.map((request) => request.method)).toEqual(["thread/resume", "thread/resume", "config/read", "turn/start"]);
+  });
+
+  test("preserves a local next-turn model override across ordinary resume and reconnect", async () => {
+    const client = new FakeAppServerClient();
+    client.resumeResult = oldResponse;
+    let disconnected: ((error: Error) => void) | undefined;
+    const runtime = new CodexRuntime({ ...provider(client),
+      onDisconnect: (listener) => { disconnected = listener; return () => { disconnected = undefined; }; } }, logger());
+    await runtime.resumeSession({ localSessionId: "s", remoteSessionId: "thr_1", agentName: "codex", cwd: process.cwd(),
+      modelProvider: "openai", model: "new-model", reasoningEffort: "high", permissionMode: "auto" });
+    await runtime.setModel("s", "newer-model");
+    disconnected?.(new Error("process exited"));
+    client.requests = [];
+    await runtime.startTurn("s", "use the local model override");
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/resume", "turn/start"]);
+    expect(client.requests.at(-1)?.params).toMatchObject({ threadId: "thr_1", model: "newer-model" });
+  });
+
+  test("retains the reconnect requirement when persistence completes after a disconnect", async () => {
+    const first = new FakeAppServerClient();
+    const second = new FakeAppServerClient();
+    first.startResult = oldResponse;
+    first.resumeResult = targetResponse;
+    second.resumeResult = targetResponse;
+    first.readResult = { thread: { id: "thr_1", preview: "history", status: { type: "idle" } } };
+    let current = first;
+    let disconnected: ((error: Error) => void) | undefined;
+    const runtime = new CodexRuntime({ ...provider(first), getClient: async () => current,
+      onDisconnect: (listener) => { disconnected = listener; return () => { disconnected = undefined; }; } }, logger());
+    await runtime.createSession({ localSessionId: "s", agentName: "codex", cwd: process.cwd(),
+      modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto" });
+    let finish!: () => void;
+    const persisted = new Promise<void>((resolve) => { finish = resolve; });
+    const persist = vi.fn(async () => persisted);
+    const switching = runtime.setExecutionSettings("s", target, persist);
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
+    current = second;
+    disconnected?.(new Error("process exited during persistence"));
+    finish();
+    await switching;
+    await runtime.startTurn("s", "resume before starting");
+    expect(second.requests.map((request) => request.method)).toEqual(["thread/resume", "config/read", "turn/start"]);
+    expect(second.requests[0]?.params).toMatchObject({ threadId: "thr_1", modelProvider: "azure" });
+    expect(runtime.getSession("s")).toMatchObject({ remoteSessionId: "thr_1", ...target });
+  });
+
+  test("prepares a local settings snapshot without contacting the App Server and reuses it", async () => {
+    const client = new FakeAppServerClient();
+    const getClient = vi.fn(async () => client);
+    const runtime = new CodexRuntime({ ...provider(client), getClient }, logger());
+    const input = { localSessionId: "s", remoteSessionId: "thr_saved", agentName: "codex", cwd: process.cwd(),
+      title: "Saved task", modelProvider: "unavailable", model: "saved-model", permissionMode: "auto" as const };
+    const session = await runtime.prepareSessionForSettings(input);
+    expect(session).toMatchObject(input);
+    expect(runtime.getSession("s")).toBe(session);
+    expect(await runtime.prepareSessionForSettings({ ...input, modelProvider: "different" })).toBe(session);
+    expect(session.modelProvider).toBe("unavailable");
+    expect(getClient).not.toHaveBeenCalled();
+    expect(client.requests).toEqual([]);
+  });
+
+  test("verifies a prepared session before its first turn", async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexRuntime(provider(client), logger());
+    await runtime.prepareSessionForSettings({ localSessionId: "s", remoteSessionId: "thr_1",
+      agentName: "codex", cwd: process.cwd(), ...target });
+    client.resumeResult = oldResponse;
+    await expect(runtime.startTurn("s", "must verify")).rejects.toThrow("Provider 未生效");
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/resume"]);
+    client.resumeResult = targetResponse;
+    await runtime.startTurn("s", "now verified");
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/resume", "thread/resume", "config/read", "turn/start"]);
+  });
+
+  test("switches a prepared session directly to the target without first resuming the dead Provider", async () => {
+    const client = new FakeAppServerClient();
+    client.resumeResult = targetResponse;
+    client.readResult = { thread: { id: "thr_1", preview: "failed prompt", status: { type: "notLoaded" } } };
+    client.unsubscribeResult = { status: "notLoaded" };
+    const runtime = new CodexRuntime(provider(client), logger());
+    await runtime.prepareSessionForSettings({ localSessionId: "s", remoteSessionId: "thr_1",
+      agentName: "codex", cwd: process.cwd(), ...target, modelProvider: "dead-provider" });
+    const persist = vi.fn(async () => undefined);
+    const session = await runtime.setExecutionSettings("s", target, persist);
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/read", "thread/read", "thread/unsubscribe", "thread/resume"]);
+    expect(client.requests.at(-1)?.params).toMatchObject({ threadId: "thr_1", modelProvider: "azure" });
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", ...target });
+    expect(persist).toHaveBeenCalledWith(expect.objectContaining({ remoteSessionId: "thr_1", ...target }));
   });
 });
 
@@ -2838,6 +3088,7 @@ class FakeAppServerClient {
   resumeResult: unknown = { thread: { id: "thr_1", turns: [] }, model: "gpt-test", reasoningEffort: "medium" };
   resumeResults: unknown[] = [];
   unsubscribeResult: unknown = { status: "unsubscribed" };
+  unsubscribeErrors: Error[] = [];
   forkResult: unknown = { thread: { id: "thr_forked", turns: [] }, model: "gpt-test", reasoningEffort: "medium" };
   forkErrors: Error[] = [];
   readResult: unknown = { thread: { id: "thr_1", name: null, preview: "" } };
@@ -2881,7 +3132,11 @@ class FakeAppServerClient {
       if (result instanceof Error) throw result;
       return result as T;
     }
-    if (method === "thread/unsubscribe") return this.unsubscribeResult as T;
+    if (method === "thread/unsubscribe") {
+      const error = this.unsubscribeErrors.shift();
+      if (error) throw error;
+      return this.unsubscribeResult as T;
+    }
     if (method === "thread/fork") {
       const error = this.forkErrors.shift();
       if (error) throw error;

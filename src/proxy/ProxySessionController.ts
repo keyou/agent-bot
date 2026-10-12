@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Logger } from "pino";
 import { createProjectlessWorkspace, detectProjectlessWorkspace } from "../codex/ProjectlessWorkspace.js";
 import { CodexVersionError } from "../codex/CodexVersion.js";
-import { assertProviderSettingsApplied, isMissingRolloutError, ProviderSwitchError } from "../codex/ProviderSwitch.js";
+import { assertProviderSettingsApplied, ProviderSwitchError } from "../codex/ProviderSwitch.js";
 import {
   SystemThreadWriterProcessController,
   type ThreadWriterProcess,
@@ -543,10 +543,14 @@ export class ProxySessionController {
   private readonly messageQueues = new Map<string, Promise<void>>();
   private readonly switchGroupOperations = new Set<string>();
   private readonly sessionLoads = new Map<string, Promise<LoadedSession>>();
+  private readonly settingsOnlySessions = new Set<string>();
   private readonly queuedPromptStarts = new Map<string, Promise<void>>();
   private readonly queuedPromptCards = new Map<string, Map<string, string>>();
   private readonly queuedPromptCardWrites = new Map<string, Promise<void>>();
   private readonly settingsOperations = new SessionOperationQueue();
+  // Loads may run inside settingsOperations; never acquire that queue while hydrating.
+  private readonly sessionHydrationOperations = new SessionOperationQueue();
+  private readonly agentDefaultsOperations = new SessionOperationQueue();
   private readonly sessionResets = new Map<string, Promise<void>>();
   private readonly resetHistoryOperations = new Map<string, string>();
   private readonly remoteTurnHistoryRefreshes = new Map<string, number>();
@@ -1237,11 +1241,11 @@ export class ProxySessionController {
           await this.refreshStatusCardFromAction(scopedAction);
         } else if (kind === "settings_tab_open") {
           const sessionId = String(scopedAction.value.sessionId ?? "");
-          await this.settingsOperations.run(sessionId, () => this.openExecutionSettings(
+          await this.openExecutionSettings(
             contextKey, executionSettingsTabValue(scopedAction.value.tab), {
               sessionId, updateMessageId: scopedAction.messageId,
             },
-          ));
+          );
         } else if (kind === "settings_agent_select") {
           await this.setDefaultAgent(contextKey, String(scopedAction.value.agent ?? ""), {
             sessionId: String(scopedAction.value.sessionId ?? ""),
@@ -1793,24 +1797,26 @@ export class ProxySessionController {
         }
       });
     }
-    const loaded = await this.loadSession(this.store.getSession(localSessionId) ?? record);
-    const session = this.store.getSession(record.localSessionId) ?? record;
-    const pending = this.store.getPendingProviderSettings(record.localSessionId);
-    const selected = pending?.settings ?? session;
-    const models = await loaded.runtime.listModels(selected.modelProvider, selected.model);
-    const currentModel = models.find((candidate) => candidate.id === selected.model)
-      ?? models.find((candidate) => candidate.isDefault);
-    const providers = loaded.runtime.listModelProviders
-      ? await this.modelProviderOptions(loaded)
-      : [];
-    return {
-      session,
-      pendingProvider: pending,
-      providers,
-      models,
-      reasoningOptions: currentModel?.supportedReasoningEfforts ?? [],
-      permissionModes: ["auto", "confirm"],
-    };
+    return this.settingsOperations.run(localSessionId, async () => {
+      const loaded = await this.loadSession(this.store.getSession(localSessionId) ?? record, true);
+      const session = this.store.getSession(record.localSessionId) ?? record;
+      const pending = this.store.getPendingProviderSettings(record.localSessionId);
+      const selected = pending?.settings ?? session;
+      const models = await loaded.runtime.listModels(selected.modelProvider, selected.model);
+      const currentModel = models.find((candidate) => candidate.id === selected.model)
+        ?? models.find((candidate) => candidate.isDefault);
+      const providers = loaded.runtime.listModelProviders
+        ? await this.modelProviderOptions(loaded)
+        : [];
+      return {
+        session,
+        pendingProvider: pending,
+        providers,
+        models,
+        reasoningOptions: currentModel?.supportedReasoningEfforts ?? [],
+        permissionModes: ["auto", "confirm"],
+      };
+    });
   }
 
   async controlTaskGoal(
@@ -2692,7 +2698,8 @@ export class ProxySessionController {
       });
     }
     const current = this.store.getSession(session.localSessionId) ?? session;
-    const loaded = await this.loadSession({ ...current, contextKey: attempt.contextKey });
+    const loaded = await this.loadSession({ ...current, contextKey: attempt.contextKey },
+      Boolean(this.store.getPendingProviderSettings(current.localSessionId)));
     const recoveryText = recoveryRuntimePrompt(attempt.promptText);
     const turnId = await this.startTurn(
       loaded,
@@ -2795,7 +2802,7 @@ export class ProxySessionController {
     }
     let loaded: LoadedSession;
     try {
-      loaded = await this.loadSession(record);
+      loaded = await this.loadSession(record, Boolean(this.store.getPendingProviderSettings(record.localSessionId)));
     } catch (error) {
       if (await this.presentThreadWriterConflict(record, contextKey, error, true)) {
         throw new PresentedRequestError(error);
@@ -4584,18 +4591,27 @@ export class ProxySessionController {
     return { chatId: group.chatId, contextKey: groupContextKey, name: group.name };
   }
 
-  private async loadSession(record: SessionRecord): Promise<LoadedSession> {
+  private async loadSession(record: SessionRecord, forSettings = false): Promise<LoadedSession> {
     const agent = this.ensureAgent(record.agentName);
     const runtime = this.runtimes.forAgent(record.agentName);
     const existing = runtime.getSession(record.localSessionId);
-    if (existing) return { record, runtime, session: existing };
+    if (existing && (forSettings || !this.settingsOnlySessions.has(record.localSessionId))) {
+      return { record, runtime, session: existing };
+    }
     const pending = this.sessionLoads.get(record.localSessionId);
     if (pending) {
-      const loaded = await pending;
-      return {
-        ...loaded,
-        record: { ...loaded.record, contextKey: record.contextKey },
-      };
+      try {
+        const loaded = await pending;
+        if (!forSettings && this.settingsOnlySessions.has(record.localSessionId)) {
+          if (this.sessionLoads.get(record.localSessionId) === pending) this.sessionLoads.delete(record.localSessionId);
+          return this.loadSession(this.store.getSession(record.localSessionId) ?? record);
+        }
+        return { ...loaded, record: { ...loaded.record, contextKey: record.contextKey } };
+      } catch (error) {
+        if (!forSettings || !runtime.prepareSessionForSettings) throw error;
+        if (this.sessionLoads.get(record.localSessionId) === pending) this.sessionLoads.delete(record.localSessionId);
+        return this.loadSession(record, forSettings);
+      }
     }
 
     this.outbound.registerSession(
@@ -4607,7 +4623,16 @@ export class ProxySessionController {
       record.model,
       record.modelProvider,
     );
-    const loading = (async (): Promise<LoadedSession> => {
+    const loading = this.sessionHydrationOperations.run(record.localSessionId, async (): Promise<LoadedSession> => {
+      const latest = this.store.getSession(record.localSessionId);
+      if (latest) record = {
+        ...record, modelProvider: latest.modelProvider, model: latest.model,
+        reasoningEffort: latest.reasoningEffort, permissionMode: latest.permissionMode,
+      };
+      const current = runtime.getSession(record.localSessionId);
+      if (current && (forSettings || !this.settingsOnlySessions.has(record.localSessionId))) {
+        return { record, runtime, session: current };
+      }
       if (record.lastTurnId) {
         try {
           await this.outbound.resumeDelivery(record.localSessionId, record.contextKey, record.lastTurnId);
@@ -4619,41 +4644,30 @@ export class ProxySessionController {
         }
       }
       const permissionMode = record.permissionMode ?? "auto";
-      if (record.remoteSessionId) await this.assertSessionTurnOwnership(record, runtime);
+      const prepare = forSettings && record.remoteSessionId && runtime.prepareSessionForSettings;
+      if (record.remoteSessionId && !prepare) await this.assertSessionTurnOwnership(record, runtime);
       let session: RuntimeSession;
       if (record.remoteSessionId) {
-        try {
-          session = await runtime.resumeSession({
-            localSessionId: record.localSessionId,
-            remoteSessionId: record.remoteSessionId,
-            agentName: record.agentName,
-            cwd: record.cwd,
-            title: record.title,
-            modelProvider: record.modelProvider,
-            model: record.model,
-            reasoningEffort: record.reasoningEffort,
-            permissionMode,
-            activeTurnId: agent.kind === "app-server" && record.status === "running" && record.lastTurnStatus === "running"
-              ? record.lastTurnId
-              : undefined,
-            lastTurnId: record.lastTurnId,
-            lastTurnStatus: record.lastTurnStatus,
-          });
-        } catch (error) {
-          if (activeWriterThreadId(error)) throw error;
-          if (!(agent.kind === "app-server" && !record.lastTurnId
-            && !this.store.getForkHistorySource(record.localSessionId) && isMissingRolloutError(error))) throw error;
-          this.logger.warn({ error, sessionId: record.localSessionId }, "App Server task has no rollout; creating a replacement task.");
-          session = await runtime.createSession({
-            localSessionId: record.localSessionId,
-            agentName: record.agentName,
-            cwd: record.cwd,
-            title: record.title,
-            modelProvider: record.modelProvider,
-            model: record.model,
-            reasoningEffort: record.reasoningEffort,
-            permissionMode,
-          });
+        const input = {
+          localSessionId: record.localSessionId,
+          remoteSessionId: record.remoteSessionId,
+          agentName: record.agentName,
+          cwd: record.cwd,
+          title: record.title,
+          modelProvider: record.modelProvider,
+          model: record.model,
+          reasoningEffort: record.reasoningEffort,
+          permissionMode,
+          activeTurnId: agent.kind === "app-server" && record.status === "running" && record.lastTurnStatus === "running"
+            ? record.lastTurnId
+            : undefined,
+          lastTurnId: record.lastTurnId,
+          lastTurnStatus: record.lastTurnStatus,
+        };
+        if (prepare) this.settingsOnlySessions.add(record.localSessionId);
+        session = prepare ? await prepare.call(runtime, input) : await runtime.resumeSession(input);
+        if (session.remoteSessionId !== record.remoteSessionId) {
+          throw new Error("加载设置返回了不同的任务 ID，不允许替换任务或更改历史。");
         }
       } else {
         session = await runtime.createSession({
@@ -4667,19 +4681,22 @@ export class ProxySessionController {
           permissionMode,
         });
       }
-      this.persistRuntimeSession(record, session, session.activeTurnId ? "running" : "ready");
+      if (!prepare) {
+        this.settingsOnlySessions.delete(record.localSessionId);
+        this.persistRuntimeSession(record, session, session.activeTurnId ? "running" : "ready");
+      }
       const saved = this.store.getSession(record.localSessionId) ?? record;
       return {
         record: { ...saved, contextKey: record.contextKey },
         runtime,
         session,
       };
-    })();
+    });
     this.sessionLoads.set(record.localSessionId, loading);
     try {
       return await loading;
     } finally {
-      this.sessionLoads.delete(record.localSessionId);
+      if (this.sessionLoads.get(record.localSessionId) === loading) this.sessionLoads.delete(record.localSessionId);
     }
   }
 
@@ -4860,7 +4877,7 @@ export class ProxySessionController {
       : undefined;
     try {
       const current = this.store.getSession(session.localSessionId) ?? session;
-      const loaded = await this.loadSession(current);
+      const loaded = await this.loadSession(current, Boolean(this.store.getPendingProviderSettings(current.localSessionId)));
       const retryTurnId = await this.startTurn(
         loaded,
         llmRetryRuntimePrompt(attempt.promptText, retryNumber),
@@ -4935,7 +4952,7 @@ export class ProxySessionController {
     if (!baseRecord || baseRecord.status === "closed") return;
     let prompt: QueuedPromptRecord | undefined;
     try {
-      let loaded = await this.loadSession(baseRecord);
+      let loaded = await this.loadSession(baseRecord, Boolean(this.store.getPendingProviderSettings(sessionId)));
       const remoteActivity = await this.assertSessionTurnOwnership(loaded.record, loaded.runtime);
       if (needsFullSessionSynchronization(loaded.record, loaded.session, remoteActivity)) {
         loaded = { ...loaded, session: await loaded.runtime.synchronizeSession(sessionId) };
@@ -5413,6 +5430,20 @@ export class ProxySessionController {
     activeTab: ExecutionSettingsTab,
     options: ExecutionSettingsCardOptions = {},
   ): Promise<void> {
+    const record = options.sessionId
+      ? this.requireSession(contextKey, options.sessionId)
+      : this.currentSession(contextKey);
+    if (!record) return this.openExecutionSettingsNow(contextKey, activeTab, options);
+    return this.settingsOperations.run(record.localSessionId, () => this.openExecutionSettingsNow(
+      contextKey, activeTab, { ...options, sessionId: record.localSessionId },
+    ));
+  }
+
+  private async openExecutionSettingsNow(
+    contextKey: string,
+    activeTab: ExecutionSettingsTab,
+    options: ExecutionSettingsCardOptions = {},
+  ): Promise<void> {
     const context = this.store.getOrCreateUserContext(contextKey, this.config.defaults.agent!);
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
@@ -5432,7 +5463,7 @@ export class ProxySessionController {
         reasoningOptions: [],
       };
     if (record) {
-      const loaded = await this.loadSession(record);
+      const loaded = await this.loadSession(record, true);
       const pending = this.store.getPendingProviderSettings(record.localSessionId);
       const selected = pending?.settings ?? loaded.session;
       if (pending && options.updateMessageId) {
@@ -5506,7 +5537,7 @@ export class ProxySessionController {
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
-    const loaded = await this.loadSession(record);
+    const loaded = await this.loadSession(record, true);
     const selected = this.store.getPendingProviderSettings(record.localSessionId)?.settings ?? loaded.session;
     await this.assertModelProvider(loaded, modelProvider);
     const models = await loaded.runtime.listModels(modelProvider, selected.model);
@@ -5535,7 +5566,7 @@ export class ProxySessionController {
     sessionId: string,
     updateMessageId: string,
   ): Promise<void> {
-    const loaded = await this.loadSession(this.requireSession(contextKey, sessionId));
+    const loaded = await this.loadSession(this.requireSession(contextKey, sessionId), true);
     await this.assertModelProvider(loaded, modelProvider);
     const { models, warning } = await this.modelOptions(loaded.runtime, modelProvider, loaded.session.model);
     const card = this.cardRenderer.renderModelSelector({
@@ -5560,7 +5591,7 @@ export class ProxySessionController {
     sessionId: string,
     updateMessageId: string,
   ): Promise<void> {
-    const loaded = await this.loadSession(this.requireSession(contextKey, sessionId));
+    const loaded = await this.loadSession(this.requireSession(contextKey, sessionId), true);
     await this.assertModelProvider(loaded, modelProvider);
     const { models, warning } = await this.modelOptions(loaded.runtime, modelProvider, model);
     const selected = models.find((candidate) => candidate.id === model);
@@ -5596,7 +5627,7 @@ export class ProxySessionController {
     sessionId: string,
     updateMessageId: string,
   ): Promise<void> {
-    const loaded = await this.loadSession(this.requireSession(contextKey, sessionId));
+    const loaded = await this.loadSession(this.requireSession(contextKey, sessionId), true);
     await this.assertProviderModelSettings(loaded, modelProvider, model, effort);
     await this.outbound.updateInteractiveCard(
       contextKey,
@@ -5626,18 +5657,38 @@ export class ProxySessionController {
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
-    const loaded = await this.loadSession(record);
+    const loaded = await this.loadSession(record, true);
     const warning = await this.assertProviderModelSettings(loaded, settings.provider, settings.model, settings.effort);
     const next: RuntimeExecutionSettings = {
       modelProvider: settings.provider, model: settings.model,
       reasoningEffort: settings.effort, permissionMode: settings.mode,
     };
+    await this.reconcilePreparedSettingsSession(loaded);
     if (loaded.session.activeTurnId || this.store.getPendingProviderSettings(record.localSessionId)) {
       await this.savePendingProviderSelection(loaded, next, contextKey, options, "provider");
       return;
     }
     if (announceStart) await this.outbound.sendText(contextKey, `正在切换到 Provider ${settings.provider}，请稍后。`);
-    const session = await this.changeProviderSettings(loaded, next);
+    const previous = { ...loaded.session };
+    let session: RuntimeSession;
+    try {
+      session = await this.changeProviderSettings(loaded, next);
+    } catch (error) {
+      if (!this.providerSettingsRestored(loaded, previous, error)) {
+        this.store.savePendingProviderSettings({
+          localSessionId: record.localSessionId, contextKey, settings: next, activeTab: "provider",
+          messageId: options.updateMessageId,
+          replyMessageId: options.updateMessageId ?? this.controlSessionReplyTarget(record)?.messageId,
+          error: runtimeErrorMessage(error),
+        });
+        if (options.updateMessageId) {
+          await this.openExecutionSettingsNow(contextKey, "provider", options).catch((presentationError: unknown) => {
+            this.logger.warn({ error: presentationError, sessionId: record.localSessionId }, "Failed to refresh rejected Provider selection.");
+          });
+        }
+      }
+      throw error;
+    }
     const notice = [
       `Provider 已切换为 ${cardCode(session.modelProvider ?? settings.provider)}`,
       `模型 ${cardCode(session.model ?? settings.model)}`,
@@ -5646,7 +5697,7 @@ export class ProxySessionController {
       `并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`,
     ].join("，");
     if (options.updateMessageId) {
-      await this.openProviderSelector(contextKey, {
+      await this.openExecutionSettingsNow(contextKey, "provider", {
         sessionId: loaded.record.localSessionId,
         updateMessageId: options.updateMessageId,
         notice,
@@ -5657,15 +5708,23 @@ export class ProxySessionController {
   }
 
   private async changeProviderSettings(loaded: LoadedSession, settings: RuntimeExecutionSettings): Promise<RuntimeSession> {
+    return this.sessionHydrationOperations.run(loaded.record.localSessionId, () => this.changeProviderSettingsNow(loaded, settings));
+  }
+
+  private async changeProviderSettingsNow(loaded: LoadedSession, settings: RuntimeExecutionSettings): Promise<RuntimeSession> {
     if (!loaded.runtime.setExecutionSettings) throw new Error("当前运行时不支持 Provider 设置。");
-    const persist = async (candidate: RuntimeSession): Promise<void> => {
+    loaded.session = loaded.runtime.getSession(loaded.record.localSessionId) ?? loaded.session;
+    const remoteSessionId = loaded.session.remoteSessionId;
+    const persist = (candidate: RuntimeSession): Promise<void> => this.agentDefaultsOperations.run(loaded.record.agentName, async () => {
+      if (candidate.remoteSessionId !== remoteSessionId) {
+        throw new Error("设置切换返回了不同的任务 ID，未保存设置；不允许替换任务或更改历史。");
+      }
       assertProviderSettingsApplied(candidate, settings);
       const agent = this.ensureAgent(loaded.record.agentName);
       const previousDefaults = agent.defaults;
-      await this.persistAgentExecutionDefaults(loaded.record.localSessionId, candidate);
+      await this.persistAgentExecutionDefaultsNow(loaded.record.localSessionId, candidate);
       try {
         this.store.updateRuntimeSession(loaded.record.localSessionId, {
-          remoteSessionId: candidate.remoteSessionId,
           modelProvider: candidate.modelProvider,
           model: candidate.model,
           reasoningEffort: candidate.reasoningEffort,
@@ -5676,10 +5735,27 @@ export class ProxySessionController {
         agent.defaults = previousDefaults;
         throw error;
       }
-    };
+    });
     const session = await loaded.runtime.setExecutionSettings(loaded.record.localSessionId, settings, persist);
+    this.settingsOnlySessions.delete(loaded.record.localSessionId);
     this.outbound.updateSessionModel(loaded.record.localSessionId, session.model, session.modelProvider);
     return session;
+  }
+
+  private async reconcilePreparedSettingsSession(loaded: LoadedSession): Promise<void> {
+    if (!this.settingsOnlySessions.has(loaded.record.localSessionId) || !loaded.session.activeTurnId) return;
+    const activity = await this.assertSessionTurnOwnership(loaded.record, loaded.runtime);
+    if (activity && !activity.active) {
+      loaded.session = await loaded.runtime.synchronizeSession(loaded.record.localSessionId);
+    }
+  }
+
+  private providerSettingsRestored(loaded: LoadedSession, previous: RuntimeSession, error: unknown): boolean {
+    const restored = loaded.runtime.getSession(loaded.record.localSessionId);
+    const saved = this.store.getSession(loaded.record.localSessionId);
+    const keys = ["remoteSessionId", "modelProvider", "model", "reasoningEffort", "permissionMode"] as const;
+    return error instanceof ProviderSwitchError && error.previousSettingsRestored
+      && Boolean(restored && saved && keys.every((key) => restored[key] === previous[key] && saved[key] === previous[key]));
   }
 
   private pendingProviderNotice(pending: PendingProviderSettings): string {
@@ -5701,6 +5777,7 @@ export class ProxySessionController {
         ?? this.controlSessionReplyTarget(loaded.record)?.messageId,
     };
     this.store.savePendingProviderSettings(pending);
+    await this.reconcilePreparedSettingsSession(loaded);
     if (!loaded.session.activeTurnId) {
       await this.applyPendingProviderSettings(loaded);
       void this.scheduleNextQueuedPrompt(loaded.record.localSessionId).catch((error: unknown) => {
@@ -5709,7 +5786,7 @@ export class ProxySessionController {
       return;
     }
     if (options.updateMessageId) {
-      await this.openExecutionSettings(contextKey, activeTab, options);
+      await this.openExecutionSettingsNow(contextKey, activeTab, options);
     } else {
       await this.outbound.sendText(contextKey, this.pendingProviderNotice(pending).replaceAll("`", ""));
     }
@@ -5719,6 +5796,7 @@ export class ProxySessionController {
   private async applyPendingProviderSettings(loaded: LoadedSession): Promise<void> {
     const pending = this.store.getPendingProviderSettings(loaded.record.localSessionId);
     if (!pending) return;
+    await this.reconcilePreparedSettingsSession(loaded);
     if (loaded.runtime.getSession(loaded.record.localSessionId)?.activeTurnId) return;
     if (pending.error) throw new Error(this.pendingProviderNotice(pending));
     const previous = { ...(loaded.runtime.getSession(loaded.record.localSessionId) ?? loaded.session) };
@@ -5731,12 +5809,7 @@ export class ProxySessionController {
       notice = `Provider 已切换为 ${cardCode(pending.settings.modelProvider)}，模型 ${cardCode(pending.settings.model)}，从下一轮生效。`;
     } catch (error) {
       const restored = loaded.runtime.getSession(pending.localSessionId);
-      const saved = this.store.getSession(pending.localSessionId);
-      const settingsKeys = [
-        "remoteSessionId", "modelProvider", "model", "reasoningEffort", "permissionMode",
-      ] as const;
-      rolledBack = error instanceof ProviderSwitchError && error.previousSettingsRestored
-        && Boolean(restored && saved && settingsKeys.every((key) => restored[key] === previous[key] && saved[key] === previous[key]));
+      rolledBack = this.providerSettingsRestored(loaded, previous, error);
       if (rolledBack) {
         loaded.session = restored!;
         this.store.deletePendingProviderSettings(pending.localSessionId);
@@ -5754,7 +5827,7 @@ export class ProxySessionController {
         ? { messageId: pending.replyMessageId, replyInThread: true } : undefined, async () => {
         if (pending.messageId) {
           try {
-            await this.openExecutionSettings(pending.contextKey, pending.activeTab ?? "provider", {
+            await this.openExecutionSettingsNow(pending.contextKey, pending.activeTab ?? "provider", {
               sessionId: pending.localSessionId, updateMessageId: pending.messageId,
               notice: failure || rolledBack ? undefined : notice,
               warning: rolledBack ? notice.replaceAll("`", "") : undefined,
@@ -5783,7 +5856,7 @@ export class ProxySessionController {
         return;
       }
       try {
-        const loaded = await this.loadSession(record);
+        const loaded = await this.loadSession(record, true);
         await this.applyPendingProviderSettings(loaded);
       } catch (error) {
         this.logger.warn({ error, sessionId }, "Deferred Provider switch could not be applied.");
@@ -5851,13 +5924,13 @@ export class ProxySessionController {
 
   private async modelNow(contextKey: string, model?: string, options: ModelCardOptions = {}): Promise<void> {
     if (!model) {
-      await this.openExecutionSettings(contextKey, "model", options);
+      await this.openExecutionSettingsNow(contextKey, "model", options);
       return;
     }
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
-    const loaded = await this.loadSession(record);
+    const loaded = await this.loadSession(record, true);
     const pending = this.store.getPendingProviderSettings(record.localSessionId);
     const selectedSettings = pending?.settings ?? loaded.session;
     if (options.expectedProvider && options.expectedProvider !== selectedSettings.modelProvider) {
@@ -5877,18 +5950,20 @@ export class ProxySessionController {
       await this.savePendingProviderSelection(loaded, { ...pending.settings, model, reasoningEffort: selectProviderReasoningEffort(selected, nextEffort) }, contextKey, options, "model");
       return;
     }
-    await loaded.runtime.setModel(loaded.record.localSessionId, model);
-    if (nextEffort && nextEffort !== currentEffort) {
-      await loaded.runtime.setReasoningEffort(loaded.record.localSessionId, nextEffort);
-    }
-    this.store.updateRuntimeSession(loaded.record.localSessionId, { model, reasoningEffort: nextEffort });
-    this.outbound.updateSessionModel(loaded.record.localSessionId, model, loaded.session.modelProvider);
-    await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
+    await this.sessionHydrationOperations.run(loaded.record.localSessionId, async () => {
+      await loaded.runtime.setModel(loaded.record.localSessionId, model);
+      if (nextEffort && nextEffort !== currentEffort) {
+        await loaded.runtime.setReasoningEffort(loaded.record.localSessionId, nextEffort);
+      }
+      this.store.updateRuntimeSession(loaded.record.localSessionId, { model, reasoningEffort: nextEffort });
+      this.outbound.updateSessionModel(loaded.record.localSessionId, model, loaded.session.modelProvider);
+      await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
+    });
     const effortMessage = nextEffort && nextEffort !== currentEffort
       ? `，思考强度已自动调整为 ${nextEffort}`
       : "";
     if (options.updateMessageId) {
-      await this.openExecutionSettings(contextKey, "model", {
+      await this.openExecutionSettingsNow(contextKey, "model", {
         sessionId: loaded.record.localSessionId,
         updateMessageId: options.updateMessageId,
         notice: `模型已切换为 ${cardCode(model)}${effortMessage}，并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`,
@@ -6305,13 +6380,13 @@ export class ProxySessionController {
 
   private async thinkingNow(contextKey: string, effort?: string, options: ThinkingCardOptions = {}): Promise<void> {
     if (!effort) {
-      await this.openExecutionSettings(contextKey, "thinking", options);
+      await this.openExecutionSettingsNow(contextKey, "thinking", options);
       return;
     }
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
-    const loaded = await this.loadSession(record);
+    const loaded = await this.loadSession(record, true);
     const pending = this.store.getPendingProviderSettings(record.localSessionId);
     const selectedSettings = pending?.settings ?? loaded.session;
     if (options.expectedProvider && options.expectedProvider !== selectedSettings.modelProvider) {
@@ -6334,11 +6409,13 @@ export class ProxySessionController {
       await this.savePendingProviderSelection(loaded, { ...pending.settings, reasoningEffort: effort }, contextKey, options, "thinking");
       return;
     }
-    await loaded.runtime.setReasoningEffort(loaded.record.localSessionId, effort);
-    this.store.updateRuntimeSession(loaded.record.localSessionId, { reasoningEffort: effort });
-    await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
+    await this.sessionHydrationOperations.run(loaded.record.localSessionId, async () => {
+      await loaded.runtime.setReasoningEffort(loaded.record.localSessionId, effort);
+      this.store.updateRuntimeSession(loaded.record.localSessionId, { reasoningEffort: effort });
+      await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
+    });
     if (options.updateMessageId) {
-      await this.openExecutionSettings(contextKey, "thinking", {
+      await this.openExecutionSettingsNow(contextKey, "thinking", {
         sessionId: loaded.record.localSessionId,
         updateMessageId: options.updateMessageId,
         notice: `思考强度已切换为 ${cardCode(effort)}，并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`,
@@ -6362,24 +6439,27 @@ export class ProxySessionController {
     options: ModelCardOptions = {},
   ): Promise<void> {
     if (!mode) {
-      await this.openExecutionSettings(contextKey, "permission", options);
+      await this.openExecutionSettingsNow(contextKey, "permission", options);
       return;
     }
     const record = options.sessionId
       ? this.requireSession(contextKey, options.sessionId)
       : this.requireCurrentSession(contextKey);
-    const loaded = await this.loadSession(record);
+    const loaded = await this.loadSession(record, true);
     const pending = this.store.getPendingProviderSettings(record.localSessionId);
     if (pending) {
       await this.savePendingProviderSelection(loaded, { ...pending.settings, permissionMode: mode }, contextKey, options, "permission");
       return;
     }
-    await loaded.runtime.setPermissionMode(record.localSessionId, mode);
-    loaded.session.permissionMode = mode;
-    this.store.updateRuntimeSession(record.localSessionId, { permissionMode: mode });
-    await this.persistAgentExecutionDefaults(record.localSessionId);
+    await this.sessionHydrationOperations.run(record.localSessionId, async () => {
+      await loaded.runtime.setPermissionMode(record.localSessionId, mode);
+      loaded.session = loaded.runtime.getSession(record.localSessionId) ?? loaded.session;
+      loaded.session.permissionMode = mode;
+      this.store.updateRuntimeSession(record.localSessionId, { permissionMode: mode });
+      await this.persistAgentExecutionDefaults(record.localSessionId);
+    });
     if (options.updateMessageId) {
-      await this.openExecutionSettings(contextKey, "permission", {
+      await this.openExecutionSettingsNow(contextKey, "permission", {
         sessionId: loaded.record.localSessionId,
         updateMessageId: options.updateMessageId,
         notice: mode === "auto"
@@ -7587,6 +7667,7 @@ export class ProxySessionController {
       }
       const localActiveTurnId = runtime.getSession(record.localSessionId)?.activeTurnId;
       const runtimeOwnsActiveTurn = Boolean(localActiveTurnId)
+        && (!this.settingsOnlySessions.has(record.localSessionId) || Boolean(activity.activeTurnId))
         && (!activity.activeTurnId || activity.activeTurnId === localActiveTurnId);
       const persistedTurnMatches = record.status === "running"
         && record.lastTurnStatus === "running"
@@ -7988,6 +8069,12 @@ export class ProxySessionController {
   }
 
   private async persistAgentExecutionDefaults(localSessionId: string, candidate?: RuntimeSession): Promise<void> {
+    const record = this.store.getSession(localSessionId);
+    if (!record) throw new Error(`找不到任务：${localSessionId}`);
+    return this.agentDefaultsOperations.run(record.agentName, () => this.persistAgentExecutionDefaultsNow(localSessionId, candidate));
+  }
+
+  private async persistAgentExecutionDefaultsNow(localSessionId: string, candidate?: RuntimeSession): Promise<void> {
     const record = this.store.getSession(localSessionId);
     if (!record) throw new Error(`找不到任务：${localSessionId}`);
     const session = candidate ?? record;
@@ -9604,7 +9691,8 @@ function isRetryableLlmTurnFailure(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) return false;
   const permanentFailure = [
-    /auth(?:entication|orization)?\b|unauthorized|forbidden|invalid api key|incorrect api key/u,
+    /\b(?:auth|authenticat\w*|unauthenticat\w*|authoriz\w*|unauthorized|forbidden)\b|invalid api key|incorrect api key/u,
+    /(?:^|\D)(?:401|403)(?:\D|$)/u,
     /insufficient[_ -]?quota|quota (?:exceeded|exhausted)|usage limit|billing|credit balance/u,
     /context (?:length|window)|maximum context|too many tokens|token limit/u,
     /invalid request|bad request|invalid argument|malformed|unsupported|not supported/u,

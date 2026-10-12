@@ -35,7 +35,7 @@ import { formatCodexError, mapCodexNotification } from "./CodexEventMapper.js";
 import { CodexLocalActivityDetector } from "./CodexLocalActivityDetector.js";
 import { detectProjectlessWorkspace } from "./ProjectlessWorkspace.js";
 import { threadWriterLockPath } from "./ThreadWriterProcess.js";
-import { assertProviderSettingsApplied, PROVIDER_SWITCH_BUSY, ProviderSwitchError, providerSwitchFailure } from "./ProviderSwitch.js";
+import { assertProviderSettingsApplied, PROVIDER_SWITCH_BUSY, PROVIDER_SWITCH_EMPTY, ProviderSwitchError, providerSwitchFailure } from "./ProviderSwitch.js";
 import { fetchProviderModels, type ProviderModelConfig } from "./ProviderModels.js";
 
 const WINDOWS_SCREENSHOT_DEVELOPER_INSTRUCTIONS = [
@@ -91,7 +91,6 @@ interface CodexSession extends RuntimeSession {
   unphasedFinalMessageId?: string;
   needsResume: boolean;
   workspaceSandboxPolicy?: WorkspaceSandboxPolicy;
-  canReplaceEmptyThread: boolean;
   settingsRecoveryError?: string;
   rolloutPath?: string;
   turnCount?: number;
@@ -184,6 +183,20 @@ export class CodexRuntime implements AgentRuntime {
     return this.runSessionOperation(input.localSessionId, () => this.resumeSessionNow(input));
   }
 
+  async prepareSessionForSettings(input: ResumeRuntimeSessionInput): Promise<RuntimeSession> {
+    return this.runSessionOperation(input.localSessionId, async () => {
+      const existing = this.sessions.get(input.localSessionId);
+      if (existing) return existing;
+      const session = this.makeSession(input, {
+        thread: { id: input.remoteSessionId, name: input.title },
+        modelProvider: input.modelProvider, model: input.model,
+      }, input.reasoningEffort);
+      session.needsResume = true;
+      this.sessions.set(input.localSessionId, session);
+      return session;
+    });
+  }
+
   private async resumeSessionNow(input: ResumeRuntimeSessionInput): Promise<RuntimeSession> {
     const client = await this.client();
     const response = await client.request<ThreadResponse>("thread/resume", {
@@ -195,8 +208,16 @@ export class CodexRuntime implements AgentRuntime {
       ...threadLifecycleParams(input.cwd),
       ...permissionParams(input.permissionMode),
     }, SESSION_REQUEST_TIMEOUT_MS);
+    if (response.thread.id !== input.remoteSessionId) throw new Error("App Server 返回了不同的任务 ID，未恢复会话。");
     const reasoningEffort = await this.resolveReasoningEffort(input, response);
     const session = this.makeSession(input, response, reasoningEffort);
+    try {
+      assertProviderSettingsApplied(response, { modelProvider: input.modelProvider });
+    } catch (error) {
+      // Keep the attachment available for an explicit settings repair, but never send to the wrong Provider.
+      session.settingsRecoveryError = providerSwitchFailure(error);
+      session.needsResume = true;
+    }
     this.sessions.set(input.localSessionId, session);
     return session;
   }
@@ -243,7 +264,6 @@ export class CodexRuntime implements AgentRuntime {
     const session = this.requireSession(sessionId);
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
-    session.canReplaceEmptyThread = false;
     const start = async () => client.request<{ turn: { id: string } }>("turn/start", {
       threadId: session.remoteSessionId,
       input: codexUserInput(prompt),
@@ -591,9 +611,10 @@ export class CodexRuntime implements AgentRuntime {
       .find((session) => session.remoteSessionId === remoteSessionId);
     const detectedTurnId = activeThreads?.get(remoteSessionId);
     // A turn started in this process is evidence; a restored activeTurnId alone is not.
+    const observedTurnId = runtimeSession?.activeTurnStartedAt !== undefined ? runtimeSession.activeTurnId : undefined;
     const active = status === "active" || Boolean(activeThreads?.has(remoteSessionId))
-      || Boolean(runtimeSession?.activeTurnId && runtimeSession.activeTurnStartedAt !== undefined);
-    const activeTurnId = detectedTurnId ?? runtimeSession?.activeTurnId;
+      || Boolean(observedTurnId);
+    const activeTurnId = detectedTurnId ?? observedTurnId;
     return {
       active,
       ...(active && activeTurnId ? { activeTurnId } : {}),
@@ -696,7 +717,6 @@ export class CodexRuntime implements AgentRuntime {
     const session = this.requireSession(sessionId);
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
-    session.canReplaceEmptyThread = false;
     const response = await client.request<{ goal: RuntimeGoal }>(
       "thread/goal/set",
       { threadId: session.remoteSessionId, ...update },
@@ -745,7 +765,7 @@ export class CodexRuntime implements AgentRuntime {
         if (error instanceof ProviderSwitchError) throw error;
         // Errors outside the mutation block are preflight failures; no settings were changed.
         const session = this.sessions.get(sessionId);
-        throw new ProviderSwitchError(providerSwitchFailure(error), Boolean(session && !session.settingsRecoveryError), { cause: error });
+        throw new ProviderSwitchError(providerSwitchFailure(error), Boolean(session && !session.needsResume && !session.settingsRecoveryError), { cause: error });
       }
     });
   }
@@ -765,82 +785,54 @@ export class CodexRuntime implements AgentRuntime {
     if (metadata.thread.status?.type === "active" || localActive?.has(session.remoteSessionId) || session.activeTurnId) {
       throw new Error(PROVIDER_SWITCH_BUSY);
     }
-    let empty = false;
-    if (session.canReplaceEmptyThread && !metadata.thread.forkedFromId && !metadata.thread.preview?.trim()) {
+    if (session.turnCount === 0 && !metadata.thread.forkedFromId && !metadata.thread.preview?.trim()) {
       try {
         const turns = await this.readLatestThreadTurns(client, session.remoteSessionId, "summary");
-        empty = turns.length === 0;
-        if (!empty) session.canReplaceEmptyThread = false;
+        if (turns.length === 0) throw new Error(PROVIDER_SWITCH_EMPTY);
       } catch (error) {
         if (!(error instanceof AppServerRequestError) || error.method !== "thread/turns/list"
           || !/missing source rollout|no rollout found/iu.test(error.serverMessage)) throw error;
-        empty = true;
+        throw new Error(PROVIDER_SWITCH_EMPTY, { cause: error });
       }
     }
     const previous = { ...session };
-    let replacementId: string | undefined;
+    const restoreProvider = previous.modelProvider?.trim()
+      || (metadata.thread.id === previous.remoteSessionId ? metadata.thread.modelProvider?.trim() : undefined);
     let detached = false;
     try {
       const params = {
         cwd: session.cwd, modelProvider: settings.modelProvider, model: settings.model,
         ...threadLifecycleParams(session.cwd), ...permissionParams(settings.permissionMode),
       };
-      if (!empty) {
-        await this.detachThreadForSettings(client, session);
-        detached = true;
-      }
-      let response: ThreadResponse;
-      if (empty) {
-        response = await client.request<ThreadResponse>("thread/start", {
-          ...params, threadSource: "user", allowProviderModelFallback: false,
-        }, SESSION_REQUEST_TIMEOUT_MS);
-        replacementId = response.thread.id;
-      } else {
-        response = await client.request<ThreadResponse>("thread/resume", {
-          ...params, threadId: session.remoteSessionId, excludeTurns: true,
-        }, SESSION_REQUEST_TIMEOUT_MS);
-        if (!providerSettingsMatch(response, settings)) {
-          this.logger.warn(
-            {
-              sessionId,
-              threadId: session.remoteSessionId,
-              requestedProvider: settings.modelProvider,
-              actualProvider: response.modelProvider,
-              requestedModel: settings.model,
-              actualModel: response.model,
-            },
-            "App Server did not apply Provider settings while resuming; forking the latest completed Turn.",
-          );
-          await this.detachThreadForSettings(client, session);
-          response = await this.forkThreadForSettings(client, session, settings);
-          replacementId = response.thread.id;
-        }
-      }
+      await this.detachThreadForSettings(client, session, () => { detached = true; });
+      const response = await client.request<ThreadResponse>("thread/resume", {
+        ...params, threadId: session.remoteSessionId, excludeTurns: true,
+      }, SESSION_REQUEST_TIMEOUT_MS);
       assertProviderSettingsApplied(response, settings);
-      if (!empty && !replacementId && response.thread.id !== session.remoteSessionId) {
+      if (response.thread.id !== session.remoteSessionId) {
         throw new Error("App Server 返回了不同的任务 ID，未保存设置。");
       }
-      if (session.title && (empty || replacementId)) await client.request("thread/name/set", {
-        threadId: response.thread.id, name: session.title,
-      }, SESSION_REQUEST_TIMEOUT_MS);
-      const candidate = { ...session, ...settings, remoteSessionId: response.thread.id,
+      const candidate = { ...session, ...settings,
         workspaceSandboxPolicy: workspaceSandboxFromResponse(response.sandbox),
         needsResume: false, settingsRecoveryError: undefined };
       await persist?.(candidate);
-      Object.assign(session, candidate);
+      Object.assign(session, settings);
+      session.workspaceSandboxPolicy = candidate.workspaceSandboxPolicy;
+      session.needsResume = this.attachedClient !== client;
+      session.settingsRecoveryError = undefined;
     } catch (error) {
-      if (replacementId) await this.discardUnusedThread(client, replacementId);
       let recovery = "原任务设置未更改。";
       if (detached) {
         try {
+          if (!restoreProvider) throw new Error("无法确认切换前的 Provider，不能验证原设置已恢复。");
           await this.detachThreadForSettings(client, previous);
           const restored = await client.request<ThreadResponse>("thread/resume", {
             threadId: previous.remoteSessionId, excludeTurns: true, cwd: previous.cwd,
-            modelProvider: previous.modelProvider, model: previous.model,
+            modelProvider: restoreProvider, model: previous.model,
             ...threadLifecycleParams(previous.cwd), ...permissionParams(previous.permissionMode),
           }, SESSION_REQUEST_TIMEOUT_MS);
-          if (previous.modelProvider && previous.model) assertProviderSettingsApplied(restored, {
-            modelProvider: previous.modelProvider, model: previous.model,
+          assertProviderSettingsApplied(restored, {
+            modelProvider: restoreProvider, model: previous.model,
           });
           if (restored.thread.id !== previous.remoteSessionId) throw new Error("恢复时返回了不同的任务 ID。");
           session.needsResume = false;
@@ -855,54 +847,24 @@ export class CodexRuntime implements AgentRuntime {
       }
       throw new ProviderSwitchError(
         `Provider 切换失败：${providerSwitchFailure(error)} ${recovery}`,
-        !session.settingsRecoveryError, { cause: error },
+        !session.needsResume && !session.settingsRecoveryError, { cause: error },
       );
     }
-    if (replacementId) await this.discardUnusedThread(client, previous.remoteSessionId);
     return session;
   }
 
-  private async detachThreadForSettings(client: AppServerClient, session: CodexSession): Promise<void> {
+  private async detachThreadForSettings(client: AppServerClient, session: CodexSession, onDetach?: () => void): Promise<void> {
     const current = await client.request<ThreadReadResponse>("thread/read", {
       threadId: session.remoteSessionId, includeTurns: false,
     }, SYNC_REQUEST_TIMEOUT_MS);
     if (session.activeTurnId || current.thread.status?.type === "active") throw new Error(PROVIDER_SWITCH_BUSY);
+    // A timeout does not cancel the remote unsubscribe, so recovery is required once it is sent.
+    onDetach?.();
     const result = await client.request<{ status: string }>("thread/unsubscribe", {
       threadId: session.remoteSessionId,
     }, CONTROL_REQUEST_TIMEOUT_MS);
-    if (result.status !== "unsubscribed" && result.status !== "notLoaded") {
-      throw new Error("当前任务仍由其他客户端加载，无法安全切换 Provider。请先在原客户端释放任务。");
-    }
-  }
-
-  private async forkThreadForSettings(
-    client: AppServerClient,
-    session: CodexSession,
-    settings: RuntimeExecutionSettings,
-  ): Promise<ThreadResponse> {
-    const turns = await this.listRecentThreadTurnsThroughCompleted(client, session.remoteSessionId);
-    const lastTurnId = turns.find((turn) => turn.status === "completed")?.id;
-    if (!lastTurnId) {
-      throw new Error("无法为 Provider 切换找到已完成的 Turn。请先完成一轮任务后重试。");
-    }
-    return client.request<ThreadResponse>("thread/fork", {
-      threadId: session.remoteSessionId,
-      lastTurnId,
-      cwd: session.cwd,
-      model: settings.model,
-      modelProvider: settings.modelProvider,
-      threadSource: "user",
-      excludeTurns: true,
-      ...threadLifecycleParams(session.cwd),
-      ...permissionParams(settings.permissionMode),
-    }, FORK_REQUEST_TIMEOUT_MS);
-  }
-
-  private async discardUnusedThread(client: AppServerClient, threadId: string): Promise<void> {
-    try {
-      await client.request("thread/unsubscribe", { threadId }, CONTROL_REQUEST_TIMEOUT_MS);
-    } catch (error) {
-      this.logger.warn({ error, threadId }, "Failed to release an unused empty Thread after changing Provider.");
+    if (!["unsubscribed", "notLoaded", "notSubscribed"].includes(result.status)) {
+      throw new Error(`App Server 返回了未知的取消订阅状态：${result.status}`);
     }
   }
 
@@ -1421,6 +1383,8 @@ export class CodexRuntime implements AgentRuntime {
       ...threadLifecycleParams(session.cwd),
       ...permissionParams(session.permissionMode),
     }, SESSION_REQUEST_TIMEOUT_MS);
+    if (response.thread.id !== session.remoteSessionId) throw new Error("App Server 返回了不同的任务 ID，未恢复会话。");
+    assertProviderSettingsApplied(response, { modelProvider: session.modelProvider });
     session.workspaceSandboxPolicy = workspaceSandboxFromResponse(response.sandbox);
   }
 
@@ -1499,7 +1463,6 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   private adoptTurn(session: CodexSession, turnId: string, startedAt: number): void {
-    session.canReplaceEmptyThread = false;
     if (!session.knownTurnIds.has(turnId)) {
       session.knownTurnIds.add(turnId);
       if (session.turnCount !== undefined) session.turnCount += 1;
@@ -1608,7 +1571,6 @@ export class CodexRuntime implements AgentRuntime {
       unphasedMessages: new Map(),
       needsResume: false,
       workspaceSandboxPolicy: workspaceSandboxFromResponse(response.sandbox),
-      canReplaceEmptyThread: !("remoteSessionId" in input),
       rolloutPath: stringValue(response.thread.path)?.trim() || undefined,
       turnCount: "remoteSessionId" in input ? undefined : 0,
       knownTurnIds: new Set(),
@@ -2047,13 +2009,6 @@ function remoteThreadStatus(value: string | undefined): RemoteSessionSummary["st
   if (value === "idle") return "idle";
   if (value === "systemError") return "error";
   return "not_loaded";
-}
-
-function providerSettingsMatch(
-  response: Pick<ThreadResponse, "modelProvider" | "model">,
-  settings: RuntimeExecutionSettings,
-): boolean {
-  return response.modelProvider === settings.modelProvider && response.model === settings.model;
 }
 
 function codexSourceLabel(source: unknown): string {

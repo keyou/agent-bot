@@ -14,6 +14,19 @@ afterEach(() => {
 });
 
 describe("writeAgentExecutionDefaults", () => {
+  test.each([{}, { permissionMode: "auto" as const }])("restores absent or partial defaults after a rejected switch: %j", (previous) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-agent-defaults-"));
+    directories.push(directory);
+    const configPath = path.join(directory, "config.yaml");
+    fs.writeFileSync(configPath, "# preserve\nagents:\n  codex:\n    command: codex\n  traex:\n    command: traex\n");
+    writeAgentExecutionDefaults(configPath, "codex", previous);
+    const before = parse(fs.readFileSync(configPath, "utf8"));
+    writeAgentExecutionDefaults(configPath, "codex", { modelProvider: "rejected", model: "new-model", reasoningEffort: "high", permissionMode: "confirm" });
+    writeAgentExecutionDefaults(configPath, "codex", previous);
+    expect(parse(fs.readFileSync(configPath, "utf8"))).toEqual(before);
+    expect(fs.readFileSync(configPath, "utf8")).toContain("# preserve");
+  });
+
   test("creates missing defaults in an older config and keeps subsequent writes idempotent", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-agent-defaults-"));
     directories.push(directory);

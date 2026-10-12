@@ -33,7 +33,9 @@ export function writeAgentExecutionDefaults(
   for (const key of DEFAULT_KEYS) {
     const value = defaults[key];
     if (value !== undefined) target.set(key, value);
+    else target.delete(key);
   }
+  if (target.items.length === 0) agent.delete("defaults");
 
   const updated = document.toString();
   if (updated === original) return false;

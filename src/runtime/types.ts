@@ -284,6 +284,9 @@ export interface AgentRuntime {
   getThreadWriterLockPath?(remoteSessionId: string): string | undefined;
   createSession(input: CreateRuntimeSessionInput): Promise<RuntimeSession>;
   resumeSession(input: ResumeRuntimeSessionInput): Promise<RuntimeSession>;
+  // Hydrate the saved same-thread snapshot without contacting the old Provider.
+  // The runtime must verify a resume before any subsequent turn or remote operation.
+  prepareSessionForSettings?(input: ResumeRuntimeSessionInput): Promise<RuntimeSession>;
   forkSession?(input: ForkRuntimeSessionInput): Promise<RuntimeSession>;
   getSession(localSessionId: string): RuntimeSession | undefined;
   // Drop local monitoring only; do not interrupt, unsubscribe, or archive remote work.
