@@ -8,11 +8,25 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### 中文
 
-- 支持运行中预选 Provider：卡片立即展示待生效 Provider 和模型，可继续选择目标 Provider 的模型，本轮结束后按最后选择应用。待生效设置跨重启保留；切换失败自动回退原 Provider 和模型，确认回退后同步恢复卡片并继续排队消息，回退失败时明确提示并暂停。
+- 命令卡片新增独立网页终端，支持连续输入、ANSI 颜色、调整尺寸、复制粘贴与断线重连。终端与 Preview 共用地址，在原会话/话题核对验证码并由所有者授权，以主机用户权限运行，不重放原命令；原始 HTML/SVG/XML 保持沙箱隔离。
+- 终端管理卡支持打开、恢复、关闭和刷新；使用稳定的 8 位链接标识，丢失页面后可重新授权恢复原 Shell。支持手机授权后自动恢复连接，避免历史回放产生多余输入。断开三分钟、后台无输入输出三十分钟或总时长八小时后回收；安全重启等待活动终端关闭。
+- 支持运行中预选 Provider 和模型，本轮结束后应用最后选择，待生效设置跨重启保留。切换始终保留任务 ID 和完整历史，不隐式 Fork 或替换空任务；切换失败验证回退，无法确认恢复时暂停后续消息并明确提示。设置入口不再被故障的旧 Provider 阻塞，修复默认配置并发保存、恢复/重连校验及认证失败误重试。
+- 模型卡片每页最多显示 20 个模型，支持原卡片翻页，默认定位当前模型；翻页不改变任务设置，并校验 Provider 是否已切换。
+- 修复转发消息附言被拆成追加消息、主 Prompt 错用转发内容的问题；附言作为主 Prompt，转发内容和附件保留为参考，避免慢 Reaction 拆散已关联消息。
+- 修复新建空任务无法归档或解散群的问题：仅对确认未生成历史的任务安全释放，不读取完整历史或发送虚构消息，保留活动任务和历史保护。
+- 修复 TraeX 批准方案后未继续执行的问题：在原任务、话题和思考卡片中衔接执行，保留审批记录、Reaction 与消息队列；Preview 使用同一追加日志和 SSE 连续更新，处理通知乱序、重复、取消及启动失败。
+- TraeX 规划确认遵循任务权限：auto 自动同意，confirm 保留手动按钮。思考卡片和 Preview 保留自动审批记录；自动回复失败时提示并恢复手动确认，仍遵守用户仅讨论或禁止实施的明确要求。
 
 ### English
 
-- Stage Provider changes during active turns, immediately showing the pending Provider/model and its model catalog. Apply the latest selection before the next turn, persist pending settings across restarts, and roll back failed switches to the original Provider/model. Restore the card and resume queued prompts only after verified rollback; pause with an error if rollback fails.
+- Add independent browser terminals to command cards, with continuous input, ANSI colors, resizing, clipboard support and reconnects. Share Preview addressing, require owner approval of a matching code in the original conversation/topic, and run as the host user without replaying the original command. Keep raw HTML/SVG/XML documents sandboxed.
+- Add terminal management cards for opening, recovering, closing and refreshing the same Shell through stable eight-character links and fresh recovery approval. Recover after mobile authorization and network interruptions without replay-generated input. Reclaim terminals after three disconnected minutes, thirty minutes of background I/O inactivity, or eight hours total; safe restart waits for active terminals.
+- Stage Provider/model choices during active turns and apply the latest selection afterward, preserving pending settings across restarts. Keep task IDs and complete history without implicit forks or empty-thread replacement. Verify rollback on failure and pause further messages if recovery cannot be confirmed. Keep settings accessible with a broken old Provider; fix concurrent defaults persistence, resume/reconnect verification and retries of permanent authentication failures.
+- Paginate model cards at twenty models per page, opening on the current model. Update the existing card without changing task settings and guard against Provider changes while paging.
+- Use the user's attached forwarding instruction as the main Prompt, retaining forwarded text and attachments as reference material. Prevent slow Reactions from splitting already-associated messages.
+- Fix archive/Dismiss for new empty tasks by safely releasing only confirmed unmaterialized tasks, without full-history reads or synthetic messages, while retaining activity and history safeguards.
+- Continue TraeX execution after plan approval in the original task, topic and progress card. Preserve approval history, reactions and queues; keep Preview live through one append-only journal and SSE, handling out-of-order notifications, duplicates, cancellation and startup failures.
+- Honor task permissions for TraeX plan confirmations: auto accepts automatically and confirm retains manual controls. Record automatic decisions in the card and Preview, fall back to manual confirmation if the response fails, and continue respecting explicit discussion-only or no-implementation instructions.
 
 ## [0.1.24-alpha.5] - 2026-09-24
 
