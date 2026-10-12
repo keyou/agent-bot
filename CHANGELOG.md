@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.6] - 2026-10-12
+
 ### 中文
 
 - 命令卡片新增独立网页终端，支持连续输入、ANSI 颜色、调整尺寸、复制粘贴与断线重连。终端与 Preview 共用地址，在原会话/话题核对验证码并由所有者授权，以主机用户权限运行，不重放原命令；原始 HTML/SVG/XML 保持沙箱隔离。
