@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24-alpha.7] - 2026-10-14
+
 ### 中文
 
 - 修复 TraeX 已进入规划模式却误报“自动同意失败”的问题：仅在核实同一轮同一次 EnterPlanMode 成功结果后消除误报，保留审批记录；未确认成功时仍提示手动处理，不改变方案批准后的继续执行逻辑。
