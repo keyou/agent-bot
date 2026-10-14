@@ -4,6 +4,7 @@ import type { PlanStep, ToolState } from "../runtime/types.js";
 const modeChangeRequest = z.object({
   requestId: z.string().min(1),
   targetMode: z.enum(["plan", "default"]),
+  sourceToolCallId: z.string().min(1).nullish(),
   reason: z.string(),
   allowedPrompts: z.array(z.object({ tool: z.string(), prompt: z.string() })).optional(),
 });

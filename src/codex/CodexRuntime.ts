@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import type {
   AgentRuntime,
@@ -34,6 +35,7 @@ import { AppServerRequestError } from "./AppServerConnection.js";
 import { workspaceSandboxFromConfig, workspaceSandboxFromResponse, type TurnSandboxPolicy, type WorkspaceSandboxPolicy } from "./AppServerPermissions.js";
 import { formatCodexError, mapCodexNotification } from "./CodexEventMapper.js";
 import { CodexLocalActivityDetector } from "./CodexLocalActivityDetector.js";
+import { hasCompletedTraePlanEntry } from "./TraePlanEntry.js";
 import { detectProjectlessWorkspace } from "./ProjectlessWorkspace.js";
 import { threadWriterLockPath } from "./ThreadWriterProcess.js";
 import { assertProviderSettingsApplied, PROVIDER_SWITCH_BUSY, PROVIDER_SWITCH_EMPTY, ProviderSwitchError, providerSwitchFailure } from "./ProviderSwitch.js";
@@ -110,6 +112,7 @@ interface PendingModeChange {
   turnId: string;
   requestId: string;
   targetMode: "plan" | "default";
+  sourceToolCallId?: string;
   responding: boolean;
   decision?: ApprovalDecision;
   automatic?: boolean;
@@ -950,11 +953,15 @@ export class CodexRuntime implements AgentRuntime {
       try {
         const client = await this.client();
         if (this.modeChanges.get(requestId) !== modeChange) throw new Error("Approval request is no longer pending.");
-        await client.request("mode/change/respond", {
-          threadId: this.requireSession(sessionId).remoteSessionId,
-          requestId: modeChange.requestId,
-          decision: decision === "accept" ? "approved" : decision === "decline" ? "rejected" : "cancelled",
-        }, CONTROL_REQUEST_TIMEOUT_MS);
+        try {
+          await client.request("mode/change/respond", {
+            threadId: this.requireSession(sessionId).remoteSessionId,
+            requestId: modeChange.requestId,
+            decision: decision === "accept" ? "approved" : decision === "decline" ? "rejected" : "cancelled",
+          }, CONTROL_REQUEST_TIMEOUT_MS);
+        } catch (error) {
+          if (!await this.reconcileCompletedPlanEntry(requestId, modeChange, error)) throw error;
+        }
         if (this.modeChanges.get(requestId) === modeChange) {
           this.confirmPlanContinuation(modeChange, decision);
           this.modeChanges.delete(requestId);
@@ -972,6 +979,36 @@ export class CodexRuntime implements AgentRuntime {
     this.approvals.delete(requestId);
     pending.resolve({ decision });
     this.emit({ type: "approval_resolved", sessionId, turnId: pending.turnId, requestId, decision });
+  }
+
+  private async reconcileCompletedPlanEntry(
+    requestId: string, pending: PendingModeChange, error: unknown,
+  ): Promise<boolean> {
+    const session = this.sessions.get(pending.sessionId);
+    if (!pending.automatic || pending.decision !== "accept" || pending.targetMode !== "plan"
+      || this.provider.getAgentFamily?.() !== "traex" || !session?.rolloutPath
+      || !(error instanceof AppServerRequestError) || error.method !== "mode/change/respond" || error.code !== -32600
+      || error.serverMessage !== `failed to respond to mode change request: No pending mode change found for request_id: ${pending.requestId}`) {
+      return false;
+    }
+    const toolCallId = pending.sourceToolCallId ?? pending.requestId;
+    for (const waitMs of [0, 100, 200]) {
+      if (waitMs) await delay(waitMs);
+      if (this.modeChanges.get(requestId) !== pending || this.sessions.get(pending.sessionId) !== session
+        || session.activeTurnId !== pending.turnId) return false;
+      try {
+        if (!await hasCompletedTraePlanEntry(session.rolloutPath, pending.turnId, toolCallId)) continue;
+        if (this.modeChanges.get(requestId) !== pending || this.sessions.get(pending.sessionId) !== session
+          || session.activeTurnId !== pending.turnId) return false;
+        this.logger.info({ sessionId: pending.sessionId, turnId: pending.turnId, requestId, toolCallId },
+          "Verified that TraeX already completed the automatic plan-mode entry.");
+        return true;
+      } catch (verificationError) {
+        this.logger.debug({ error: verificationError, sessionId: pending.sessionId, requestId },
+          "Could not verify TraeX plan-mode entry from the rollout tail.");
+      }
+    }
+    return false;
   }
 
   async listModels(modelProvider?: string, fallbackModel?: string): Promise<ModelOption[]> {
@@ -1217,6 +1254,7 @@ export class CodexRuntime implements AgentRuntime {
       const pending: PendingModeChange = {
         sessionId, turnId: mapped.turnId, requestId: mapped.requestId,
         targetMode: mapped.targetMode, responding: false,
+        sourceToolCallId: mapped.sourceToolCallId ?? undefined,
       };
       this.modeChanges.set(requestId, pending);
       const automatic = session.permissionMode === "auto" && this.provider.getAgentFamily?.() === "traex";
@@ -1236,8 +1274,9 @@ export class CodexRuntime implements AgentRuntime {
       this.emit({ type: "approval_requested", sessionId, turnId: mapped.turnId, request });
       if (automatic) {
         void this.resolveApproval(sessionId, requestId, "accept", true).catch((error: unknown) => {
-          this.logger.warn({ error, sessionId, requestId }, "Failed to automatically approve the TraeX mode change.");
           if (this.modeChanges.get(requestId) !== pending || session.activeTurnId !== mapped.turnId) return;
+          this.logger.warn({ error, sessionId, requestId, turnId: mapped.turnId, targetMode: mapped.targetMode,
+            sourceToolCallId: pending.sourceToolCallId }, "Failed to automatically approve the TraeX mode change.");
           this.emit({ type: "approval_requested", sessionId, turnId: mapped.turnId,
             request: { ...request, automatic: false, reason: ["自动同意失败，请手动确认。", request.reason].filter(Boolean).join("\n\n") } });
         });

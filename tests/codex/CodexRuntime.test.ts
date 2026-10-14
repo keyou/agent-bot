@@ -7,6 +7,7 @@ import type { RuntimeEvent, RuntimeExecutionSettings, RuntimeGoal } from "../../
 import { AppServerRequestError } from "../../src/codex/AppServerConnection.js";
 import { CodexRuntime, type AppServerClientProvider } from "../../src/codex/CodexRuntime.js";
 import { CodexLocalActivityDetector } from "../../src/codex/CodexLocalActivityDetector.js";
+import * as traePlanEntry from "../../src/codex/TraePlanEntry.js";
 import { PROVIDER_SWITCH_EMPTY, ProviderSwitchError } from "../../src/codex/ProviderSwitch.js";
 
 describe("CodexRuntime", () => {
@@ -3018,21 +3019,116 @@ describe("CodexRuntime mode confirmations", () => {
     reason: "Review the implementation plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
   };
 
-  async function setup(permissionMode: "auto" | "confirm" = "confirm", family: "codex" | "traex" = "traex") {
+  async function setup(permissionMode: "auto" | "confirm" = "confirm", family: "codex" | "traex" = "traex", rolloutPath?: string) {
     const client = new FakeAppServerClient();
+    if (rolloutPath) client.startResult = { thread: { id: "thr_1", path: rolloutPath } };
     let disconnect: ((error: Error) => void) | undefined;
+    const log = logger();
     const runtime = new CodexRuntime({
       ...provider(client),
       getAgentFamily: () => family,
       onDisconnect: (listener) => { disconnect = listener; return () => { disconnect = undefined; }; },
-    }, logger());
+    }, log);
     const events: RuntimeEvent[] = [];
     runtime.onEvent((event) => events.push(event));
     await runtime.createSession({ localSessionId: "s1", agentName: family, cwd: process.cwd(), permissionMode });
     await runtime.startTurn("s1", "create a plan");
     events.length = 0;
-    return { client, runtime, events, disconnect: () => disconnect?.(new Error("process exited")) };
+    return { client, runtime, events, log, disconnect: () => disconnect?.(new Error("process exited")) };
   }
+
+  const missingModeError = () => new AppServerRequestError("mode/change/respond", -32600,
+    "failed to respond to mode change request: No pending mode change found for request_id: request_1");
+  function planEntryRecords(callId: string): string {
+    return [
+      { type: "function_call", name: "EnterPlanMode", call_id: callId, arguments: "{}" },
+      { type: "function_call_output", call_id: callId, output: "Entered plan mode. More instructions." },
+    ].map((item) => JSON.stringify({ type: "history_mutation", payload: {
+      version: 1, turn_id: "turn_1", operation: "append", items: [item],
+    } }) + "\n").join("");
+  }
+
+  test.each([undefined, "source_call"])("verifies an already completed plan entry without manual controls (%s)", async (sourceToolCallId) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentbot-plan-"));
+    const file = path.join(dir, "rollout.jsonl");
+    fs.writeFileSync(file, planEntryRecords(sourceToolCallId ?? "request_1"));
+    const { client, runtime, events, log } = await setup("auto", "traex", file);
+    try {
+      client.modeChangeResponse = async () => { throw missingModeError(); };
+      const params = { ...notification, targetMode: "plan", sourceToolCallId };
+      client.emit("mode/changeRequested", params);
+      client.emit("mode/changeRequested", params);
+      await vi.waitFor(() => expect(events.filter((e) => e.type === "approval_resolved")).toHaveLength(1));
+      expect(events).toEqual([
+        expect.objectContaining({ type: "approval_requested", request: expect.objectContaining({ automatic: true }) }),
+        { type: "approval_resolved", sessionId: "s1", turnId: "turn_1", requestId, decision: "accept", automatic: true },
+      ]);
+      client.emit("mode/changeResolved", { ...params, decision: "approved" });
+      client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+      expect(events.filter((e) => e.type === "approval_resolved")).toHaveLength(1);
+      expect(events.at(-1)).not.toHaveProperty("approvedPlan");
+      expect(log.warn).not.toHaveBeenCalled();
+      expect(client.requests.filter((r) => r.method === "mode/change/respond")).toHaveLength(1);
+      expect(client.requests.some((r) => r.method === "thread/read" || r.method === "thread/turns/list")).toBe(false);
+    } finally { runtime.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("waits briefly for the completed plan entry to flush", async () => {
+    const verify = vi.spyOn(traePlanEntry, "hasCompletedTraePlanEntry").mockResolvedValueOnce(false).mockResolvedValue(true);
+    const { client, runtime, events } = await setup("auto", "traex", "test-rollout.jsonl");
+    try {
+      client.modeChangeResponse = async () => { throw missingModeError(); };
+      client.emit("mode/changeRequested", { ...notification, targetMode: "plan" });
+      await vi.waitFor(() => expect(events.filter((e) => e.type === "approval_resolved")).toHaveLength(1));
+      expect(verify).toHaveBeenCalledTimes(2);
+      expect(events.filter((e) => e.type === "approval_requested")).toHaveLength(1);
+    } finally { runtime.close(); verify.mockRestore(); }
+  });
+
+  test.each(["missing", "unreadable", "no-path", "transport", "different-request", "exit-plan"])(
+    "does not infer success without verified matching plan entry: %s", async (scenario) => {
+      const verify = vi.spyOn(traePlanEntry, "hasCompletedTraePlanEntry").mockResolvedValue(scenario !== "missing");
+      if (scenario === "unreadable") verify.mockRejectedValue(new Error("cannot read rollout"));
+      const { client, runtime, events } = await setup("auto", "traex", scenario === "no-path" ? undefined : "test-rollout.jsonl");
+      try {
+        client.modeChangeResponse = async () => {
+          if (scenario === "transport") throw new Error("transport failed");
+          if (scenario === "different-request") throw new AppServerRequestError("mode/change/respond", -32600,
+            "failed to respond to mode change request: No pending mode change found for request_id: another_request");
+          throw missingModeError();
+        };
+        client.emit("mode/changeRequested", { ...notification, targetMode: scenario === "exit-plan" ? "default" : "plan" });
+        await vi.waitFor(() => expect(events).toHaveLength(2));
+        expect(events[1]).toMatchObject({ type: "approval_requested", request: { automatic: false, reason: expect.stringContaining("自动同意失败") } });
+        expect(events.some((e) => e.type === "approval_resolved")).toBe(false);
+        expect(verify).toHaveBeenCalledTimes(["missing", "unreadable"].includes(scenario) ? 3 : 0);
+      } finally { runtime.close(); verify.mockRestore(); }
+    },
+  );
+
+  test.each(["completed", "interrupted", "failed", "disconnect", "resolved", "close"])(
+    "does not revive a request during verification after %s", async (scenario) => {
+      let finish!: (value: boolean) => void;
+      const verify = vi.spyOn(traePlanEntry, "hasCompletedTraePlanEntry").mockImplementation(
+        () => new Promise<boolean>((resolve) => { finish = resolve; }),
+      );
+      const { client, runtime, events, disconnect, log } = await setup("auto", "traex", "test-rollout.jsonl");
+      try {
+        client.modeChangeResponse = async () => { throw missingModeError(); };
+        client.emit("mode/changeRequested", { ...notification, targetMode: "plan" });
+        await vi.waitFor(() => expect(finish).toBeDefined());
+        if (scenario === "disconnect") disconnect();
+        else if (scenario === "close") runtime.close();
+        else if (scenario === "resolved") client.emit("mode/changeResolved", { ...notification, targetMode: "plan", decision: "rejected" });
+        else client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: scenario } });
+        const count = events.length;
+        finish(true);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(events).toHaveLength(count);
+        expect(log.warn).not.toHaveBeenCalled();
+      } finally { runtime.close(); verify.mockRestore(); }
+    },
+  );
 
   test.each(["plan", "default"])("requires explicit confirmation for %s in confirm mode", async (targetMode) => {
     const { client, runtime, events } = await setup();

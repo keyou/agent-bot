@@ -8,9 +8,13 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### 中文
 
+- 修复 TraeX 已进入规划模式却误报“自动同意失败”的问题：仅在核实同一轮同一次 EnterPlanMode 成功结果后消除误报，保留审批记录；未确认成功时仍提示手动处理，不改变方案批准后的继续执行逻辑。
+
 - 安全重启卡片逐个显示阻塞终端的 token、目录、活跃/连接状态和正在执行的命令，并提供所有者专用的“结束终端”按钮。等待 Shell 实际退出后才解除阻塞，保留任务及其他终端；拒绝过期卡片操作。PowerShell 支持命令/空闲识别，其他 Shell 回退为前台进程或未知状态。
 
 ### English
+
+- Fix false automatic-approval failures after TraeX has already entered Plan mode. Verify the matching Turn and EnterPlanMode result before resolving, retain approval history, and keep manual fallback for unverified failures without changing approved-plan continuation.
 
 - List blocking terminals on safe-restart cards with tokens, directories, activity/connection state and current commands, plus an owner-only End Terminal action. Wait for Shell exit before clearing its blocker, leave tasks and other terminals untouched, and reject stale card actions. Track PowerShell commands/idle state; other Shells fall back to foreground processes or unknown state.
 

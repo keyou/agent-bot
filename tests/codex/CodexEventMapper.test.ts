@@ -75,7 +75,7 @@ describe("mapCodexNotification", () => {
       sourceToolCallId: null, reason: "Review the plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
     })).toEqual({
       kind: "mode_change_requested", threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode,
-      reason: "Review the plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
+      sourceToolCallId: null, reason: "Review the plan", allowedPrompts: [{ tool: "PowerShell", prompt: "run tests" }],
     });
     for (const decision of ["approved", "rejected", "cancelled"]) {
       expect(mapCodexNotification("mode/changeResolved", {
@@ -89,6 +89,8 @@ describe("mapCodexNotification", () => {
   test("validates mode confirmation payloads without requiring allowed prompts", () => {
     const params = { threadId: "thr_1", turnId: "turn_1", requestId: "request_1", targetMode: "default", reason: "" };
     expect(mapCodexNotification("mode/changeRequested", params)?.kind).toBe("mode_change_requested");
+    expect(mapCodexNotification("mode/changeRequested", { ...params, sourceToolCallId: "call_1" }))
+      .toMatchObject({ sourceToolCallId: "call_1" });
     for (const invalid of [
       { requestId: "" }, { targetMode: "unknown" }, { reason: null }, { allowedPrompts: [{}] },
       { threadId: undefined }, { turnId: undefined },
