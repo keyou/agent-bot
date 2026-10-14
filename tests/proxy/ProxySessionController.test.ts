@@ -13,7 +13,7 @@ import type { AppConfig } from "../../src/config/schema.js";
 import { generateGroupAvatarPng, resolveGroupAvatarProjectName } from "../../src/feishu/GroupAvatarGenerator.js";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
 import { FeishuTurnPresenter } from "../../src/feishu/FeishuTurnPresenter.js";
-import type { FeishuOutbound, IncomingMessage } from "../../src/feishu/types.js";
+import type { CardAction, FeishuOutbound, IncomingMessage } from "../../src/feishu/types.js";
 import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import { OutboundRouter } from "../../src/presentation/OutboundRouter.js";
@@ -590,6 +590,7 @@ function fixture(
   const forceSafeRestart = vi.fn(async () => true);
   const terminalUrl = vi.fn((id: string) => `https://terminal.example/open/${id}/signature`);
   const authorizeTerminal = vi.fn(async () => "已授权终端");
+  const stopSafeRestartTerminal = vi.fn(async (_action: CardAction) => "已请求结束对应终端");
   const cancelAutomaticUpdate = vi.fn(async () => undefined);
   const showUpdates = vi.fn(async () => undefined);
   const selectUpdate = vi.fn(async () => undefined);
@@ -620,6 +621,7 @@ function fixture(
       forceSafeRestart,
       terminalUrl,
       authorizeTerminal,
+      stopSafeRestartTerminal,
       cancelAutomaticUpdate,
       showUpdates,
       selectUpdate,
@@ -652,6 +654,7 @@ function fixture(
     forceSafeRestart,
     terminalUrl,
     authorizeTerminal,
+    stopSafeRestartTerminal,
     cancelAutomaticUpdate,
     showUpdates,
     selectUpdate,
@@ -1794,6 +1797,19 @@ describe("ProxySessionController", () => {
     expect(cancelSafeRestart).toHaveBeenCalledOnce();
     expect(cancelSafeRestart).toHaveBeenCalledWith(7);
     expect(outbound.sendText).not.toHaveBeenCalled();
+  });
+
+  test("routes restart terminal closure once without stopping a task or forcing restart", async () => {
+    const { controller, stopSafeRestartTerminal, runtime, forceSafeRestart, cancelSafeRestart, config, outbound } = fixture();
+    config.feishu.userOpenId = "ou_owner";
+    config.feishu.respondToOwnerOnly = true;
+    const action = { actionId: "stop-terminal", contextKey: "chat_id:c1", messageId: "om_restart", userId: "ou_owner",
+      value: { action: "safe_restart_terminal_stop", scheduleId: "1", terminalId: "a".repeat(32) } };
+    await controller.onCardAction({ ...action, actionId: "stop-terminal-other", userId: "ou_other" }); expect(stopSafeRestartTerminal).not.toHaveBeenCalled();
+    await controller.onCardAction(action); await controller.onCardAction(action);
+    expect(stopSafeRestartTerminal).toHaveBeenCalledExactlyOnceWith(action);
+    expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", "已请求结束对应终端");
+    expect(runtime.interruptRemoteTurn).not.toHaveBeenCalled(); expect(forceSafeRestart).not.toHaveBeenCalled(); expect(cancelSafeRestart).not.toHaveBeenCalled();
   });
 
   test("reports a stale safe restart card without affecting another schedule", async () => {

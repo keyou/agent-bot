@@ -1,7 +1,7 @@
 import type { Logger } from "pino";
 import { CardRenderer } from "../feishu/CardRenderer.js";
 import { isThreadContextKey } from "../feishu/contextKey.js";
-import type { FeishuOutbound } from "../feishu/types.js";
+import type { CardAction, FeishuOutbound } from "../feishu/types.js";
 import type { StateStore } from "../state/StateStore.js";
 import type { RestartNotificationTarget, SafeRestartStatus } from "./SafeRestartScheduler.js";
 
@@ -9,11 +9,15 @@ const DEFAULT_INITIAL_CARD_DELAY_MS = 3_000;
 
 export interface SafeRestartNotifierOptions {
   initialCardDelayMs?: number;
+  ownerId?(): string | undefined;
+  isCurrentSchedule?(scheduleId: number): boolean;
+  stopTerminal?(terminalId: string, userId: string): Promise<boolean>;
 }
 
 export class SafeRestartNotifier {
   private readonly messageIds = new Map<string, string>();
   private readonly cardHashes = new Map<string, string>();
+  private readonly cardTerminalIds = new Map<string, Set<string>>();
   private readonly notificationTargets = new Map<string, RestartNotificationTarget>();
   private activeScheduleId?: number;
   private terminalScheduleId?: number;
@@ -55,6 +59,7 @@ export class SafeRestartNotifier {
       this.activeScheduleId = status.scheduleId;
       this.messageIds.clear();
       this.cardHashes.clear();
+      this.cardTerminalIds.clear();
       this.notificationTargets.clear();
       this.clearInitialCardTimer();
       this.pendingInitialStatus = status;
@@ -88,6 +93,25 @@ export class SafeRestartNotifier {
 
   getNotificationTargets(): RestartNotificationTarget[] {
     return [...this.notificationTargets.values()].map((target) => ({ ...target }));
+  }
+
+  async stopTerminal(action: CardAction): Promise<string> {
+    const ownerId = this.options.ownerId?.();
+    if (!ownerId || action.userId !== ownerId) throw new Error("仅 AgentBot 所有者可结束终端。");
+    const scheduleId = Number(action.value.scheduleId);
+    const terminalId = typeof action.value.terminalId === "string" ? action.value.terminalId : "";
+    if (!Number.isSafeInteger(scheduleId) || scheduleId <= 0 || !/^[a-f0-9]{32}$/u.test(terminalId)) {
+      throw new Error("安全重启卡片无效，请使用最新的状态卡片。");
+    }
+    if (scheduleId !== this.activeScheduleId || !this.options.isCurrentSchedule?.(scheduleId)
+      || !this.lastStatus || ["cancelled", "restarting"].includes(this.lastStatus.phase)
+      || !action.messageId || this.messageIds.get(action.contextKey) !== action.messageId
+      || !this.cardTerminalIds.get(action.contextKey)?.has(terminalId)) {
+      throw new Error("该安全重启卡片或终端操作已失效，请查看最新状态卡片。");
+    }
+    if (!this.options.stopTerminal) throw new Error("网页终端未启用。");
+    const stopped = await this.options.stopTerminal(terminalId, ownerId);
+    return stopped ? "已请求结束对应终端，安全重启将继续等待其余阻塞项。" : "该终端已结束或正在关闭，无需重复操作。";
   }
 
   private publishPendingInitialStatus(): Promise<void> {
@@ -133,6 +157,8 @@ export class SafeRestartNotifier {
         remainingMs: status.remainingMs,
         pendingFinalDeliveries: status.activity.pendingFinalDeliveries,
         activeTerminals: status.activity.activeTerminals,
+        terminalBlockers: status.activity.terminalBlockers,
+        contextKey,
         waitingTasks,
       });
       const cardHash = JSON.stringify(card);
@@ -141,12 +167,17 @@ export class SafeRestartNotifier {
         if (this.cardHashes.get(contextKey) === cardHash) return;
         try {
           await this.outbound.updateInteractiveCard(messageId, card);
-          this.cardHashes.set(contextKey, cardHash);
+          if (this.activeScheduleId === status.scheduleId && this.messageIds.get(contextKey) === messageId) {
+            this.cardHashes.set(contextKey, cardHash);
+            this.cardTerminalIds.set(contextKey, new Set((status.activity.terminalBlockers ?? []).map((terminal) => terminal.terminalId)));
+          }
           return;
         } catch (error) {
           this.logger.warn({ error, contextKey, messageId }, "Failed to update safe restart status card; sending a replacement.");
+          if (this.activeScheduleId !== status.scheduleId) return;
           this.messageIds.delete(contextKey);
           this.cardHashes.delete(contextKey);
+          this.cardTerminalIds.delete(contextKey);
         }
       }
       try {
@@ -170,6 +201,7 @@ export class SafeRestartNotifier {
           if (this.activeScheduleId === status.scheduleId) {
             this.messageIds.set(contextKey, created);
             this.cardHashes.set(contextKey, cardHash);
+            this.cardTerminalIds.set(contextKey, new Set((status.activity.terminalBlockers ?? []).map((terminal) => terminal.terminalId)));
           } else {
             await this.stopCard(created, status, reason ?? status.reason);
           }

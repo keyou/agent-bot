@@ -966,6 +966,27 @@ describe("CardRenderer", () => {
     expect(JSON.stringify(restarting)).not.toContain(">Cancel</font>");
   });
 
+  test.each(["waiting_tasks", "cancelled", "restarting", "superseded"] as const)("lists terminal activity and commands with scoped close buttons during %s", (phase) => {
+    const terminals = [
+      { terminalId: "a".repeat(32), token: "Ab_-1234", cwd: "D:\\dev\\agent-bot", state: "running" as const,
+        active: true, foreground: false, connected: false, command: { status: "running" as const, command: "Start-Sleep 60", source: "shell" as const } },
+      { terminalId: "b".repeat(32), token: "Cd_-5678", cwd: "/tmp", state: "running" as const,
+        active: false, foreground: false, connected: true, command: { status: "idle" as const } },
+      { terminalId: "c".repeat(32), token: "Ef_-9012", cwd: "/tmp", state: "closing" as const,
+        active: false, foreground: false, connected: false, command: { status: "unknown" as const } },
+    ];
+    const card = new CardRenderer().renderSafeRestartStatus({ scheduleId: 3, reason: "test", phase, pendingFinalDeliveries: 0,
+      waitingTasks: [], activeTerminals: terminals.length, terminalBlockers: terminals, contextKey: "chat_id:g:thread_id:t" });
+    const text = JSON.stringify(card);
+    expect(text).toContain("Ab_-1234"); expect(text).toContain("Start-Sleep 60"); expect(text).toContain("不活跃");
+    expect(text).toContain("网页已断开"); expect(text).toContain("Shell 空闲"); expect(text).toContain("等待 Shell 退出");
+    const actions = collectObjects(card).filter(item => item.action === "safe_restart_terminal_stop");
+    expect(actions).toEqual(phase === "waiting_tasks" ? terminals.slice(0, 2).map(t => ({
+      action: "safe_restart_terminal_stop", scheduleId: "3", terminalId: t.terminalId, contextKey: "chat_id:g:thread_id:t",
+    })) : []);
+    if (phase === "waiting_tasks") expect(text).toContain("<font color='red'>结束终端</font>");
+  });
+
   test.each([
     "waiting_tasks", "waiting_delivery", "countdown", "restarting", "cancelled", "superseded",
   ] as const)("renders safe restart actions only while the %s plan is pending", (phase) => {

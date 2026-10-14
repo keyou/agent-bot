@@ -15,7 +15,7 @@ import type {
 import type { TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
 import type { UpdateNotice } from "../updates/types.js";
-import type { TerminalCardView } from "../terminal/TerminalServer.js";
+import type { ActiveTerminal, TerminalCardView } from "../terminal/TerminalServer.js";
 import { localCardImage } from "./LocalCardImage.js";
 
 export interface StartupStatusView {
@@ -61,6 +61,8 @@ export interface InitializationWelcomeView {
 
 export interface SafeRestartStatusView {
   activeTerminals?: number;
+  terminalBlockers?: ActiveTerminal[];
+  contextKey?: string;
   scheduleId: number;
   reason: string;
   phase: "waiting_tasks" | "waiting_delivery" | "countdown" | "restarting" | "cancelled" | "superseded";
@@ -1069,9 +1071,35 @@ export class CardRenderer {
       `**重启原因**：${inlineCode(view.reason)}`,
       `**重启倒计时**：${countdown}`,
       `**待投递结果**：${view.pendingFinalDeliveries} 条`,
-      ...(view.activeTerminals ? [`**活动终端**：${view.activeTerminals} 个，请在网页或原会话的终端管理卡中关闭。ForceRestart 会中断终端。`] : []),
+      ...(view.activeTerminals ? [`**活动终端**：${view.activeTerminals} 个。结束终端会中断其中的命令；ForceRestart 会中断所有终端。`] : []),
     ];
     const elements: Record<string, unknown>[] = [markdown(lines.join("\n"))];
+    if (view.terminalBlockers?.length) {
+      elements.push({ tag: "hr" }, markdown(`**阻止重启的终端（${view.terminalBlockers.length}）**`));
+      for (const terminal of view.terminalBlockers) {
+        const command = terminal.state === "closing" ? "正在结束，等待 Shell 退出"
+          : terminal.state === "starting" ? "Shell 启动中"
+          : terminal.command.status === "idle" ? "无（Shell 空闲）"
+          : terminal.command.command ? inlineCode(escapeCardHtml(truncateText(terminal.command.command.replace(/\s+/gu, " "), 240)))
+          : terminal.command.status === "running" ? "命令执行中（命令内容不可用）"
+          : "未知（Shell 未提供命令信息）";
+        const connection = terminal.connected ? terminal.foreground ? "网页前台" : "网页已连接" : "网页已断开";
+        const label = `**终端**：${inlineCode(terminal.token)} · ${terminal.active ? "活跃" : "不活跃"} · ${connection}\n**目录**：${inlineCode(escapeCardHtml(truncateText(terminal.cwd, 240)))}\n**${terminal.command.source === "process" ? "前台进程" : "正在执行"}**：${command}`;
+        elements.push({
+          tag: "column_set", flex_mode: "none", horizontal_spacing: "8px",
+          columns: [
+            { tag: "column", width: "weighted", weight: 1, elements: [markdown(label)] },
+            ...(actionable && terminal.state !== "closing" ? [{
+              tag: "column", width: "auto", elements: [taskActionElement({
+                text: "结束终端", type: "danger",
+                value: { action: "safe_restart_terminal_stop", scheduleId: String(view.scheduleId), terminalId: terminal.terminalId, ...(view.contextKey ? { contextKey: view.contextKey } : {}) },
+              })],
+            }] : []),
+          ],
+        });
+      }
+      elements.push(markdown("活跃：前台连接、正在执行命令或最近 30 秒有输入输出。不活跃的 Shell 仍会阻止安全重启。"));
+    }
     if (view.waitingTasks.length > 0) {
       const visible = view.waitingTasks.slice(0, 10);
       elements.push({ tag: "hr" }, markdown(`**当前等待的任务（${view.waitingTasks.length}）**`));

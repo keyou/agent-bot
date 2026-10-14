@@ -1,5 +1,8 @@
+import type { ActiveTerminal } from "../terminal/TerminalServer.js";
+
 export interface ServerActivityState {
   activeTerminals?: number;
+  terminalBlockers?: ActiveTerminal[];
   runningSessions: number;
   pendingFinalDeliveries: number;
   latestInboundAt?: string;
@@ -64,6 +67,10 @@ export class SafeRestartScheduler {
 
   get pendingReason(): string | undefined {
     return this.reason;
+  }
+
+  isCurrentSchedule(scheduleId: number): boolean {
+    return this.scheduled && !this.restartingNow && this.scheduleId === scheduleId;
   }
 
   schedule(

@@ -12,6 +12,7 @@ import type { CardAction } from "../feishu/types.js";
 import { spawnTerminal, type TerminalProcess, type TerminalSpawner } from "./TerminalProcess.js";
 import { terminalPage, TERMINAL_CSS, TERMINAL_SCRIPT } from "./TerminalPage.js";
 import { TerminalLinks } from "./TerminalLinks.js";
+import type { TerminalCommandState } from "./TerminalCommandTracker.js";
 
 const require = createRequire(import.meta.url);
 const AUTH_TTL = 5 * 60_000;
@@ -35,6 +36,11 @@ export interface TerminalCardView extends TerminalAuthorization {
   contextKey: string; commandCardMessageId: string; shellStarted: boolean;
   terminalId: string; reopenToken: string; reopenUrl: string; recovery: boolean; state: "pending" | "approved" | "running" | "closed";
   connected: boolean; message?: string;
+}
+export interface ActiveTerminal {
+  terminalId: string; token: string; cwd: string;
+  state: "starting" | "running" | "closing"; connected: boolean;
+  active: boolean; foreground: boolean; command: TerminalCommandState;
 }
 export interface TerminalServerOptions {
   stateDirectory: string;
@@ -131,6 +137,37 @@ export class TerminalServer {
 
   get activeCount(): number {
     return [...this.sessions.values()].filter((s) => s.pty || s.starting).length;
+  }
+
+  listActiveTerminals(): ActiveTerminal[] {
+    return [...this.sessions.values()].filter((s) => s.pty || s.starting).map((s) => {
+      const foreground = s.socket?.readyState === WebSocket.OPEN && (s.foregroundUntil ?? 0) > this.now();
+      let command: TerminalCommandState = { status: "unknown" };
+      if (s.state !== "closed") {
+        try { command = s.pty?.commandState?.() ?? command; }
+        catch { /* Command inspection must not prevent safe-restart activity checks. */ }
+      }
+      return {
+        terminalId: s.requestId, token: s.reopenToken, cwd: s.cwd,
+        state: s.state === "closed" ? "closing" : s.pty ? "running" : "starting",
+        connected: s.socket?.readyState === WebSocket.OPEN,
+        active: s.state !== "closed" && (foreground || command.status === "running" || this.now() - s.lastActivity < 30_000),
+        foreground, command,
+      };
+    });
+  }
+
+  async stopActiveTerminal(terminalId: string, userId: string): Promise<boolean> {
+    const ownerId = this.options.ownerId();
+    if (!ownerId || userId !== ownerId) throw new Error("仅 AgentBot 所有者可结束终端。");
+    const session = this.sessions.get(terminalId);
+    if (!session || session.state === "closed" || (!session.pty && !session.starting)) return false;
+    if (session.ownerId !== userId) throw new Error("终端所有者已变更，请刷新状态。");
+    // Keep blocking restart if the OS refuses to terminate the Shell.
+    if (session.pty) session.pty.kill();
+    this.disposeSession(session, "所有者已从安全重启卡片结束终端", true);
+    await this.cardUpdates;
+    return true;
   }
 
   async resolveApproval(action: CardAction): Promise<string> {
@@ -425,11 +462,13 @@ export class TerminalServer {
     this.assertCanStart();
     const starting = (async () => {
       const pty = await (this.options.spawn ?? spawnTerminal)(session.cwd, 100, 30);
+      session.pty = pty;
+      pty.onExit(({ exitCode }) => { session.pty = undefined; this.disposeSession(session, `Shell 已退出（${exitCode}）`); });
       if (this.closed || this.options.canStart?.() === false || session.state === "closed"
         || session.ownerId !== this.options.ownerId() || this.now() >= session.expiresAt) {
-        pty.kill(); this.disposeSession(session, "服务正在重启或授权已失效"); return;
+        this.disposeSession(session, "服务正在重启或授权已失效", true); pty.kill(); return;
       }
-      session.pty = pty; session.state = "running"; session.lastActivity = this.now();
+      session.state = "running"; session.lastActivity = this.now();
       this.markDisconnected(session);
       pty.onData((data) => {
         if (session.state !== "running") return;
@@ -437,7 +476,6 @@ export class TerminalServer {
         session.output = (session.output + data).slice(-256 * 1024);
         if (session.socket) this.send(session.socket, { type: "data", data });
       });
-      pty.onExit(({ exitCode }) => { session.pty = undefined; this.disposeSession(session, `Shell 已退出（${exitCode}）`); });
       this.options.logger.info({ requestId: session.requestId }, "Interactive terminal started.");
     })();
     session.starting = starting;
@@ -469,16 +507,16 @@ export class TerminalServer {
       if (s.state === "running" && now - Math.max(s.lastActivity, s.foregroundUntil ?? 0) >= IDLE_TTL) {
         this.disposeSession(s, "连续 30 分钟无输入或输出，Shell 已自动关闭");
       }
-      if (s.state === "closed" && !s.starting && now - s.lastActivity >= AUTH_TTL) this.sessions.delete(s.requestId);
+      if (s.state === "closed" && !s.pty && !s.starting && now - s.lastActivity >= AUTH_TTL) this.sessions.delete(s.requestId);
     }
   }
-  private disposeSession(s: TerminalSession, message: string): void {
+  private disposeSession(s: TerminalSession, message: string, waitForExit = false): void {
     if (s.state === "closed") return;
     this.clearDisconnectTimer(s);
     s.state = "closed"; s.message = message; s.lastActivity = this.now();
-    const pty = s.pty; s.pty = undefined;
+    const pty = s.pty; if (!waitForExit) s.pty = undefined;
     if (s.socket) { this.send(s.socket, { type: "exit", message }); s.socket.close(); s.socket = undefined; }
-    try { pty?.kill(); } catch (error) { this.options.logger.warn({ error, requestId: s.requestId }, "Failed to close terminal process."); }
+    try { if (!waitForExit) pty?.kill(); } catch (error) { this.options.logger.warn({ error, requestId: s.requestId }, "Failed to close terminal process."); }
     s.output = "";
     for (const recovery of this.recoveries.values()) {
       if (recovery.targetId === s.requestId) this.closeRecovery(recovery, message);

@@ -516,7 +516,75 @@ test("closing while a PTY is starting kills the late process instead of leaking 
   expect(f.server.activeCount).toBe(1);
   await f.post("close", credentials); finish(f.pty);
   await vi.waitFor(() => expect(f.pty.kill).toHaveBeenCalledOnce());
-  expect(f.server.activeCount).toBe(0);
+  expect(f.server.activeCount).toBe(1);
+  f.exit(); expect(f.server.activeCount).toBe(0);
+});
+
+test("restart blockers distinguish foreground, recent I/O, shell execution and idle state", async () => {
+  const f = await fixture(); const credentials = await f.request();
+  expect(f.server.listActiveTerminals()).toEqual([]); await f.approve();
+  expect(f.server.listActiveTerminals()).toEqual([]);
+  const commandState = vi.fn<NonNullable<TerminalProcess["commandState"]>>(() => ({ status: "idle", source: "shell" }));
+  f.pty.commandState = commandState;
+  const c = await f.connect(credentials); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
+  const view = f.authorization();
+  expect(f.server.listActiveTerminals()).toEqual([{
+    terminalId: credentials.requestId, token: view.reopenToken, cwd: f.dir, state: "running",
+    connected: true, active: true, foreground: false, command: { status: "idle", source: "shell" },
+  }]);
+  f.tick(31_000); expect(f.server.listActiveTerminals()[0]?.active).toBe(false);
+  await visibility(f, c.ws, true);
+  expect(f.server.listActiveTerminals()[0]).toMatchObject({ active: true, foreground: true });
+  await visibility(f, c.ws, false); f.tick(31_000);
+  commandState.mockReturnValue({ status: "running", command: "Start-Sleep -Seconds 60", source: "shell" });
+  expect(f.server.listActiveTerminals()[0]).toMatchObject({ active: true, foreground: false, command: { status: "running", command: "Start-Sleep -Seconds 60" } });
+  commandState.mockReturnValue({ status: "unknown" }); await disconnect(f, c.ws); f.tick(31_000);
+  expect(f.server.listActiveTerminals()[0]).toMatchObject({ active: false, connected: false, command: { status: "unknown" } });
+  commandState.mockImplementationOnce(() => { throw new Error("PTY exited while inspecting"); });
+  expect(f.server.listActiveTerminals()[0]?.command.status).toBe("unknown");
+  f.data("progress"); expect(f.server.listActiveTerminals()[0]?.active).toBe(true);
+});
+
+test("restart closure is owner-only, closes only the selected Shell and waits for its exit", async () => {
+  const f = await fixture(); const first = await f.request(); await f.approve();
+  const c = await f.connect(first); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
+  f.tick(11_000); const second = await f.request(); await f.approve();
+  const secondPty = { write: vi.fn(), resize: vi.fn(), kill: vi.fn(), onData: vi.fn(() => ({ dispose() {} })), onExit: vi.fn(() => ({ dispose() {} })) };
+  f.spawn.mockResolvedValueOnce(secondPty);
+  const other = await f.connect(second); await vi.waitFor(() => expect(other.messages[0]?.type).toBe("ready"));
+  f.blockStart();
+  await expect(f.server.stopActiveTerminal(first.requestId, "other")).rejects.toThrow("所有者");
+  expect(f.pty.kill).not.toHaveBeenCalled();
+  expect(await f.server.stopActiveTerminal(first.requestId, "ou_owner")).toBe(true);
+  expect(f.pty.kill).toHaveBeenCalledOnce(); expect(secondPty.kill).not.toHaveBeenCalled();
+  expect(f.server.activeCount).toBe(2);
+  expect(f.server.listActiveTerminals().find(t => t.terminalId === first.requestId)).toMatchObject({ state: "closing", active: false });
+  expect(await f.server.stopActiveTerminal(first.requestId, "ou_owner")).toBe(false);
+  expect(await f.server.stopActiveTerminal("0".repeat(32), "ou_owner")).toBe(false);
+  f.exit(); expect(f.server.activeCount).toBe(1);
+  expect(f.server.listActiveTerminals().map(t => t.terminalId)).toEqual([second.requestId]);
+});
+
+test("a failed OS termination keeps the terminal blocking and allows retry", async () => {
+  const f = await fixture(); const credentials = await f.request(); await f.approve();
+  const c = await f.connect(credentials); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
+  vi.mocked(f.pty.kill).mockImplementationOnce(() => { throw new Error("kill failed"); });
+  await expect(f.server.stopActiveTerminal(credentials.requestId, "ou_owner")).rejects.toThrow("kill failed");
+  expect(f.server.listActiveTerminals()[0]?.state).toBe("running");
+  expect(await f.server.stopActiveTerminal(credentials.requestId, "ou_owner")).toBe(true);
+  expect(f.server.activeCount).toBe(1); f.exit(); expect(f.server.activeCount).toBe(0);
+});
+
+test("restart closure during startup retains the blocker until the late PTY exits", async () => {
+  const f = await fixture(); const credentials = await f.request(); await f.approve();
+  let finish!: (pty: TerminalProcess) => void;
+  f.spawn.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await f.connect(credentials); await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  expect(f.server.listActiveTerminals()[0]?.state).toBe("starting");
+  await f.server.stopActiveTerminal(credentials.requestId, "ou_owner");
+  expect(f.server.activeCount).toBe(1); expect(f.server.listActiveTerminals()[0]?.state).toBe("closing");
+  finish(f.pty); await vi.waitFor(() => expect(f.pty.kill).toHaveBeenCalledOnce());
+  expect(f.server.activeCount).toBe(1); f.exit(); expect(f.server.activeCount).toBe(0);
 });
 
 test("denial, session caps and restart gating prevent new shells", async () => {

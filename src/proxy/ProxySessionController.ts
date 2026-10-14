@@ -515,6 +515,7 @@ export interface ControlTaskReleaseResult {
 export interface ProxyLifecycle {
   terminalUrl?(jobId: string): string | undefined;
   authorizeTerminal?(action: CardAction): Promise<string>;
+  stopSafeRestartTerminal?(action: CardAction): Promise<string>;
   supervised?: boolean;
   restart(contextKey: string, force: boolean, replyTarget?: MessageReplyTarget): Promise<void>;
   cancelSafeRestart?(scheduleId: number): Promise<boolean>;
@@ -1035,6 +1036,9 @@ export class ProxySessionController {
         if (kind === "terminal_authorize") {
           if (!this.lifecycle?.authorizeTerminal) throw new Error("网页终端未启用。");
           await this.outbound.sendText(contextKey, await this.lifecycle.authorizeTerminal(scopedAction));
+        } else if (kind === "safe_restart_terminal_stop") {
+          if (!this.lifecycle?.stopSafeRestartTerminal) throw new Error("网页终端未启用。");
+          await this.outbound.sendText(contextKey, await this.lifecycle.stopSafeRestartTerminal(scopedAction));
         } else if (kind === "agentbot_update_cancel") {
           if (!this.lifecycle?.cancelAutomaticUpdate) throw new Error("自动更新功能未启用。");
           await this.lifecycle.cancelAutomaticUpdate(scopedAction);

@@ -46,6 +46,15 @@ describe("SafeRestartScheduler", () => {
     expect(onReady).toHaveBeenCalledWith("default countdown", []);
   });
 
+  test("terminal actions only apply to the current pending schedule", async () => {
+    vi.useFakeTimers();
+    const scheduler = new SafeRestartScheduler({ readActivity: () => ({ runningSessions: 0, pendingFinalDeliveries: 0, activeTerminals: 1 }), onReady: vi.fn() });
+    expect(scheduler.isCurrentSchedule(1)).toBe(false);
+    scheduler.schedule("first"); expect(scheduler.isCurrentSchedule(1)).toBe(true);
+    scheduler.schedule("second"); expect(scheduler.isCurrentSchedule(1)).toBe(false); expect(scheduler.isCurrentSchedule(2)).toBe(true);
+    scheduler.cancel(); expect(scheduler.isCurrentSchedule(2)).toBe(false);
+  });
+
   test("waits for all tasks and final deliveries plus a quiet inbound window", async () => {
     vi.useFakeTimers();
     let state: ServerActivityState = { runningSessions: 1, pendingFinalDeliveries: 0, latestInboundAt: "a" };

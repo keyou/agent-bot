@@ -6,6 +6,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 中文
+
+- 安全重启卡片逐个显示阻塞终端的 token、目录、活跃/连接状态和正在执行的命令，并提供所有者专用的“结束终端”按钮。等待 Shell 实际退出后才解除阻塞，保留任务及其他终端；拒绝过期卡片操作。PowerShell 支持命令/空闲识别，其他 Shell 回退为前台进程或未知状态。
+
+### English
+
+- List blocking terminals on safe-restart cards with tokens, directories, activity/connection state and current commands, plus an owner-only End Terminal action. Wait for Shell exit before clearing its blocker, leave tasks and other terminals untouched, and reject stale card actions. Track PowerShell commands/idle state; other Shells fall back to foreground processes or unknown state.
+
 ## [0.1.24-alpha.6] - 2026-10-12
 
 ### 中文

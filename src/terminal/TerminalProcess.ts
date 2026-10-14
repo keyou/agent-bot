@@ -3,8 +3,11 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import type { IPty } from "node-pty";
+import { powerShellTrackingScript, TerminalCommandTracker, type TerminalCommandState } from "./TerminalCommandTracker.js";
 
-export type TerminalProcess = Pick<IPty, "write" | "resize" | "kill" | "onData" | "onExit">;
+export type TerminalProcess = Pick<IPty, "write" | "resize" | "kill" | "onData" | "onExit"> & {
+  commandState?(): TerminalCommandState;
+};
 export type TerminalSpawner = (cwd: string, cols: number, rows: number) => Promise<TerminalProcess>;
 
 export function terminalShell(
@@ -63,9 +66,28 @@ export const spawnTerminal: TerminalSpawner = async (cwd, cols, rows) => {
     prepareTerminalHelper(path.dirname(require.resolve("node-pty/package.json")));
   }
   const shell = terminalShell();
-  return pty.spawn(shell.file, shell.args, {
+  const tracker = new TerminalCommandTracker();
+  const powershell = /^(pwsh|powershell)(\.exe)?$/iu.test(path.basename(shell.file));
+  const args = powershell ? [...shell.args, "-NoExit", "-EncodedCommand",
+    Buffer.from(powerShellTrackingScript(tracker.nonce), "utf16le").toString("base64")] : shell.args;
+  const processPty = pty.spawn(shell.file, args, {
     cwd, cols, rows, name: "xterm-256color", env: terminalEnvironment(), useConpty: true,
     // The bundled ConPTY closes via its input pipe, avoiding node-pty's console-list helper on kill.
     useConptyDll: process.platform === "win32",
   });
+  return {
+    write: (data) => processPty.write(data), resize: (cols, rows) => processPty.resize(cols, rows), kill: () => processPty.kill(),
+    onExit: (listener) => processPty.onExit(listener),
+    onData: (listener) => processPty.onData((data) => { const visible = tracker.consume(data); if (visible) listener(visible); }),
+    commandState: () => {
+      const tracked = tracker.snapshot();
+      if (tracked.status !== "unknown" || process.platform === "win32") return tracked;
+      try {
+        const name = processPty.process;
+        // Unix PTYs can report a foreground process even without shell integration.
+        if (name && path.basename(name) !== path.basename(shell.file)) return { status: "running", command: name, source: "process" };
+      } catch { /* An exited PTY may no longer have a foreground process. */ }
+      return tracked;
+    },
+  };
 };

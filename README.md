@@ -114,6 +114,8 @@ The safe-restart card offers `Cancel` and `ForceRestart`. Clicking `ForceRestart
 
 Each displayed running task also has a `Stop` action that interrupts only that task, including tasks in other conversations. The card refreshes automatically as tasks stop; the safe restart continues waiting for the remaining blockers.
 
+The card also lists blocking terminals by their eight-character token, directory, activity and browser-connection state, with the current command when available. A terminal is active if its connected page is in the foreground, a command is known to be running, or it had input/output in the last 30 seconds; an inactive Shell still blocks restart. PowerShell with PSReadLine reports accepted commands and prompt-idle state; other Shells show the foreground process where available, otherwise **unknown**, not a guessed command. Command text is shortened on the card. Only the configured owner can click **End Terminal** to interrupt that Shell; safe restart waits for its exit and all remaining blockers. Stale or cancelled cards cannot end terminals.
+
 To start Agent Bot automatically at user login:
 
 ```bash

@@ -207,6 +207,8 @@ The safe-restart card has matching `Cancel` and `ForceRestart` actions. Clicking
 
 Each displayed running task on that card has a `Stop` action targeting its exact task, even across conversations. It uses normal Agent interruption and leaves the restart scheduled; the card updates as tasks stop. Only stop a task when the user requests it.
 
+Blocking terminals are listed on the safe-restart card by their eight-character token, directory, activity/connection state, and current command when available. Activity means a connected foreground page, a known running command, or input/output within 30 seconds; inactive Shells still block restart. PowerShell/PSReadLine reports commands; other Shells may report only a foreground process or unknown. The owner-only End Terminal action stops exactly that Shell and waits for its exit without forcing restart. Never end a user's terminal merely to complete your own restart; require their explicit request. Stale/cancelled cards cannot close terminals.
+
 A bare `agentbot server restart` invoked inside an Agent Bot-started Agent returns restart status to the source task conversation. The same command from an ordinary terminal uses the configured user's private chat. Add `--task <task>` only to override either default.
 
 Never use `taskkill`, `Stop-Process`, or equivalent commands for routine restart management.

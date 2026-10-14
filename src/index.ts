@@ -145,7 +145,14 @@ if (feishuOutbound) {
     workspaceKind: defaultAgent?.kind === "app-server" ? "projectless" : "project",
     defaultUserOpenId: config.feishu.userOpenId,
   }, metadataHydrator);
-  safeRestartNotifier = new SafeRestartNotifier(store, feishuOutbound, renderer, logger);
+  safeRestartNotifier = new SafeRestartNotifier(store, feishuOutbound, renderer, logger, {
+    ownerId: () => config.feishu.userOpenId,
+    isCurrentSchedule: (scheduleId) => !shuttingDown && !restartRequested && safeRestart.isCurrentSchedule(scheduleId),
+    stopTerminal: (terminalId, userId) => {
+      if (!terminalServer) throw new Error("网页终端未启用。");
+      return terminalServer.stopActiveTerminal(terminalId, userId);
+    },
+  });
 }
 
 const consoleEnabled = consoleOnly || config.console.enabled || transport === "console";
@@ -253,8 +260,8 @@ if (feishuOutbound && localFileViewer && config.terminal?.enabled !== false) {
 
 function serverActivity() {
   const activity = store.getServerActivityState();
-  const activeTerminals = terminalServer?.activeCount ?? 0;
-  return { ...activity, activeTerminals };
+  const terminalBlockers = terminalServer?.listActiveTerminals() ?? [];
+  return { ...activity, activeTerminals: terminalBlockers.length, terminalBlockers };
 }
 
 const controller = new ProxySessionController(config, store, runtimes, outbound, logger, {
@@ -263,6 +270,10 @@ const controller = new ProxySessionController(config, store, runtimes, outbound,
   authorizeTerminal: (action) => {
     if (!terminalServer) throw new Error("网页终端未启用。");
     return terminalServer.resolveApproval(action);
+  },
+  stopSafeRestartTerminal: (action) => {
+    if (!safeRestartNotifier) throw new Error("安全重启通知未启用。");
+    return safeRestartNotifier.stopTerminal(action);
   },
   showUpdates: (contextKey, userId) => manualUpdates.show(contextKey, userId),
   selectUpdate: (action, replyTarget) => manualUpdates.select(action, replyTarget),
