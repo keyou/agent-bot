@@ -15,7 +15,7 @@ describe("inspectSupportedAgents", () => {
       ? successfulCommand("codex-cli 0.153.3") : failedCommand());
     const [codex] = await inspectSupportedAgents({ run });
     expect(codex).toMatchObject({
-      state: "outdated", minimumVersion: "0.153.4",
+      state: "outdated", minimumVersion: "0.162.1",
       compatibilityIssue: expect.stringContaining("codex update"),
       action: { kind: "upgrade" },
     });
@@ -66,8 +66,8 @@ describe("inspectSupportedAgents", () => {
         name: "Codex",
         state: "outdated",
         installedVersion: "0.145.0",
-        minimumVersion: "0.153.4",
-        compatibilityIssue: expect.stringContaining("Codex >= 0.153.4"),
+        minimumVersion: "0.162.1",
+        compatibilityIssue: expect.stringContaining("Codex >= 0.162.1"),
         action: { kind: "upgrade", command: "codex update" },
       },
       {
@@ -83,7 +83,7 @@ describe("inspectSupportedAgents", () => {
 
   test("keeps installed agents usable when the latest-version checks fail", async () => {
     const run: AgentCommandRunner = vi.fn(async (command) => {
-      if (command.display === "codex --version") return successfulCommand("codex-cli 0.153.4\n");
+      if (command.display === "codex --version") return successfulCommand("codex-cli 0.162.1\n");
       if (command.display === "traex --version") return successfulCommand("traecli 0.201.1-alpha.8\n");
       return failedCommand();
     });
@@ -93,7 +93,7 @@ describe("inspectSupportedAgents", () => {
         id: "codex",
         name: "Codex",
         state: "ready",
-        installedVersion: "0.153.4",
+        installedVersion: "0.162.1",
         latestCheckFailed: true,
       },
       {

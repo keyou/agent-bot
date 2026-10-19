@@ -2473,7 +2473,7 @@ describe("ProxySessionController", () => {
   test("shows an unsupported Codex version instead of silently displaying cached status", async () => {
     const { controller, runtime, outbound } = fixture();
     await controller.onMessage(message("/new Version check"));
-    vi.mocked(runtime.readRemoteSession!).mockRejectedValue(new CodexVersionError("Codex >= 0.153.4; run codex update"));
+    vi.mocked(runtime.readRemoteSession!).mockRejectedValue(new CodexVersionError("Codex >= 0.162.1; run codex update"));
     await controller.onMessage({ ...message("/status"), messageId: "old-codex-status" });
     expect(outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("codex update"));
     controller.close();

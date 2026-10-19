@@ -6,6 +6,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 中文
+
+- 简化 Codex Provider 切换：要求 Codex >= 0.162.1，启动时仅为其进程设置零线程卸载延迟。切换等待目标线程实际卸载后恢复同一任务，保留完整历史及失败回退；不再重启共享 App Server，也不要求其他任务空闲。
+
+### English
+
+- Simplify Codex Provider switching with Codex >= 0.162.1 and a process-local zero thread-unload delay. Wait for the selected thread to unload before resuming the same task, preserving complete history and verified rollback without restarting the shared App Server or waiting for sibling tasks.
+
 ## [0.1.24-alpha.7] - 2026-10-14
 
 ### 中文

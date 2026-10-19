@@ -60,9 +60,11 @@ export class CodexProcessManager implements AppServerClientProvider {
     const environmentContext = this.environmentContext();
     const agentEnvironment = { ...this.env };
     if (this.getAgentFamily() === "codex") agentEnvironment.CODEX_HOME = this.getCodexHome();
+    const args = this.getAgentFamily() === "codex"
+      ? [...this.args, "-c", "thread_unload_delay_secs=0"] : this.args;
     const child = spawnStdioCommand(
       this.command,
-      this.args,
+      args,
       agentBotEnvironment({ ...this.codexEnvironment, ...process.env }, agentEnvironment, environmentContext),
       environmentContext.profilePath ?? os.homedir(),
     );

@@ -1,7 +1,7 @@
 import { compareSemanticVersions } from "../utils/semanticVersion.js";
 
-// Verified protocol baseline: paginated Turn summaries and excludeTurns.
-export const MINIMUM_CODEX_VERSION = "0.153.4";
+// Verified protocol baseline: paginated history and configurable thread unloading.
+export const MINIMUM_CODEX_VERSION = "0.162.1";
 
 export class CodexVersionError extends Error {}
 

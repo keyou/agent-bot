@@ -23,7 +23,7 @@ describe("assertProviderSettingsApplied", () => {
     [{ model: "gpt-test" }, { modelProvider: "azure", model: "gpt-test" }],
   ])("rejects a missing or mismatched known Provider independently of model (%j, %j)", (actual, requested) => {
     expect(() => assertProviderSettingsApplied(actual, requested)).toThrow("Provider 未生效");
-    expect(() => assertProviderSettingsApplied(actual, requested)).toThrow("安全重启");
+    expect(() => assertProviderSettingsApplied(actual, requested)).toThrow("请稍后重试");
     expect(() => assertProviderSettingsApplied(actual, requested)).toThrow("不会自动 Fork 或更改历史");
   });
 

@@ -832,7 +832,7 @@ export class CodexRuntime implements AgentRuntime {
   ): Promise<RuntimeSession> {
     const session = this.requireSession(sessionId);
     if (session.activeTurnId) throw new Error(PROVIDER_SWITCH_BUSY);
-    const client = await this.client();
+    let client = await this.client();
     const metadata = await client.request<ThreadReadResponse>("thread/read", {
       threadId: session.remoteSessionId, includeTurns: false,
     }, SYNC_REQUEST_TIMEOUT_MS);
@@ -854,12 +854,14 @@ export class CodexRuntime implements AgentRuntime {
     const restoreProvider = previous.modelProvider?.trim()
       || (metadata.thread.id === previous.remoteSessionId ? metadata.thread.modelProvider?.trim() : undefined);
     let detached = false;
+    let resumeRequested = false;
     try {
       const params = {
         cwd: session.cwd, modelProvider: settings.modelProvider, model: settings.model,
         ...threadLifecycleParams(session.cwd), ...permissionParams(settings.permissionMode),
       };
       await this.detachThreadForSettings(client, session, () => { detached = true; });
+      resumeRequested = true;
       const response = await client.request<ThreadResponse>("thread/resume", {
         ...params, threadId: session.remoteSessionId, excludeTurns: true,
       }, SESSION_REQUEST_TIMEOUT_MS);
@@ -880,7 +882,8 @@ export class CodexRuntime implements AgentRuntime {
       if (detached) {
         try {
           if (!restoreProvider) throw new Error("无法确认切换前的 Provider，不能验证原设置已恢复。");
-          await this.detachThreadForSettings(client, previous);
+          client = await this.client();
+          if (resumeRequested) await this.detachThreadForSettings(client, previous);
           const restored = await client.request<ThreadResponse>("thread/resume", {
             threadId: previous.remoteSessionId, excludeTurns: true, cwd: previous.cwd,
             modelProvider: restoreProvider, model: previous.model,
@@ -920,6 +923,20 @@ export class CodexRuntime implements AgentRuntime {
     }, CONTROL_REQUEST_TIMEOUT_MS);
     if (!["unsubscribed", "notLoaded", "notSubscribed"].includes(result.status)) {
       throw new Error(`App Server 返回了未知的取消订阅状态：${result.status}`);
+    }
+    if (this.provider.getAgentFamily?.() === "codex") {
+      const deadline = Date.now() + CONTROL_REQUEST_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        if (this.attachedClient !== client) throw new Error("App Server 连接已变化，请重试 Provider 切换。");
+        const { thread } = await client.request<ThreadReadResponse>("thread/read", {
+          threadId: session.remoteSessionId, includeTurns: false,
+        }, Math.min(SYNC_REQUEST_TIMEOUT_MS, Math.max(1, deadline - Date.now())));
+        if (thread.id !== session.remoteSessionId) throw new Error("App Server 返回了不同的任务 ID，未切换 Provider。");
+        if (thread.status?.type === "notLoaded") return;
+        if (thread.status?.type === "active" || session.activeTurnId) throw new Error(PROVIDER_SWITCH_BUSY);
+        await delay(100);
+      }
+      throw new Error("等待任务卸载超时；任务可能仍有订阅或正在关闭，请稍后重试 Provider 切换。");
     }
   }
 

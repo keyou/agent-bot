@@ -61,7 +61,7 @@ describe("CodexProcessManager", () => {
     expect(environment.CODEX_HOME).toBe(directory);
     expect(environment.FEISHU_APP_SECRET).toBeUndefined();
     expect(environment.AGENT_BOT_RESTART_REASON).toBeUndefined();
-    child.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    child.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.162.1" } });
     await starting;
     manager.close();
   });
@@ -138,7 +138,7 @@ describe("CodexProcessManager", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [{ id: "provider-model" }] })));
     vi.stubGlobal("fetch", fetchMock);
     const models = runtime.listModels("private-provider");
-    child.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    child.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.162.1" } });
     await vi.waitFor(() => expect(child.writtenJson()).toContainEqual(expect.objectContaining({ method: "config/read" })));
     child.pushStdout({ id: 2, result: { config: { model_providers: { "private-provider": {
       base_url: "https://provider.example/v1", env_key: "TEST_CODEX_FILE_KEY",
@@ -164,7 +164,7 @@ describe("CodexProcessManager", () => {
     expect(manager.getEnvironmentVariable("MISSING_PROVIDER_KEY")).toBeUndefined();
   });
 
-  test.each(["0.153.3", "0.153.4-alpha.1", undefined])("rejects unsupported Codex %s before exposing a client", async (version) => {
+  test.each(["0.153.4", "0.162.0", "0.162.1-alpha.1", undefined])("rejects unsupported Codex %s before exposing a client", async (version) => {
     const process = fakeChildProcess();
     mocks.spawnStdioCommand.mockReturnValue(process.child);
     const manager = new CodexProcessManager("C:\\tools\\codex.exe", ["app-server"], {}, logger());
@@ -176,7 +176,7 @@ describe("CodexProcessManager", () => {
     for (const outcome of await outcomes) {
       expect(outcome.status).toBe("rejected");
       if (outcome.status === "rejected") {
-        expect(outcome.reason.message).toContain("Codex >= 0.153.4");
+        expect(outcome.reason.message).toContain("Codex >= 0.162.1");
         expect(outcome.reason.message).toContain("codex update");
       }
     }
@@ -191,6 +191,7 @@ describe("CodexProcessManager", () => {
     mocks.spawnStdioCommand.mockReturnValue(process.child);
     const manager = new CodexProcessManager("traex", ["app-server"], {}, logger());
     const client = manager.getClient();
+    expect(mocks.spawnStdioCommand.mock.calls[0]?.[1]).toEqual(["app-server"]);
     await vi.waitFor(() => expect(process.writtenJson()).toHaveLength(1));
     process.pushStdout({ id: 1, result: { userAgent: "traex/0.1.0" } });
     await expect(client).resolves.toBeDefined();
@@ -204,6 +205,7 @@ describe("CodexProcessManager", () => {
     expect(manager.getProcessInfo()).toEqual({});
 
     const client = manager.getClient();
+    expect(mocks.spawnStdioCommand.mock.calls[0]?.[1]).toEqual(["app-server", "-c", "thread_unload_delay_secs=0"]);
     await vi.waitFor(() => expect(process.writtenJson()).toHaveLength(1));
     expect(manager.getProcessInfo()).toEqual({ pid: 4321 });
 
@@ -216,10 +218,10 @@ describe("CodexProcessManager", () => {
       },
     });
 
-    process.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    process.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.162.1" } });
     await expect(client).resolves.toBeDefined();
     expect(process.writtenJson()[1]).toEqual({ method: "initialized", params: {} });
-    expect(manager.getProcessInfo()).toEqual({ pid: 4321, version: "0.153.4" });
+    expect(manager.getProcessInfo()).toEqual({ pid: 4321, version: "0.162.1" });
 
     manager.close();
   });
@@ -256,7 +258,7 @@ describe("CodexProcessManager", () => {
     expect(environment.FEISHU_APP_SECRET).toBeUndefined();
     expect(mocks.spawnStdioCommand.mock.calls[0]?.[3]).toBe("C:\\Users\\tester\\.agent-bot");
 
-    process.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    process.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.162.1" } });
     await client;
     manager.close();
   });
@@ -269,7 +271,7 @@ describe("CodexProcessManager", () => {
 
     const firstClient = manager.getClient();
     await vi.waitFor(() => expect(first.writtenJson()).toHaveLength(1));
-    first.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    first.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.162.1" } });
     await firstClient;
 
     const released = manager.release();
@@ -281,9 +283,9 @@ describe("CodexProcessManager", () => {
 
     const secondClient = manager.getClient();
     await vi.waitFor(() => expect(second.writtenJson()).toHaveLength(1));
-    second.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.153.4" } });
+    second.pushStdout({ id: 1, result: { userAgent: "codex-cli/0.162.1" } });
     await secondClient;
-    expect(manager.getProcessInfo()).toEqual({ pid: 4322, version: "0.153.4" });
+    expect(manager.getProcessInfo()).toEqual({ pid: 4322, version: "0.162.1" });
     manager.close();
   });
 });

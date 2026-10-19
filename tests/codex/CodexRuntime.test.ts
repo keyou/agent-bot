@@ -2523,6 +2523,134 @@ describe("Provider switching", () => {
     return { client, runtime, session };
   }
 
+  describe("Codex thread unloading", () => {
+    async function setupCodex(status = "systemError") {
+      const client = new FakeAppServerClient();
+      client.startResult = oldResponse;
+      client.resumeResult = targetResponse;
+      client.readResult = { thread: { id: "thr_1", preview: "previous prompt", status: { type: status } } };
+      client.unsubscribeResponse = async () => {
+        client.readResult = { thread: { id: "thr_1", status: { type: "notLoaded" } } };
+      };
+      const release = vi.fn();
+      const close = vi.fn();
+      const runtime = new CodexRuntime({ getClient: async () => client, getAgentFamily: () => "codex", release, close }, logger());
+      const session = await runtime.createSession({ localSessionId: "s", agentName: "codex", cwd: process.cwd(),
+        modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto", title: "Original" });
+      client.requests = [];
+      return { client, runtime, session, release, close };
+    }
+
+    test.each(["idle", "error", "systemError"])("waits for the selected %s thread to unload before resuming with new settings", async (status) => {
+      const { client, runtime, session, release, close } = await setupCodex(status);
+      const persist = vi.fn();
+      await runtime.setExecutionSettings("s", target, persist);
+      expect(client.requests.map((request) => request.method)).toEqual([
+        "thread/read", "thread/read", "thread/unsubscribe", "thread/read", "thread/resume",
+      ]);
+      expect(persist).toHaveBeenCalledWith(expect.objectContaining({ ...target, remoteSessionId: "thr_1" }));
+      expect(session).toMatchObject({ ...target, remoteSessionId: "thr_1", title: "Original" });
+      expect(release).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+      await runtime.startTurn("s", "use the selected provider");
+      expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: { threadId: "thr_1", effort: "high" } });
+    });
+
+    test("switches a failed thread while another task runs and an empty sibling remains subscribed", async () => {
+      const { client, runtime, release, close } = await setupCodex();
+      client.startResult = { ...oldResponse, thread: { id: "thr_running" } };
+      await runtime.createSession({ localSessionId: "running", agentName: "codex", cwd: process.cwd(),
+        modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto" });
+      await runtime.startTurn("running", "keep working");
+      client.startResult = { ...oldResponse, thread: { id: "thr_empty" } };
+      await runtime.createSession({ localSessionId: "empty", agentName: "codex", cwd: process.cwd(),
+        modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto" });
+      client.requests = [];
+      const events: RuntimeEvent[] = [];
+      runtime.onEvent((event) => events.push(event));
+      await runtime.setExecutionSettings("s", target);
+      expect(runtime.getSession("running")).toMatchObject({ remoteSessionId: "thr_running", modelProvider: "openai", activeTurnId: "turn_1" });
+      expect(runtime.getSession("empty")).toMatchObject({ remoteSessionId: "thr_empty", modelProvider: "openai" });
+      expect(client.requests.every((request) => (request.params as { threadId: string }).threadId === "thr_1")).toBe(true);
+      expect(release).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+      expect(events).toEqual([]);
+    });
+
+    test("does not mistake unsubscribe success or an unrelated close notification for actual unloading", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client, runtime } = await setupCodex();
+        client.unsubscribeResponse = async () => {
+          client.emit("thread/closed", { threadId: "unrelated" });
+          client.readResults.push(
+            { thread: { id: "thr_1", status: { type: "systemError" } } },
+            { thread: { id: "thr_1", status: { type: "idle" } } },
+            { thread: { id: "thr_1", status: { type: "notLoaded" } } },
+          );
+        };
+        const switching = runtime.setExecutionSettings("s", target);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(client.requests.some((request) => request.method === "thread/resume")).toBe(false);
+        await vi.advanceTimersByTimeAsync(200);
+        await switching;
+        expect(client.requests.at(-1)?.method).toBe("thread/resume");
+      } finally { vi.useRealTimers(); }
+    });
+
+    test("reports an unload timeout and reattaches original settings without restarting or forking", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client, runtime, session, release } = await setupCodex();
+        client.unsubscribeResponse = undefined;
+        client.resumeResult = oldResponse;
+        const persist = vi.fn();
+        const switching = runtime.setExecutionSettings("s", target, persist);
+        const rejected = expect(switching).rejects.toMatchObject({
+          previousSettingsRestored: true, message: expect.stringContaining("等待任务卸载超时"),
+        });
+        await vi.advanceTimersByTimeAsync(10_000);
+        await rejected;
+        expect(persist).not.toHaveBeenCalled();
+        expect(session.modelProvider).toBe("openai");
+        expect(client.requests.filter((request) => request.method === "thread/resume")).toEqual([
+          { method: "thread/resume", params: expect.objectContaining({ threadId: "thr_1", modelProvider: "openai" }) },
+        ]);
+        expect(client.requests.some((request) => request.method === "thread/fork")).toBe(false);
+        expect(release).not.toHaveBeenCalled();
+        await runtime.startTurn("s", "continue with verified original settings");
+        expect(client.requests.at(-1)?.method).toBe("turn/start");
+      } finally { vi.useRealTimers(); }
+    });
+
+    test.each(["wrong ID", "active"])("does not apply target settings after an unsafe unload response (%s)", async (scenario) => {
+      const { client, runtime, release } = await setupCodex();
+      client.unsubscribeResponse = async () => {
+        client.readResult = { thread: { id: scenario === "wrong ID" ? "unexpected" : "thr_1",
+          status: { type: scenario === "active" ? "active" : "notLoaded" } } };
+      };
+      client.resumeResult = oldResponse;
+      await expect(runtime.setExecutionSettings("s", target)).rejects.toMatchObject({ previousSettingsRestored: true });
+      expect(client.requests.filter((request) => request.method === "thread/resume").map((request) => request.params)).toEqual([
+        expect.objectContaining({ threadId: "thr_1", modelProvider: "openai" }),
+      ]);
+      expect(release).not.toHaveBeenCalled();
+    });
+
+    test("unloads the changed thread again when restoring after persistence fails", async () => {
+      const { client, runtime, session, release } = await setupCodex();
+      client.resumeResults.push(targetResponse, oldResponse);
+      await expect(runtime.setExecutionSettings("s", target, async () => { throw new Error("disk full"); }))
+        .rejects.toMatchObject({ previousSettingsRestored: true });
+      expect(client.requests.map((request) => request.method)).toEqual([
+        "thread/read", "thread/read", "thread/unsubscribe", "thread/read", "thread/resume",
+        "thread/read", "thread/unsubscribe", "thread/read", "thread/resume",
+      ]);
+      expect(session.modelProvider).toBe("openai");
+      expect(release).not.toHaveBeenCalled();
+    });
+  });
+
   test("unloads idle history before resuming and does not read turn contents", async () => {
     const { client, runtime, session } = await setup();
     const persist = vi.fn(async () => { expect(session.modelProvider).toBe("openai"); });
@@ -2581,7 +2709,7 @@ describe("Provider switching", () => {
     });
     const persist = vi.fn();
 
-    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow("安全重启");
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toThrow("Provider 未生效");
 
     expect(client.requests.some((request) => ["thread/fork", "thread/start", "thread/turns/list", "turn/start"].includes(request.method))).toBe(false);
     expect(release).not.toHaveBeenCalled();
@@ -2840,8 +2968,7 @@ describe("Provider switching", () => {
     await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toMatchObject({ previousSettingsRestored: restored });
     expect(persist).not.toHaveBeenCalled();
     expect(client.requests.map((request) => request.method)).toEqual([
-      "thread/read", "thread/read", "thread/unsubscribe",
-      "thread/read", "thread/unsubscribe", "thread/resume",
+      "thread/read", "thread/read", "thread/unsubscribe", "thread/resume",
     ]);
     expect(client.requests.at(-1)?.params).toMatchObject({ threadId: "thr_1", modelProvider: "openai" });
     expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
@@ -3426,6 +3553,7 @@ class FakeAppServerClient {
   resumeResults: unknown[] = [];
   unsubscribeResult: unknown = { status: "unsubscribed" };
   unsubscribeErrors: Error[] = [];
+  unsubscribeResponse?: () => Promise<void>;
   archiveErrors: Error[] = [];
   forkResult: unknown = { thread: { id: "thr_forked", turns: [] }, model: "gpt-test", reasoningEffort: "medium" };
   forkErrors: Error[] = [];
@@ -3478,6 +3606,7 @@ class FakeAppServerClient {
     if (method === "thread/unsubscribe") {
       const error = this.unsubscribeErrors.shift();
       if (error) throw error;
+      await this.unsubscribeResponse?.();
       return this.unsubscribeResult as T;
     }
     if (method === "thread/fork") {

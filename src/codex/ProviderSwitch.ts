@@ -15,7 +15,7 @@ export function assertProviderSettingsApplied(
   requested: Partial<Pick<RuntimeExecutionSettings, "modelProvider" | "model">>,
 ): void {
   if (requested.modelProvider !== undefined && actual.modelProvider !== requested.modelProvider) {
-    throw new Error(`Provider 未生效：请求 ${requested.modelProvider}，实际返回 ${actual.modelProvider ?? "未知"}。App Server 未应用设置；可在任务空闲后安全重启再重试，不会自动 Fork 或更改历史。`);
+    throw new Error(`Provider 未生效：请求 ${requested.modelProvider}，实际返回 ${actual.modelProvider ?? "未知"}。App Server 未应用设置，请稍后重试；不会自动 Fork 或更改历史。`);
   }
   if (requested.model !== undefined && actual.model !== requested.model) {
     throw new Error(`模型未生效：请求 ${requested.model}，实际返回 ${actual.model ?? "未知"}。请确认目标 Provider 支持该模型。`);

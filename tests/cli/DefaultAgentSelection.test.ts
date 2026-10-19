@@ -10,7 +10,7 @@ describe("selectableDefaultAgents", () => {
   test("omits an installed Codex that does not satisfy the protocol minimum", () => {
     expect(selectableDefaultAgents([{ name: "codex", title: "Codex" }], [{
       id: "codex", name: "Codex", state: "outdated", installedVersion: "0.153.3",
-      compatibilityIssue: "Upgrade Codex", minimumVersion: "0.153.4",
+      compatibilityIssue: "Upgrade Codex", minimumVersion: "0.162.1",
     }])).toEqual([]);
   });
 
