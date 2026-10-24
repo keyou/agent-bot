@@ -13,6 +13,8 @@ import type {
   ToolState,
 } from "../runtime/types.js";
 import type { TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
+import { visibleTurnActivities } from "../presentation/visibleTurnActivities.js";
+import { displayRuntimeError } from "../runtime/responseErrors.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
 import type { UpdateNotice } from "../updates/types.js";
 import type { ActiveTerminal, TerminalCardView } from "../terminal/TerminalServer.js";
@@ -1778,7 +1780,7 @@ function renderTurnElements(
   if (state.fileSummary.length > 0) elements.push(fileSummaryPanel(state));
 
   if (state.approval) elements.push(...renderApprovalElements(state, state.approval));
-  if (state.error) elements.push(markdown(codeBlock(state.error, 2_000)));
+  if (state.error) elements.push(markdown(codeBlock(displayRuntimeError(state.error), 2_000)));
   const showAssistantText = state.assistantText && assistantTextMode === "always";
   if (showAssistantText) {
     if (elements.length > 0) elements.push({ tag: "hr" });
@@ -1818,7 +1820,7 @@ function renderGroupedTurnElements(
   if (state.fileSummary.length > 0) elements.push(fileSummaryPanel(state));
 
   if (state.approval) elements.push(...renderApprovalElements(state, state.approval));
-  if (state.error) elements.push(markdown(codeBlock(state.error, 2_000)));
+  if (state.error) elements.push(markdown(codeBlock(displayRuntimeError(state.error), 2_000)));
   const showAssistantText = state.assistantText && assistantTextMode === "always";
   if (showAssistantText) {
     if (elements.length > 0) elements.push({ tag: "hr" });
@@ -1954,7 +1956,8 @@ function renderActivity(
     const text = activity.text.trim();
     if (!text) return [];
     if (activity.id.startsWith("commentary:runtime-error:")) {
-      const chunks = fullAssistantText ? splitText(text, ACTIVITY_TEXT_CHUNK) : [text];
+      const displayed = displayRuntimeError(text);
+      const chunks = fullAssistantText ? splitText(displayed, ACTIVITY_TEXT_CHUNK) : [displayed];
       return chunks.map((chunk) => markdown(codeBlock(chunk, fullAssistantText ? ACTIVITY_TEXT_CHUNK : MAX_LIVE_ASSISTANT_TEXT)));
     }
     return fullAssistantText
@@ -2327,8 +2330,10 @@ function removeMarkdownBold(value: string): string {
 }
 
 function turnActivities(state: TurnViewState): TurnActivity[] {
-  if (state.activities?.length) return state.approval
-    ? state.activities.filter((a) => a.id !== approvalActivityId(state.turnId, state.approval!.id)) : state.activities;
+  if (state.activities?.length) {
+    const activities = visibleTurnActivities(state);
+    return state.approval ? activities.filter((a) => a.id !== approvalActivityId(state.turnId, state.approval!.id)) : activities;
+  }
 
   const activities: TurnActivity[] = [];
   if (state.progressText) {

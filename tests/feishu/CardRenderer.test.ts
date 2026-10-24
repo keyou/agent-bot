@@ -128,6 +128,34 @@ function state(): TurnViewState {
 }
 
 describe("CardRenderer", () => {
+  test.each(["grouped", "timeline"] as const)("shows the terminal error once without losing distinct warnings in %s cards", (thinkingCardLayout) => {
+    const input = state();
+    const message = JSON.stringify({ type: "error", status: 400, error: {
+      message: "Persisted response cannot be replayed.", code: "unsupported_persisted_item_context", param: "previous_response_id",
+    } });
+    const warning = { kind: "assistant" as const, id: "commentary:runtime-error:turn_1",
+      text: `运行请求失败，等待 Agent 返回最终状态：${message}` };
+    input.activities = [warning];
+    input.status = "failed";
+    input.error = message + "\n\n模型续接状态失效，正在恢复连接并继续（1/1）。";
+    const renderer = new CardRenderer({ thinkingCardLayout });
+    const original = JSON.stringify(input);
+    for (const card of [renderer.renderTurn(input), renderer.renderTurnDetails(input)]) {
+      const serialized = JSON.stringify(card);
+      expect(serialized.match(/unsupported_persisted_item_context/g)).toHaveLength(1);
+      expect(serialized).toContain("恢复连接并继续");
+      expect(serialized).not.toContain('\\"type\\":\\"error\\"');
+    }
+    expect(JSON.stringify(input)).toBe(original);
+    input.error = "A different final failure";
+    const distinct = JSON.stringify(renderer.renderTurn(input));
+    expect(distinct).toContain("unsupported_persisted_item_context");
+    expect(distinct).toContain("A different final failure");
+    input.status = "running";
+    input.error = undefined;
+    expect(JSON.stringify(renderer.renderTurn(input))).toContain("unsupported_persisted_item_context");
+  });
+
   test.each(["grouped", "timeline"] as const)("renders runtime error reasons as literal text in %s cards", (thinkingCardLayout) => {
     const input = state();
     const text = '运行请求出错，Agent 正在重试：Reconnecting... 2/5\n\nrate_limit_reached (code=3003). Please try again in 60 seconds.\n<img src=x onerror="alert(1)"> ![remote](https://example.test/error.png)';

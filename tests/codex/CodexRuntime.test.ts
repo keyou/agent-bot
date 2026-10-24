@@ -12,6 +12,104 @@ import { PROVIDER_SWITCH_EMPTY, ProviderSwitchError } from "../../src/codex/Prov
 
 describe("CodexRuntime", () => {
 
+  describe("Responses continuation recovery", () => {
+    const message = JSON.stringify({ type: "error", status: 400, error: {
+      message: "Persisted response cannot be replayed.", type: "invalid_request_error",
+      param: "previous_response_id", code: "unsupported_persisted_item_context",
+    } });
+    async function setup() {
+      const client = new FakeAppServerClient();
+      const runtime = new CodexRuntime({ ...provider(client), getAgentFamily: () => "codex" }, logger());
+      await runtime.createSession({ localSessionId: "s1", agentName: "codex", cwd: process.cwd(),
+        model: "gpt-test", reasoningEffort: "high", permissionMode: "auto" });
+      await runtime.startTurn("s1", { text: "original user input", localImagePaths: ["C:/input.png"] });
+      client.readResult = { thread: { id: "thr_1", status: { type: "idle" }, turns: [
+        { id: "turn_1", status: "failed", error: { message } },
+      ] } };
+      return { client, runtime };
+    }
+    function fail(client: FakeAppServerClient, error = message) {
+      client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "failed", error: { message: error } } });
+    }
+
+    test.each(["notification", "snapshot"])("continues a verified %s failure with empty input in the same thread", async (terminal) => {
+      const { client, runtime } = await setup();
+      if (terminal === "snapshot") await runtime.synchronizeSession("s1");
+      else fail(client);
+      client.nextTurnId = "continued";
+      client.requests.length = 0;
+      expect(await runtime.recoverResponseContinuation!("s1", "turn_1")).toBe("continued");
+      expect(client.requests).toEqual([
+        { method: "thread/read", params: { threadId: "thr_1", includeTurns: false } },
+        { method: "thread/turns/list", params: { threadId: "thr_1", limit: 1, sortDirection: "desc", itemsView: "summary" } },
+        { method: "turn/start", params: expect.objectContaining({ threadId: "thr_1", input: [], model: "gpt-test",
+          effort: "high", approvalPolicy: "never", cwd: process.cwd() }) },
+      ]);
+      expect(runtime.getSession("s1")?.activeTurnId).toBe("continued");
+      await expect(runtime.recoverResponseContinuation!("s1", "turn_1")).rejects.toThrow("失效");
+    });
+
+    test("does not continue a warning before the backend declares failure", async () => {
+      const { client, runtime } = await setup();
+      client.emit("error", { threadId: "thr_1", turnId: "turn_1", error: { message }, willRetry: false });
+      await expect(runtime.recoverResponseContinuation!("s1", "turn_1")).rejects.toThrow("失效");
+    });
+
+    test.each(["different-error", "cancelled", "different-turn", "new-active", "settings"])("refuses %s recovery", async (scenario) => {
+      const { client, runtime } = await setup();
+      if (scenario === "cancelled") client.emit("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "interrupted" } });
+      else fail(client, scenario === "different-error" ? "HTTP 400: Bad request" : message);
+      if (scenario === "different-turn") client.readResult = { thread: { id: "thr_1", status: { type: "idle" }, turns: [{ id: "external", status: "completed" }] } };
+      if (scenario === "new-active") client.readResult = { thread: { id: "thr_1", status: { type: "active" }, turns: [{ id: "external", status: "inProgress" }] } };
+      if (scenario === "settings") await runtime.setModel("s1", "other-model");
+      const count = client.requests.filter((r) => r.method === "turn/start").length;
+      await expect(runtime.recoverResponseContinuation!("s1", "turn_1")).rejects.toThrow();
+      expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(count);
+    });
+
+    test("consumes recovery before an ambiguous start timeout; never resubmits", async () => {
+      const { client, runtime } = await setup();
+      fail(client);
+      client.turnStartErrors = [new Error("App Server request timed out: turn/start")];
+      await expect(runtime.recoverResponseContinuation!("s1", "turn_1")).rejects.toThrow("timed out");
+      await expect(runtime.recoverResponseContinuation!("s1", "turn_1")).rejects.toThrow("失效");
+      expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(2);
+    });
+
+    test("honors cancellation during preflight and interrupts a continuation cancelled while starting", async () => {
+      for (const stage of ["thread/read", "turn/start"]) {
+        const { client, runtime } = await setup();
+        fail(client);
+        client.nextTurnId = "continued";
+        const abort = new AbortController();
+        const request = client.request.bind(client);
+        vi.spyOn(client, "request").mockImplementation(async (method, params, timeout) => {
+          const result = await request(method, params, timeout);
+          if (method === stage) abort.abort();
+          return result;
+        });
+        await expect(runtime.recoverResponseContinuation!("s1", "turn_1", abort.signal)).rejects.toThrow();
+        expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(stage === "turn/start" ? 2 : 1);
+        if (stage === "turn/start") expect(client.requests.at(-1)).toEqual({ method: "turn/interrupt", params: { threadId: "thr_1", turnId: "continued" } });
+      }
+    });
+
+    test("does not expose Codex-specific recovery on TraeX", () => {
+      const runtime = new CodexRuntime({ ...provider(new FakeAppServerClient()), getAgentFamily: () => "traex" }, logger());
+      expect(runtime.recoverResponseContinuation).toBeUndefined();
+    });
+
+    test("enables recovery when a wrapped executable is identified as Codex during initialization", async () => {
+      const client = new FakeAppServerClient();
+      let identified = false;
+      const runtime = new CodexRuntime({ getAgentFamily: () => identified ? "codex" : undefined,
+        getClient: async () => { identified = true; return client; }, close: vi.fn() }, logger());
+      expect(runtime.recoverResponseContinuation).toBeUndefined();
+      await runtime.createSession({ localSessionId: "s1", agentName: "custom-wrapper", cwd: process.cwd(), permissionMode: "auto" });
+      expect(runtime.recoverResponseContinuation).toBeTypeOf("function");
+    });
+  });
+
   test("locates one historical Turn with summary cursors and reads only that Turn in full", async () => {
     const client = new FakeAppServerClient();
     const runtime = new CodexRuntime(provider(client), logger());
@@ -2717,20 +2815,65 @@ describe("Provider switching", () => {
     expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
   });
 
-  test.each(["empty summary", "no rollout found", "missing source rollout"])("refuses a pristine thread before detaching (%s)", async (history) => {
+  test.each(["empty summary", "no rollout found", "missing source rollout", "thread is not materialized yet"])("switches a verified empty thread before its first message (%s)", async (history) => {
     const { client, runtime, session } = await setup(true);
     if (history !== "empty summary") client.turnListErrors.push(new AppServerRequestError("thread/turns/list", -32600, history));
+    client.startResult = { ...targetResponse, thread: { id: "thr_new" } };
     const persist = vi.fn();
-    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toMatchObject({
-      message: PROVIDER_SWITCH_EMPTY, previousSettingsRestored: true,
-    });
-    expect(client.requests.map((request) => request.method)).toEqual(["thread/read", "thread/turns/list"]);
-    expect(client.requests.at(-1)?.params).toEqual({ threadId: "thr_1", limit: 1, sortDirection: "desc", itemsView: "summary" });
-    expect(persist).not.toHaveBeenCalled();
-    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai", model: "gpt-test" });
+    await runtime.setExecutionSettings("s", target, persist);
+    expect(persist).toHaveBeenCalledWith(expect.objectContaining({ ...target, remoteSessionId: "thr_new", title: "Original", cwd: process.cwd() }), { emptyRemoteSessionId: "thr_1" });
+    expect(client.requests.filter(r => r.method === "thread/turns/list").every(r =>
+      JSON.stringify(r.params) === JSON.stringify({ threadId: "thr_1", limit: 1, sortDirection: "desc", itemsView: "summary" }))).toBe(true);
+    expect(client.requests.some(r => ["thread/resume", "thread/fork", "turn/start"].includes(r.method))).toBe(false);
+    expect(client.requests.at(-1)).toEqual({ method: "thread/unsubscribe", params: { threadId: "thr_1" } });
+    expect(session).toMatchObject({ ...target, remoteSessionId: "thr_new", localSessionId: "s" });
     client.requests = [];
-    await runtime.startTurn("s", "original thread is still usable");
-    expect(client.requests).toEqual([{ method: "turn/start", params: expect.objectContaining({ threadId: "thr_1", model: "gpt-test" }) }]);
+    await runtime.startTurn("s", "first message uses the selected Provider");
+    expect(client.requests.at(-1)).toEqual({ method: "turn/start", params: expect.objectContaining({ threadId: "thr_new", model: "gpt-test", effort: "high" }) });
+    expect(client.requests.some(r => r.method === "thread/resume")).toBe(false);
+  });
+
+  test.each(["start", "model", "persist", "changed history"])("preserves the original empty thread after replacement failure: %s", async (failure) => {
+    const { client, runtime, session } = await setup(true);
+    client.startResult = { ...targetResponse, thread: { id: "thr_new" }, model: failure === "model" ? "wrong" : target.model };
+    if (failure === "start") client.startErrors.push(new Error("start failed"));
+    if (failure === "changed history") client.readResults.push(
+      { thread: { id: "thr_1", preview: "", status: { type: "idle" } } },
+      { thread: { id: "thr_1", preview: "new external message", status: { type: "active" } } },
+    );
+    const persist = vi.fn(async () => { if (failure === "persist") throw new Error("disk full"); });
+    await expect(runtime.setExecutionSettings("s", target, persist)).rejects.toBeInstanceOf(ProviderSwitchError);
+    expect(session).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
+    expect(client.requests.filter(r => r.method === "thread/unsubscribe")).toEqual(failure === "start" ? [] : [
+      { method: "thread/unsubscribe", params: { threadId: "thr_new" } },
+    ]);
+    expect(client.requests.some(r => r.method === "thread/resume" || r.method === "thread/fork")).toBe(false);
+  });
+
+  test.each([false, true])("switches a persisted empty session after hydration or rejected resume (rejected=%s)", async (rejected) => {
+    const { client, runtime } = await setup(true);
+    client.readResult = { thread: { id: "thr_1", preview: "", forkedFromId: null, status: { type: "idle" } } };
+    runtime.forgetSession("s");
+    const input = { localSessionId: "s", remoteSessionId: "thr_1", agentName: "codex", cwd: process.cwd(),
+      modelProvider: "openai", model: "gpt-test", reasoningEffort: "medium", permissionMode: "auto" as const };
+    if (rejected) {
+      client.resumeResult = { ...oldResponse, modelProvider: "ignored" };
+      await runtime.resumeSession(input);
+    } else await runtime.prepareSessionForSettings(input);
+    client.startResult = { ...targetResponse, thread: { id: "thr_new" } };
+    await expect(runtime.setExecutionSettings("s", target)).resolves.toMatchObject({ remoteSessionId: "thr_new", ...target });
+    await runtime.startTurn("s", "first message");
+    expect(client.requests.at(-1)).toMatchObject({ method: "turn/start", params: { threadId: "thr_new" } });
+  });
+
+  test.each(["fork", "failed turn", "history error"])("never replaces threads with history or unverified emptiness (%s)", async (scenario) => {
+    const { client, runtime, session } = await setup(true);
+    if (scenario === "fork") client.readResult = { thread: { id: "thr_1", preview: "", forkedFromId: "source", status: { type: "idle" } } };
+    else if (scenario === "failed turn") client.turnListResults.push({ data: [{ id: "failed", status: "failed" }], nextCursor: null });
+    else client.turnListErrors.push(new Error("permission denied"));
+    try { await runtime.setExecutionSettings("s", target); } catch { /* Inspection errors must not trigger replacement. */ }
+    expect(session.remoteSessionId).toBe("thr_1");
+    expect(client.requests.some(r => r.method === "thread/start" || r.method === "thread/fork")).toBe(false);
   });
 
   test("waits for same-thread settings persistence before starting a turn", async () => {
@@ -2941,7 +3084,7 @@ describe("Provider switching", () => {
     await runtime.setGoal("s", { objective: "keep this goal" });
     client.requests = [];
     await expect(runtime.setExecutionSettings("s", target)).rejects.toThrow(PROVIDER_SWITCH_EMPTY);
-    expect(client.requests.map((request) => request.method)).toEqual(["thread/read", "thread/turns/list"]);
+    expect(client.requests.map((request) => request.method)).toEqual(["thread/read", "thread/turns/list", "thread/goal/get"]);
     expect(runtime.getSession("s")?.remoteSessionId).toBe("thr_1");
     expect(client.goalResult?.objective).toBe("keep this goal");
   });
@@ -3549,6 +3692,7 @@ class FakeAppServerClient {
   requests: Array<{ method: string; params: unknown }> = [];
   timeouts: Array<{ method: string; timeoutMs: number | undefined }> = [];
   startResult: unknown = { thread: { id: "thr_1" }, model: "gpt-test", reasoningEffort: "medium" };
+  startErrors: Error[] = [];
   resumeResult: unknown = { thread: { id: "thr_1", turns: [] }, model: "gpt-test", reasoningEffort: "medium" };
   resumeResults: unknown[] = [];
   unsubscribeResult: unknown = { status: "unsubscribed" };
@@ -3592,7 +3736,11 @@ class FakeAppServerClient {
       await this.modeChangeResponse?.();
       return {} as T;
     }
-    if (method === "thread/start") return this.startResult as T;
+    if (method === "thread/start") {
+      const error = this.startErrors.shift();
+      if (error) throw error;
+      return this.startResult as T;
+    }
     if (method === "thread/archive") {
       const error = this.archiveErrors.shift();
       if (error) throw error;

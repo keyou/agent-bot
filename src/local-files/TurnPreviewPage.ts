@@ -8,6 +8,8 @@ import type { ApprovalRequest, ToolState } from "../runtime/types.js";
 import type { FileSummary, TurnActivity, TurnReasoningItem, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
 import { displayFilePath, displayToolCommand, formatShellCommandForDisplay, toolStatusIcon } from "../feishu/CardRenderer.js";
 import { turnReasoningItems } from "../presentation/turnReasoning.js";
+import { visibleTurnActivities } from "../presentation/visibleTurnActivities.js";
+import { displayRuntimeError } from "../runtime/responseErrors.js";
 import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 
 const MARKDOWN = new MarkdownIt({
@@ -620,16 +622,19 @@ export function renderTurnPreviewPatch(
   state: TurnViewState, changed: Set<string>, removed: Set<string>,
   localFileUrl: (filePath: string) => string | undefined, language: TurnPreviewLanguage,
 ): TurnPreviewSnapshot & { removed: string[]; before: Record<string, string> } {
+  const visible = visibleTurnActivities(state);
+  const visibleIds = new Set(visible.map((activity) => activity.id));
+  const suppressed = state.activities.filter((activity) => !visibleIds.has(activity.id)).map((activity) => activity.id);
   const partial = { ...state,
-    activities: state.activities.filter((a) => changed.has(a.id)),
+    activities: visible.filter((a) => changed.has(a.id)),
     reasoningItems: state.reasoningItems?.filter((r) => changed.has(`reasoning:${r.itemId}`)),
   };
   const order = [
     ...(state.reasoningItems ?? []).filter((r) => !r.afterActivityId).map((r) => `reasoning:${r.itemId}`),
-    ...state.activities.flatMap((a) => [a.id, ...(state.reasoningItems ?? []).filter((r) => r.afterActivityId === a.id).map((r) => `reasoning:${r.itemId}`)]),
+    ...visible.flatMap((a) => [a.id, ...(state.reasoningItems ?? []).filter((r) => r.afterActivityId === a.id).map((r) => `reasoning:${r.itemId}`)]),
   ];
   const before = Object.fromEntries(order.flatMap((id, i) => changed.has(id) && order[i + 1] ? [[id, order[i + 1]]] : []));
-  return { ...renderTurnPreviewSnapshot(partial, localFileUrl, language, { deferDetails: true }), removed: [...removed], before };
+  return { ...renderTurnPreviewSnapshot(partial, localFileUrl, language, { deferDetails: true }), removed: [...new Set([...removed, ...suppressed])], before };
 }
 
 export function renderTurnPreviewSnapshot(
@@ -645,7 +650,7 @@ export function renderTurnPreviewSnapshot(
     return localFileUrl(path.resolve(state.projectCwd, filePath));
   } : undefined;
   const renderText = (value: string): string => renderMarkdown(value, state.projectCwd, localFileUrl, language);
-  const timeline = renderTimeline(state, renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd, options.deferDetails);
+  const timeline = renderTimeline({ ...state, activities: visibleTurnActivities(state) }, renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd, options.deferDetails);
   const terminal = isTerminal(state.status);
   const waitingForProgress = !terminal && !state.finalResponse && !state.assistantText
     && !state.error && !state.approval && state.status !== "waiting_for_approval"
@@ -666,7 +671,7 @@ export function renderTurnPreviewSnapshot(
     `<section class="timeline" data-preview-key="timeline"${timelineContent ? "" : " hidden"}>${timelineContent}</section>`,
     state.fileSummary.length > 0 ? renderFileSummary(state, language, resolveFileUrl, options.deferDetails) : "",
     state.approval ? renderApprovalNotice(state.approval, renderText, language) : "",
-    state.error ? `<section class="result error-result" data-preview-key="error"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(state.error)}</pre></section>` : "",
+    state.error ? `<section class="result error-result" data-preview-key="error"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(displayRuntimeError(state.error))}</pre></section>` : "",
     state.finalResponse
       ? renderFinalAnswer(state.finalResponse, state.turnId, renderText, language)
       : state.assistantText
@@ -831,7 +836,7 @@ function renderActivity(
   switch (activity.kind) {
     case "assistant":
       if (activity.id.startsWith("commentary:runtime-error:")) {
-        return `<article class="activity message runtime-error" data-activity="${escapeAttribute(activity.id)}"><pre>${escapeHtml(activity.text)}</pre></article>`;
+        return `<article class="activity message runtime-error" data-activity="${escapeAttribute(activity.id)}"><pre>${escapeHtml(displayRuntimeError(activity.text))}</pre></article>`;
       }
       return renderMessageActivity(activity.id, activity.text, "commentary", renderText);
     case "user":

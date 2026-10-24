@@ -1,7 +1,7 @@
 import type { RuntimeExecutionSettings } from "../runtime/types.js";
 
 export const PROVIDER_SWITCH_BUSY = "当前任务正在执行，暂时不能切换 Provider。请等待任务完成，或停止任务后重试。";
-export const PROVIDER_SWITCH_EMPTY = "App Server 尚未保存此空会话，无法在保留任务 ID 的前提下切换 Provider。未改变会话或设置，也不会自动创建替代任务。";
+export const PROVIDER_SWITCH_EMPTY = "无法确认此会话不包含历史、分支或 Goal，未替换任务。请检查原会话状态后重试。";
 
 export class ProviderSwitchError extends Error {
   constructor(message: string, readonly previousSettingsRestored: boolean, options?: ErrorOptions) {

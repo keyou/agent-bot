@@ -270,6 +270,10 @@ export interface RuntimeExecutionSettings {
   permissionMode: PermissionMode;
 }
 
+export interface RuntimeSettingsReplacement {
+  emptyRemoteSessionId: string;
+}
+
 export interface RuntimeReleaseResult {
   status: "released" | "busy";
   activeSessionIds?: string[];
@@ -304,6 +308,8 @@ export interface AgentRuntime {
   inspectRemoteSessionActivity?(remoteSessionId: string): Promise<RemoteSessionActivity>;
   synchronizeSession(sessionId: string): Promise<RuntimeSession>;
   startTurn(sessionId: string, prompt: RuntimePrompt): Promise<string>;
+  // Continue a verified Responses replay failure without resubmitting user input.
+  recoverResponseContinuation?(sessionId: string, failedTurnId: string, signal?: AbortSignal): Promise<string>;
   steerTurn(sessionId: string, turnId: string, prompt: RuntimePrompt): Promise<void>;
   cancelTurn(sessionId: string, turnId: string): Promise<void>;
   interruptRemoteTurn?(remoteSessionId: string, turnId: string): Promise<void>;
@@ -320,7 +326,7 @@ export interface AgentRuntime {
     sessionId: string,
     settings: RuntimeExecutionSettings,
     // Called after remote verification, before releasing the task's operation lock.
-    persist?: (session: RuntimeSession) => Promise<void>,
+    persist?: (session: RuntimeSession, replacement?: RuntimeSettingsReplacement) => Promise<void>,
   ): Promise<RuntimeSession>;
   respondToApproval(sessionId: string, requestId: string, decision: ApprovalDecision): Promise<void>;
   listModels(modelProvider?: string, fallbackModel?: string): Promise<ModelOption[]>;

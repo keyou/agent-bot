@@ -1461,6 +1461,96 @@ describe("ProxySessionController", () => {
     expect(store.getTurnDelivery("implementation")?.progressMessageId).toBe("original-card");
   });
 
+  describe("Responses continuation failures", () => {
+    const error = JSON.stringify({ type: "error", status: 400, error: {
+      message: "Persisted response cannot be replayed.", type: "invalid_request_error",
+      code: "unsupported_persisted_item_context", param: "previous_response_id",
+    } });
+
+    test("recovers once without replaying user input, keeps reactions pending, and ignores duplicate failures", async () => {
+      const f = fixture();
+      vi.mocked(f.outbound.addReaction!).mockResolvedValue("reaction");
+      f.runtime.recoverResponseContinuation = vi.fn(async (sessionId) => {
+        f.sessions.get(sessionId)!.activeTurnId = "continued";
+        for (const listener of f.listeners) listener({ type: "turn_started", sessionId, turnId: "continued", startedAt: Date.now() });
+        return "continued";
+      });
+      await f.controller.onMessage({ ...message("finish release"), images: [{ imageKey: "input" }] });
+      const session = f.store.listSessions("chat_id:c1")[0]!;
+      const attemptId = f.store.findIncompleteTurnAttemptForSession(session.localSessionId)!.attemptId;
+      f.sessions.get(session.localSessionId)!.activeTurnId = undefined;
+      const failed = { type: "turn_failed" as const, sessionId: session.localSessionId, turnId: "turn_1", message: error };
+      for (const listener of f.listeners) { listener(failed); listener(failed); }
+      await vi.waitFor(() => expect(f.store.getTurnAttempt(attemptId)).toMatchObject({ turnId: "continued", retryCount: 1, status: "running" }));
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+      expect(f.runtime.recoverResponseContinuation).toHaveBeenCalledExactlyOnceWith(session.localSessionId, "turn_1", expect.any(AbortSignal));
+      expect(f.presenter.startPendingTurn).toHaveBeenLastCalledWith(session.localSessionId, "chat_id:c1", expect.any(String),
+        undefined, "恢复模型续接：finish release");
+      expect(f.store.getMessageReaction("m-finish release")).toMatchObject({ turnId: "continued", status: "pending", emojiType: "OnIt" });
+      f.sessions.get(session.localSessionId)!.activeTurnId = undefined;
+      for (const listener of f.listeners) listener({ ...failed, turnId: "continued" });
+      await vi.waitFor(() => expect(f.store.getTurnAttempt(attemptId)?.status).toBe("failed"));
+      expect(f.runtime.recoverResponseContinuation).toHaveBeenCalledTimes(1);
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([false, true])("does not retry an ambiguous continuation start or replay the prompt (disconnect event: %s)", async (disconnect) => {
+      const f = fixture();
+      f.runtime.recoverResponseContinuation = vi.fn(async (sessionId) => {
+        if (disconnect) {
+          for (const listener of f.listeners) listener({ type: "turn_started", sessionId, turnId: "continued", startedAt: Date.now() });
+          for (const listener of f.listeners) listener({ type: "turn_failed", sessionId, turnId: "continued", message: "App Server disconnected: connection closed." });
+        }
+        throw new Error("App Server request timed out: turn/start");
+      });
+      await f.controller.onMessage(message("do not replay this"));
+      const session = f.store.listSessions("chat_id:c1")[0]!;
+      f.sessions.get(session.localSessionId)!.activeTurnId = undefined;
+      for (const listener of f.listeners) listener({ type: "turn_failed", sessionId: session.localSessionId, turnId: "turn_1", message: error });
+      await vi.waitFor(() => expect(f.store.getSession(session.localSessionId)?.status).toBe("failed"));
+      expect(f.runtime.recoverResponseContinuation).toHaveBeenCalledTimes(1);
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(f.outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("模型续接恢复未能启动")));
+    });
+
+    test("allows Stop to cancel recovery before a new turn is submitted", async () => {
+      const f = fixture();
+      f.runtime.recoverResponseContinuation = vi.fn(async () => "unexpected");
+      await f.controller.onMessage(message("stop before recovery"));
+      const session = f.store.listSessions("chat_id:c1")[0]!;
+      const attemptId = f.store.findIncompleteTurnAttemptForSession(session.localSessionId)!.attemptId;
+      f.sessions.get(session.localSessionId)!.activeTurnId = undefined;
+      const remote = f.remoteSessions.find((r) => r.id === session.remoteSessionId)!;
+      remote.status = "idle";
+      remote.lastTurnStatus = "failed";
+      let release!: () => void;
+      const barrier = new Promise<void>((resolve) => { release = resolve; });
+      vi.mocked(f.presenter.onEvent).mockImplementationOnce(async () => { await barrier; });
+      for (const listener of f.listeners) listener({ type: "turn_failed", sessionId: session.localSessionId, turnId: "turn_1", message: error });
+      await vi.waitFor(() => expect(f.store.getTurnAttempt(attemptId)?.retryCount).toBe(1));
+      await f.controller.onMessage(message("/stop"));
+      release();
+      await vi.waitFor(() => expect(f.store.getTurnAttempt(attemptId)?.status).toBe("cancelled"));
+      expect(f.runtime.recoverResponseContinuation).not.toHaveBeenCalled();
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    });
+
+    test.each(["unsupported-runtime", "cancelling", "pending-provider"])("does not recover with %s", async (scenario) => {
+      const f = fixture();
+      if (scenario !== "unsupported-runtime") f.runtime.recoverResponseContinuation = vi.fn(async () => "unexpected");
+      await f.controller.onMessage(message("keep task ownership"));
+      const session = f.store.listSessions("chat_id:c1")[0]!;
+      if (scenario === "cancelling") f.store.requestTurnAttemptCancellation("turn_1");
+      if (scenario === "pending-provider") f.store.savePendingProviderSettings({ localSessionId: session.localSessionId,
+        contextKey: "chat_id:c1", settings: { modelProvider: "other", model: "gpt-test", reasoningEffort: "high", permissionMode: "auto" } });
+      f.sessions.get(session.localSessionId)!.activeTurnId = undefined;
+      for (const listener of f.listeners) listener({ type: "turn_failed", sessionId: session.localSessionId, turnId: "turn_1", message: error });
+      await vi.waitFor(() => expect(f.store.getSession(session.localSessionId)?.lastTurnStatus).toBe("failed"));
+      if (f.runtime.recoverResponseContinuation) expect(f.runtime.recoverResponseContinuation).not.toHaveBeenCalled();
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    });
+  });
+
   test("retries transient LLM turn failures three times before making the task terminal", async () => {
     const { controller, runtime, sessions, outbound, presenter, store, listeners } = fixture();
     (outbound.addReaction as ReturnType<typeof vi.fn>)
@@ -11094,6 +11184,67 @@ describe("ProxySessionController", () => {
       { id: "openai" },
       { id: "ai_coding", displayName: "AI Coding" },
     ]);
+  });
+
+  test.each(["cli", "card"])("persists a verified empty-thread replacement through %s and routes the first Prompt to it", async (entry) => {
+    const { controller, runtime, store, presenter, remoteSessions, persistAgentExecutionDefaults } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const original = runtime.getSession(id)!;
+    vi.mocked(runtime.setExecutionSettings!).mockImplementationOnce(async (_id, settings, persist) => {
+      const candidate = { ...original, ...settings, remoteSessionId: "replacement" };
+      await persist?.(candidate, { emptyRemoteSessionId: original.remoteSessionId });
+      remoteSessions.push({ id: candidate.remoteSessionId, cwd: candidate.cwd, source: "agent-bot", status: "idle" });
+      Object.assign(original, candidate);
+      return original;
+    });
+    if (entry === "cli") await controller.controlTaskSettings(id, "provider", "azure");
+    else await controller.onCardAction({ actionId: "switch-empty", contextKey: "chat_id:c1", messageId: "om_provider",
+      value: { action: "settings_provider_select", sessionId: id, contextKey: "chat_id:c1", provider: "azure" } });
+    expect(store.getSession(id)).toMatchObject({ localSessionId: id, remoteSessionId: "replacement", modelProvider: "azure" });
+    expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe(id);
+    expect(persistAgentExecutionDefaults).toHaveBeenCalled();
+    expect(presenter.updateSessionModel).toHaveBeenCalledWith(id, original.model, "azure");
+    await controller.onMessage(message("first message after switching"));
+    expect(runtime.startTurn).toHaveBeenLastCalledWith(id, "first message after switching");
+    expect(runtime.getSession(id)?.remoteSessionId).toBe("replacement");
+  });
+
+  test.each(["last turn", "attempt", "fork", "wrong source"])("rejects empty-thread replacement with local evidence: %s", async (evidence) => {
+    const { controller, runtime, store, persistAgentExecutionDefaults } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const original = runtime.getSession(id)!;
+    if (evidence === "last turn") store.updateRuntimeSession(id, { lastTurnId: "old-turn", lastTurnStatus: "failed" });
+    if (evidence === "attempt") store.createTurnAttempt({ attemptId: "past-attempt", localSessionId: id, contextKey: "chat_id:c1", promptText: "prior prompt" });
+    if (evidence === "fork") store.audit("chat_id:c1", "session_forked", { forkedLocalSessionId: id, sourceTurnId: "source-turn" });
+    vi.mocked(runtime.setExecutionSettings!).mockImplementationOnce(async (_id, settings, persist) => {
+      const candidate = { ...original, ...settings, remoteSessionId: "replacement" };
+      await persist?.(candidate, { emptyRemoteSessionId: evidence === "wrong source" ? "wrong" : original.remoteSessionId });
+      return candidate;
+    });
+    await expect(controller.controlTaskSettings(id, "provider", "azure")).rejects.toThrow("任务 ID");
+    expect(store.getSession(id)?.remoteSessionId).toBe(original.remoteSessionId);
+    expect(persistAgentExecutionDefaults).not.toHaveBeenCalled();
+  });
+
+  test.each(["defaults", "database"])("keeps the old empty-task binding when replacement persistence fails: %s", async (failure) => {
+    const { controller, runtime, store, config, persistAgentExecutionDefaults } = fixture();
+    await controller.onMessage(message("/new"));
+    const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const original = runtime.getSession(id)!;
+    vi.mocked(runtime.setExecutionSettings!).mockImplementationOnce(async (_id, settings, persist) => {
+      const candidate = { ...original, ...settings, remoteSessionId: "replacement" };
+      if (failure === "defaults") persistAgentExecutionDefaults.mockRejectedValueOnce(new Error("defaults unavailable"));
+      else vi.spyOn(store, "updateRuntimeSession").mockImplementationOnce(() => { throw new Error("database unavailable"); });
+      await persist?.(candidate, { emptyRemoteSessionId: original.remoteSessionId });
+      Object.assign(original, candidate);
+      return original;
+    });
+    await expect(controller.controlTaskSettings(id, "provider", "azure")).rejects.toThrow("unavailable");
+    expect(store.getSession(id)).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "openai" });
+    expect(original.remoteSessionId).toBe("thr_1");
+    expect(config.agents.codex?.defaults?.modelProvider).not.toBe("azure");
   });
 
   test.each(["cli", "card"])("rejects a replacement thread ID when switching Provider through %s", async (entry) => {

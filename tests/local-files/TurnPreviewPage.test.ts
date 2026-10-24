@@ -7,7 +7,7 @@ import { CardRenderer } from "../../src/feishu/CardRenderer.js";
 import { reduceTurnEvent } from "../../src/presentation/TurnStateReducer.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import type { ToolState } from "../../src/runtime/types.js";
-import { detectTurnPreviewLanguage, renderTurnPreviewPage, renderTurnPreviewSnapshot, renderTurnPreviewDetail } from "../../src/local-files/TurnPreviewPage.js";
+import { detectTurnPreviewLanguage, renderTurnPreviewPage, renderTurnPreviewSnapshot, renderTurnPreviewDetail, renderTurnPreviewPatch } from "../../src/local-files/TurnPreviewPage.js";
 
 function state(tool?: Partial<ToolState>): TurnViewState {
   return {
@@ -23,6 +23,35 @@ function state(tool?: Partial<ToolState>): TurnViewState {
 }
 
 describe("Turn Preview", () => {
+  test.each(["zh", "en"] as const)("deduplicates terminal errors in %s snapshots and removes the live SSE warning", (language) => {
+    const message = JSON.stringify({ type: "error", status: 400, error: {
+      message: "Persisted response <script> cannot be replayed.",
+      type: "invalid_request_error", code: "unsupported_persisted_item_context", param: "previous_response_id",
+    } });
+    const warningId = "commentary:runtime-error:turn";
+    const live = reduceTurnEvent(state(), { type: "progress", sessionId: "session", turnId: "turn",
+      activityId: warningId, severity: "warning", append: false,
+      text: `运行请求失败，等待 Agent 返回最终状态：${message}` }, true);
+    expect(renderTurnPreviewSnapshot(live).content).toContain(`data-activity="${warningId}"`);
+    const failed = reduceTurnEvent(live, { type: "turn_failed", sessionId: "session", turnId: "turn",
+      message: message + "\n\n模型续接状态失效，正在恢复连接并继续（1/1）。" }, true);
+    const original = JSON.stringify(failed);
+    const snapshot = renderTurnPreviewSnapshot(failed, undefined, language);
+    const patch = renderTurnPreviewPatch(failed, new Set(), new Set(), () => undefined, language);
+    for (const rendered of [snapshot, patch]) {
+      expect(rendered.content.match(/unsupported_persisted_item_context/g)).toHaveLength(1);
+      expect(rendered.content).not.toContain(`data-activity="${warningId}"`);
+      expect(rendered.content).not.toContain("<script>");
+      expect(rendered.content).toContain("&lt;script&gt;");
+      expect(rendered.content).toContain("恢复连接并继续");
+    }
+    expect(patch.removed).toContain(warningId);
+    expect(JSON.stringify(failed)).toBe(original);
+    failed.error = "Different final failure";
+    expect(renderTurnPreviewSnapshot(failed).content).toContain(`data-activity="${warningId}"`);
+    expect(renderTurnPreviewPatch(failed, new Set(), new Set(), () => undefined, language).removed).not.toContain(warningId);
+  });
+
   test("shows automatic approval in live Preview without asking the user to respond", () => {
     const id = { sessionId: "session", turnId: "turn" };
     let input = reduceTurnEvent(state(), { ...id, type: "approval_requested", request: {

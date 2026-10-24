@@ -59,6 +59,7 @@ import type { TurnActivity, TurnViewState } from "../presentation/turnViewTypes.
 import { createTurnViewState, hydrateTurnViewState } from "../presentation/TurnStateReducer.js";
 import { buildTurnGraphRows } from "../presentation/turnGraph.js";
 import type { AgentRuntimeRegistry } from "../runtime/AgentRuntimeRegistry.js";
+import { displayRuntimeError, isResponseContinuationError } from "../runtime/responseErrors.js";
 import type {
   AgentRuntime,
   ApprovalDecision,
@@ -76,6 +77,7 @@ import type {
   RuntimeExecutionSettings,
   RuntimePrompt,
   RuntimeSession,
+  RuntimeSettingsReplacement,
 } from "../runtime/types.js";
 import {
   isActiveShellCommandJob,
@@ -120,6 +122,7 @@ interface StartTurnOptions {
   displayPrompt?: string;
   preserveAttemptOnFailure?: boolean;
   approvedPlanTurnId?: string;
+  responseContinuationTurnId?: string;
 }
 
 interface PendingForwardAttachment {
@@ -566,6 +569,7 @@ export class ProxySessionController {
   private readonly lastSessionListings = new Map<string, string[]>();
   private readonly threadInitializations = new Map<string, Promise<void>>();
   private readonly llmRetryingSessions = new Set<string>();
+  private readonly responseContinuations = new Map<string, { turnId: string; abort: AbortController }>();
   private readonly planHandoffs = new Map<string, string>();
   private readonly retriedFailureTurnIds = new Set<string>();
   private readonly queuedPromptRetryTimers = new Map<string, NodeJS.Timeout>();
@@ -3976,6 +3980,16 @@ export class ProxySessionController {
     localImagePaths?: string[], options: StartTurnOptions = {},
   ): Promise<string> {
     return this.settingsOperations.run(loaded.record.localSessionId, async () => {
+      if (options.responseContinuationTurnId) {
+        const current = this.store.getSession(loaded.record.localSessionId);
+        if (!current || current.status === "closed" || current.lastTurnId !== options.responseContinuationTurnId
+          || this.sessionResets.has(current.localSessionId)
+          || this.responseContinuations.get(current.localSessionId)?.turnId !== options.responseContinuationTurnId
+          || this.store.getPendingProviderSettings(current.localSessionId)) {
+          throw new Error("任务或运行设置已变化，未自动恢复模型续接。请发送消息继续。");
+        }
+        return this.startTurnNow(loaded, text, replyTarget, localImagePaths, options);
+      }
       try {
         await this.applyPendingProviderSettings(loaded);
       } catch (error) {
@@ -4050,17 +4064,27 @@ export class ProxySessionController {
             || this.sessionResets.has(loaded.record.localSessionId))) {
             throw new Error("方案执行已取消。");
           }
-          turnId = await loaded.runtime.startTurn(
-            loaded.record.localSessionId,
-            options.approvedPlanTurnId
-              ? { text: runtimeText, collaborationMode: "default" }
-              : runtimePrompt(runtimeText, localImagePaths),
-          );
+          if (options.responseContinuationTurnId) {
+            const recovery = this.responseContinuations.get(loaded.record.localSessionId);
+            if (recovery?.turnId !== options.responseContinuationTurnId
+              || this.sessionResets.has(loaded.record.localSessionId) || !loaded.runtime.recoverResponseContinuation) {
+              throw new Error("模型续接恢复已取消。");
+            }
+            turnId = await loaded.runtime.recoverResponseContinuation(loaded.record.localSessionId, options.responseContinuationTurnId, recovery.abort.signal);
+          } else {
+            turnId = await loaded.runtime.startTurn(
+              loaded.record.localSessionId,
+              options.approvedPlanTurnId
+                ? { text: runtimeText, collaborationMode: "default" }
+                : runtimePrompt(runtimeText, localImagePaths),
+            );
+          }
           break;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const attempt = this.store.getTurnAttempt(attemptId);
           const retryAttempt = attempt
+            && !options.responseContinuationTurnId
             && isRetryableLlmTurnFailure(message)
             && attempt.retryCount < MAX_LLM_TURN_RETRIES
             ? this.store.prepareUnstartedTurnAttemptRetry(attemptId)
@@ -4794,7 +4818,23 @@ export class ProxySessionController {
       : undefined;
     if (event.type === "turn_failed") {
       if (this.retriedFailureTurnIds.has(event.turnId)) return;
-      if (failedAttempt && isRetryableLlmTurnFailure(event.message) && failedAttempt.retryCount < MAX_LLM_TURN_RETRIES) {
+      const source = this.store.getSession(event.sessionId);
+      const responseContinuation = failedAttempt?.retryCount === 0 && failedAttempt.status !== "cancelling"
+        && source && source.status !== "closed" && source.lastTurnId === event.turnId
+        && !this.sessionResets.has(event.sessionId) && !this.store.getPendingProviderSettings(event.sessionId)
+        && Boolean(this.runtimes.forAgent(source.agentName).recoverResponseContinuation)
+        && isResponseContinuationError(event.message);
+      if (failedAttempt && responseContinuation) {
+        const retryAttempt = this.store.prepareTurnAttemptRetry(failedAttempt.attemptId, event.turnId);
+        if (retryAttempt) {
+          this.retriedFailureTurnIds.add(event.turnId);
+          this.responseContinuations.set(event.sessionId, { turnId: event.turnId, abort: new AbortController() });
+          await this.retryFailedLlmTurn(event, retryAttempt, true);
+          return;
+        }
+      }
+      if (failedAttempt && !this.responseContinuations.has(event.sessionId)
+        && isRetryableLlmTurnFailure(event.message) && failedAttempt.retryCount < MAX_LLM_TURN_RETRIES) {
         const retryAttempt = this.store.prepareTurnAttemptRetry(failedAttempt.attemptId, event.turnId);
         if (retryAttempt) {
           this.retriedFailureTurnIds.add(event.turnId);
@@ -4957,6 +4997,7 @@ export class ProxySessionController {
   private async retryFailedLlmTurn(
     event: Extract<RuntimeEvent, { type: "turn_failed" }>,
     attempt: TurnAttemptRecord,
+    responseContinuation = false,
   ): Promise<void> {
     const retryNumber = attempt.retryCount;
     const session = this.store.getSession(event.sessionId);
@@ -4974,14 +5015,17 @@ export class ProxySessionController {
       attemptId: attempt.attemptId,
       failedTurnId: event.turnId,
       retryNumber,
-      maxRetries: MAX_LLM_TURN_RETRIES,
+      maxRetries: responseContinuation ? 1 : MAX_LLM_TURN_RETRIES,
+      responseContinuation,
       error: event.message,
     });
 
     try {
       await this.outbound.onEvent({
         ...event,
-        message: `${event.message}\n\n检测到临时模型服务错误，正在自动重试（${retryNumber}/${MAX_LLM_TURN_RETRIES}）。`,
+        message: responseContinuation
+          ? `${event.message}\n\n模型续接状态失效，正在恢复连接并继续（1/1）。`
+          : `${event.message}\n\n检测到临时模型服务错误，正在自动重试（${retryNumber}/${MAX_LLM_TURN_RETRIES}）。`,
       });
     } catch (error) {
       this.logger.warn(
@@ -4998,21 +5042,26 @@ export class ProxySessionController {
       const loaded = await this.loadSession(current, Boolean(this.store.getPendingProviderSettings(current.localSessionId)));
       const retryTurnId = await this.startTurn(
         loaded,
-        llmRetryRuntimePrompt(attempt.promptText, retryNumber),
+        responseContinuation ? "" : llmRetryRuntimePrompt(attempt.promptText, retryNumber),
         replyTarget,
-        attempt.localImagePaths,
+        responseContinuation ? undefined : attempt.localImagePaths,
         {
           attemptId: attempt.attemptId,
           messageId: attempt.messageId,
-          displayPrompt: llmRetryCardPrompt(attempt.promptText, retryNumber),
+          displayPrompt: responseContinuation ? `恢复模型续接：${attempt.promptText}` : llmRetryCardPrompt(attempt.promptText, retryNumber),
           preserveAttemptOnFailure: true,
+          ...(responseContinuation ? { responseContinuationTurnId: event.turnId } : {}),
         },
       );
       this.store.rebindPendingTurnMessages(session.localSessionId, event.turnId, retryTurnId);
     } catch (error) {
-      this.store.updateTurnAttempt(attempt.attemptId, { status: "failed" });
-      this.store.updateSession(session.localSessionId, { status: "failed" });
-      await this.finalizeTurnMessageReactions(event.turnId, "failed").catch((reactionError: unknown) => {
+      const aborted = responseContinuation && !this.responseContinuations.has(session.localSessionId);
+      this.store.updateTurnAttempt(attempt.attemptId, { status: aborted ? "cancelled" : "failed" });
+      const latest = this.store.getSession(session.localSessionId);
+      if (!responseContinuation || (latest?.lastTurnId === event.turnId && latest.status !== "closed")) {
+        this.store.updateSession(session.localSessionId, { status: aborted ? "ready" : "failed" });
+      }
+      await this.finalizeTurnMessageReactions(event.turnId, aborted ? "cancelled" : "failed").catch((reactionError: unknown) => {
         this.logger.warn(
           { error: reactionError, sessionId: session.localSessionId, turnId: event.turnId },
           "Failed to finalize reactions after an LLM retry could not start.",
@@ -5022,9 +5071,16 @@ export class ProxySessionController {
         { error, sessionId: session.localSessionId, retryNumber },
         "Failed to start an automatic LLM turn retry.",
       );
+      if (responseContinuation && !aborted) {
+        await this.outbound.sendText(attempt.contextKey,
+          `模型续接恢复未能启动：${displayRuntimeError(runtimeErrorMessage(error))}。请发送消息继续。`);
+      }
       await this.scheduleNextQueuedPrompt(session.localSessionId);
     } finally {
       this.llmRetryingSessions.delete(session.localSessionId);
+      if (this.responseContinuations.get(session.localSessionId)?.turnId === event.turnId) {
+        this.responseContinuations.delete(session.localSessionId);
+      }
     }
   }
 
@@ -5291,6 +5347,8 @@ export class ProxySessionController {
   }
 
   private async cancelSession(record: SessionRecord): Promise<void> {
+    this.responseContinuations.get(record.localSessionId)?.abort.abort();
+    this.responseContinuations.delete(record.localSessionId);
     this.planHandoffs.delete(record.localSessionId);
     const runtime = this.runtimes.forAgent(record.agentName);
     if (runtime.kind === "codex" && record.remoteSessionId && runtime.interruptRemoteTurn) {
@@ -5370,6 +5428,8 @@ export class ProxySessionController {
   }
 
   private async runSessionReset(sessionId: string, operation: () => Promise<void>): Promise<void> {
+    this.responseContinuations.get(sessionId)?.abort.abort();
+    this.responseContinuations.delete(sessionId);
     this.planHandoffs.delete(sessionId);
     const previous = this.sessionResets.get(sessionId) ?? Promise.resolve();
     const reset = previous.catch(() => undefined).then(operation);
@@ -5844,9 +5904,16 @@ export class ProxySessionController {
     if (!loaded.runtime.setExecutionSettings) throw new Error("当前运行时不支持 Provider 设置。");
     loaded.session = loaded.runtime.getSession(loaded.record.localSessionId) ?? loaded.session;
     const remoteSessionId = loaded.session.remoteSessionId;
-    const persist = (candidate: RuntimeSession): Promise<void> => this.agentDefaultsOperations.run(loaded.record.agentName, async () => {
+    const persist = (candidate: RuntimeSession, replacement?: RuntimeSettingsReplacement): Promise<void> => this.agentDefaultsOperations.run(loaded.record.agentName, async () => {
       if (candidate.remoteSessionId !== remoteSessionId) {
-        throw new Error("设置切换返回了不同的任务 ID，未保存设置；不允许替换任务或更改历史。");
+        const saved = this.store.getSession(loaded.record.localSessionId);
+        if (replacement?.emptyRemoteSessionId !== remoteSessionId || !saved || saved.remoteSessionId !== remoteSessionId
+          || saved.status === "closed" || saved.status === "running" || saved.lastTurnId || loaded.session.activeTurnId || candidate.activeTurnId
+          || candidate.localSessionId !== saved.localSessionId || !candidate.remoteSessionId
+          || candidate.agentName !== saved.agentName || candidate.cwd !== saved.cwd || candidate.runtimeKind !== loaded.session.runtimeKind
+          || this.store.hasTurnAttemptsForSession(saved.localSessionId) || this.store.getForkHistorySource(saved.localSessionId)) {
+          throw new Error("设置切换返回了不同的任务 ID，未保存设置；仅允许已验证的空会话更换底层任务。");
+        }
       }
       assertProviderSettingsApplied(candidate, settings);
       const agent = this.ensureAgent(loaded.record.agentName);
@@ -5854,6 +5921,7 @@ export class ProxySessionController {
       await this.persistAgentExecutionDefaultsNow(loaded.record.localSessionId, candidate);
       try {
         this.store.updateRuntimeSession(loaded.record.localSessionId, {
+          remoteSessionId: candidate.remoteSessionId,
           modelProvider: candidate.modelProvider,
           model: candidate.model,
           reasoningEffort: candidate.reasoningEffort,
@@ -5866,6 +5934,7 @@ export class ProxySessionController {
       }
     });
     const session = await loaded.runtime.setExecutionSettings(loaded.record.localSessionId, settings, persist);
+    loaded.record = this.store.getSession(loaded.record.localSessionId) ?? loaded.record;
     this.settingsOnlySessions.delete(loaded.record.localSessionId);
     this.outbound.updateSessionModel(loaded.record.localSessionId, session.model, session.modelProvider);
     return session;

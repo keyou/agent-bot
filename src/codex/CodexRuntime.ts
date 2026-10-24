@@ -28,9 +28,11 @@ import type {
   RuntimeReleaseResult,
   RuntimeSession,
   RuntimeSessionMetadata,
+  RuntimeSettingsReplacement,
 } from "../runtime/types.js";
 import { appendGeneratedImageMarkdown } from "../utils/generatedImageMarkdown.js";
 import { normalizeTaskTitle } from "../utils/taskTitle.js";
+import { isResponseContinuationError } from "../runtime/responseErrors.js";
 import { AppServerRequestError } from "./AppServerConnection.js";
 import { workspaceSandboxFromConfig, workspaceSandboxFromResponse, type TurnSandboxPolicy, type WorkspaceSandboxPolicy } from "./AppServerPermissions.js";
 import { formatCodexError, mapCodexNotification } from "./CodexEventMapper.js";
@@ -88,6 +90,7 @@ interface CodexSession extends RuntimeSession {
   terminalTurnIds: Set<string>;
   modeChangeRequestIds: Set<string>;
   planContinuationTurnId?: string;
+  responseFailureTurnId?: string;
   finalText: string;
   generatedImagePaths: string[];
   messagePhases: Map<string, "commentary" | "final_answer">;
@@ -266,16 +269,51 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async startTurn(sessionId: string, prompt: RuntimePrompt): Promise<string> {
-    return this.runSessionOperation(sessionId, () => this.startTurnNow(sessionId, prompt));
+    return this.runSessionOperation(sessionId, () => {
+      this.requireSession(sessionId).responseFailureTurnId = undefined;
+      return this.startTurnNow(sessionId, prompt);
+    });
   }
 
-  private async startTurnNow(sessionId: string, prompt: RuntimePrompt): Promise<string> {
+  get recoverResponseContinuation(): AgentRuntime["recoverResponseContinuation"] {
+    return this.provider.getAgentFamily?.() === "codex"
+      ? (sessionId, failedTurnId, signal) => this.recoverResponseContinuationNow(sessionId, failedTurnId, signal)
+      : undefined;
+  }
+
+  private async recoverResponseContinuationNow(sessionId: string, failedTurnId: string, signal?: AbortSignal): Promise<string> {
+    return this.runSessionOperation(sessionId, async () => {
+      signal?.throwIfAborted();
+      const session = this.requireSession(sessionId);
+      if (session.responseFailureTurnId !== failedTurnId || session.activeTurnId || session.needsResume) {
+        throw new Error("模型续接恢复已失效，请发送消息继续。");
+      }
+      // Consume before starting: a timeout must not create a second continuation.
+      session.responseFailureTurnId = undefined;
+      const client = await this.client();
+      const metadata = await client.request<ThreadReadResponse>("thread/read", {
+        threadId: session.remoteSessionId, includeTurns: false,
+      }, SYNC_REQUEST_TIMEOUT_MS);
+      const latest = await this.readLatestThreadTurns(client, session.remoteSessionId, "summary");
+      signal?.throwIfAborted();
+      if (session.activeTurnId || session.needsResume || metadata.thread.id !== session.remoteSessionId || metadata.thread.status?.type === "active"
+        || latest.at(-1)?.id !== failedTurnId || latest.at(-1)?.status !== "failed") {
+        throw new Error("任务已发生变化，未自动恢复模型续接。请检查当前任务后继续。");
+      }
+      const turnId = await this.startTurnNow(sessionId, "", true);
+      if (signal?.aborted && session.activeTurnId === turnId) await this.cancelTurn(sessionId, turnId);
+      signal?.throwIfAborted();
+      return turnId;
+    });
+  }
+
+  private async startTurnNow(sessionId: string, prompt: RuntimePrompt, responseContinuation = false): Promise<string> {
     const session = this.requireSession(sessionId);
     const client = await this.client();
     await this.ensureSessionResumed(session, client);
     const start = async () => client.request<{ turn: { id: string } }>("turn/start", {
       threadId: session.remoteSessionId,
-      input: codexUserInput(prompt),
+      input: responseContinuation ? [] : codexUserInput(prompt),
       cwd: session.cwd,
       model: session.model,
       effort: session.reasoningEffort,
@@ -293,7 +331,7 @@ export class CodexRuntime implements AgentRuntime {
     try {
       response = await start();
     } catch (error) {
-      if (!isInvalidWorkingDirectoryError(error)) throw error;
+      if (responseContinuation || !isInvalidWorkingDirectoryError(error)) throw error;
       this.logger.warn(
         { error, sessionId: session.localSessionId, cwd: session.cwd },
         "App Server rejected the task working directory; refreshing the current thread before retrying.",
@@ -797,24 +835,37 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    await this.runSessionOperation(sessionId, async () => { this.requireSession(sessionId).model = model; });
+    await this.runSessionOperation(sessionId, async () => {
+      const session = this.requireSession(sessionId);
+      session.model = model;
+      session.responseFailureTurnId = undefined;
+    });
   }
 
   async setReasoningEffort(sessionId: string, effort: string): Promise<void> {
-    await this.runSessionOperation(sessionId, async () => { this.requireSession(sessionId).reasoningEffort = effort; });
+    await this.runSessionOperation(sessionId, async () => {
+      const session = this.requireSession(sessionId);
+      session.reasoningEffort = effort;
+      session.responseFailureTurnId = undefined;
+    });
   }
 
   async setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
-    await this.runSessionOperation(sessionId, async () => { this.requireSession(sessionId).permissionMode = mode; });
+    await this.runSessionOperation(sessionId, async () => {
+      const session = this.requireSession(sessionId);
+      session.permissionMode = mode;
+      session.responseFailureTurnId = undefined;
+    });
   }
 
   async setExecutionSettings(
     sessionId: string,
     settings: RuntimeExecutionSettings,
-    persist?: (session: RuntimeSession) => Promise<void>,
+    persist?: (session: RuntimeSession, replacement?: RuntimeSettingsReplacement) => Promise<void>,
   ): Promise<RuntimeSession> {
     return this.runSessionOperation(sessionId, async () => {
       try {
+        this.requireSession(sessionId).responseFailureTurnId = undefined;
         return await this.setExecutionSettingsNow(sessionId, settings, persist);
       } catch (error) {
         if (error instanceof ProviderSwitchError) throw error;
@@ -828,7 +879,7 @@ export class CodexRuntime implements AgentRuntime {
   private async setExecutionSettingsNow(
     sessionId: string,
     settings: RuntimeExecutionSettings,
-    persist?: (session: RuntimeSession) => Promise<void>,
+    persist?: (session: RuntimeSession, replacement?: RuntimeSettingsReplacement) => Promise<void>,
   ): Promise<RuntimeSession> {
     const session = this.requireSession(sessionId);
     if (session.activeTurnId) throw new Error(PROVIDER_SWITCH_BUSY);
@@ -836,19 +887,13 @@ export class CodexRuntime implements AgentRuntime {
     const metadata = await client.request<ThreadReadResponse>("thread/read", {
       threadId: session.remoteSessionId, includeTurns: false,
     }, SYNC_REQUEST_TIMEOUT_MS);
+    if (metadata.thread.id !== session.remoteSessionId) throw new Error("App Server 返回了不同的任务 ID，未切换 Provider。");
     const localActive = await this.localActivityDetector?.activeThreads([session.remoteSessionId]);
     if (metadata.thread.status?.type === "active" || localActive?.has(session.remoteSessionId) || session.activeTurnId) {
       throw new Error(PROVIDER_SWITCH_BUSY);
     }
-    if (session.turnCount === 0 && !metadata.thread.forkedFromId && !metadata.thread.preview?.trim()) {
-      try {
-        const turns = await this.readLatestThreadTurns(client, session.remoteSessionId, "summary");
-        if (turns.length === 0) throw new Error(PROVIDER_SWITCH_EMPTY);
-      } catch (error) {
-        if (!(error instanceof AppServerRequestError) || error.method !== "thread/turns/list"
-          || !/missing source rollout|no rollout found/iu.test(error.serverMessage)) throw error;
-        throw new Error(PROVIDER_SWITCH_EMPTY, { cause: error });
-      }
+    if (await this.isEmptySettingsSession(client, session, metadata.thread)) {
+      return this.replaceEmptySettingsSession(client, session, settings, persist);
     }
     const previous = { ...session };
     const restoreProvider = previous.modelProvider?.trim()
@@ -909,6 +954,72 @@ export class CodexRuntime implements AgentRuntime {
       );
     }
     return session;
+  }
+
+  private async isEmptySettingsSession(client: AppServerClient, session: CodexSession, thread: CodexThreadSnapshot): Promise<boolean> {
+    if (thread.id !== session.remoteSessionId || thread.preview !== "" || thread.forkedFromId
+      || (session.turnCount === undefined && thread.forkedFromId !== null)
+      || session.activeTurnId || (session.turnCount ?? 0) > 0 || session.knownTurnIds.size > 0
+      || session.terminalTurnIds.size > 0 || (thread.turns?.length ?? 0) > 0) return false;
+    try {
+      if ((await this.readLatestThreadTurns(client, session.remoteSessionId, "summary")).length > 0) return false;
+    } catch (error) {
+      if (!(error instanceof AppServerRequestError) || error.method !== "thread/turns/list"
+        || !/missing source rollout|no rollout found|not materialized yet/iu.test(error.serverMessage)) throw error;
+    }
+    if (!["idle", "notLoaded"].includes(thread.status?.type ?? "")) throw new Error(PROVIDER_SWITCH_EMPTY);
+    const { goal } = await client.request<{ goal: RuntimeGoal | null }>("thread/goal/get", {
+      threadId: session.remoteSessionId,
+    }, CONTROL_REQUEST_TIMEOUT_MS);
+    if (goal !== null) throw new Error(PROVIDER_SWITCH_EMPTY);
+    return true;
+  }
+
+  private async replaceEmptySettingsSession(
+    client: AppServerClient, session: CodexSession, settings: RuntimeExecutionSettings,
+    persist?: (session: RuntimeSession, replacement?: RuntimeSettingsReplacement) => Promise<void>,
+  ): Promise<RuntimeSession> {
+    const oldId = session.remoteSessionId;
+    let replacementId: string | undefined;
+    try {
+      // Keep the original attachment until target verification and persistence both succeed.
+      const response = await client.request<ThreadResponse>("thread/start", {
+        cwd: session.cwd, modelProvider: settings.modelProvider, model: settings.model, threadSource: "user",
+        ...threadLifecycleParams(session.cwd), ...permissionParams(settings.permissionMode),
+      }, SESSION_REQUEST_TIMEOUT_MS);
+      if (!response.thread.id || response.thread.id === oldId) throw new Error("App Server 未创建独立的空任务，未保存设置。");
+      replacementId = response.thread.id;
+      assertProviderSettingsApplied(response, settings);
+      if (session.title) await client.request("thread/name/set", { threadId: replacementId, name: session.title }, CONTROL_REQUEST_TIMEOUT_MS);
+      const { thread } = await client.request<ThreadReadResponse>("thread/read", { threadId: oldId, includeTurns: false }, SYNC_REQUEST_TIMEOUT_MS);
+      const active = await this.localActivityDetector?.activeThreads([oldId]);
+      if (active?.has(oldId) || !await this.isEmptySettingsSession(client, session, thread)) throw new Error(PROVIDER_SWITCH_BUSY);
+      if (this.attachedClient !== client) throw new Error("App Server 连接已变化，请重试 Provider 切换。");
+      const candidate = this.makeSession({
+        localSessionId: session.localSessionId, agentName: session.agentName, cwd: session.cwd, title: session.title, ...settings,
+      }, response, settings.reasoningEffort);
+      candidate.title = session.title;
+      await persist?.(candidate, { emptyRemoteSessionId: oldId });
+      Object.assign(session, candidate, {
+        needsResume: this.attachedClient !== client, settingsRecoveryError: undefined, remoteSummary: undefined,
+      });
+    } catch (error) {
+      if (replacementId) await this.releaseUnusedSettingsThread(client, replacementId);
+      throw new ProviderSwitchError(`Provider 切换失败：${providerSwitchFailure(error)} 原会话和设置已保留。`,
+        !session.needsResume && !session.settingsRecoveryError, { cause: error });
+    }
+    if (![...this.sessions.values()].some(other => other.remoteSessionId === oldId)) {
+      await this.releaseUnusedSettingsThread(client, oldId);
+    }
+    return session;
+  }
+
+  private async releaseUnusedSettingsThread(client: AppServerClient, threadId: string): Promise<void> {
+    try {
+      await client.request("thread/unsubscribe", { threadId }, CONTROL_REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      this.logger.warn({ error, threadId }, "Could not release an unused empty settings thread.");
+    }
   }
 
   private async detachThreadForSettings(client: AppServerClient, session: CodexSession, onDetach?: () => void): Promise<void> {
@@ -1426,6 +1537,9 @@ export class CodexRuntime implements AgentRuntime {
       session.activeTurnStartedAt = undefined;
       session.terminalTurnIds.add(mapped.turnId);
       session.messagePhases.clear();
+      session.responseFailureTurnId = mapped.status === "failed" && mapped.error
+        && this.provider.getAgentFamily?.() === "codex" && isResponseContinuationError(mapped.error)
+        ? mapped.turnId : undefined;
       if (mapped.status === "cancelled") {
         this.emit({ type: "turn_cancelled", sessionId, turnId: mapped.turnId });
       } else if (mapped.status === "failed") {
@@ -1604,6 +1718,7 @@ export class CodexRuntime implements AgentRuntime {
       if (session.turnCount !== undefined) session.turnCount += 1;
     }
     session.activeTurnId = turnId;
+    session.responseFailureTurnId = undefined;
     session.activeTurnStartedAt = startedAt;
     session.planContinuationTurnId = undefined;
     session.modeChangeRequestIds.clear();
@@ -1638,6 +1753,9 @@ export class CodexRuntime implements AgentRuntime {
     session.activeTurnStartedAt = undefined;
     session.terminalTurnIds.add(turn.id);
     session.messagePhases.clear();
+    const failure = formatCodexError(turn.error);
+    session.responseFailureTurnId = turn.status === "failed" && failure
+      && this.provider.getAgentFamily?.() === "codex" && isResponseContinuationError(failure) ? turn.id : undefined;
     if (turn.status === "interrupted") {
       this.emit({ type: "turn_cancelled", sessionId: session.localSessionId, turnId: turn.id });
       return;
@@ -1647,7 +1765,7 @@ export class CodexRuntime implements AgentRuntime {
         type: "turn_failed",
         sessionId: session.localSessionId,
         turnId: turn.id,
-        message: formatCodexError(turn.error) ?? "App Server turn failed.",
+        message: failure ?? "App Server turn failed.",
       });
       return;
     }
@@ -1710,7 +1828,7 @@ export class CodexRuntime implements AgentRuntime {
       workspaceSandboxPolicy: workspaceSandboxFromResponse(response.sandbox),
       rolloutPath: stringValue(response.thread.path)?.trim() || undefined,
       turnCount: "remoteSessionId" in input ? undefined : 0,
-      knownTurnIds: new Set(),
+      knownTurnIds: new Set("lastTurnId" in input && input.lastTurnId ? [input.lastTurnId] : []),
     };
   }
 
@@ -1782,6 +1900,7 @@ export class CodexRuntime implements AgentRuntime {
     for (const session of this.sessions.values()) {
       session.needsResume = true;
       session.planContinuationTurnId = undefined;
+      session.responseFailureTurnId = undefined;
       const turnId = session.activeTurnId;
       if (!turnId) continue;
       session.activeTurnId = undefined;
