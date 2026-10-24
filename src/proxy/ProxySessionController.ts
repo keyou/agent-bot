@@ -7176,6 +7176,7 @@ export class ProxySessionController {
   }
 
   private async createDirectoryFromCard(contextKey: string, action: CardAction): Promise<void> {
+    const updateMessageId = requiredCardMessageId(action.messageId);
     const directory = directoryActionPath(action.value.directory);
     await this.assertBrowsableDirectory(directory);
     const folderName = directoryFolderName(cardFormValue(action.value, "folderName"));
@@ -7189,9 +7190,9 @@ export class ProxySessionController {
       if (code === "EEXIST") throw new Error(`目录已存在：${newDirectory}`);
       throw new Error(`无法创建目录 ${newDirectory}：${runtimeErrorMessage(error)}`);
     }
-    await this.openDirectoryBrowser(contextKey, directory, {
-      updateMessageId: requiredCardMessageId(action.messageId),
-      page: directoryPageValue(action.value.page),
+    await this.openDirectoryBrowser(contextKey, newDirectory, {
+      updateMessageId,
+      page: 0,
     });
     await this.outbound.sendText(contextKey, `已创建目录：${newDirectory}`);
   }

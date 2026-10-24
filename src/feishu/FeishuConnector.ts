@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { WSClient as LarkWsClient, WSConnectionStatus } from "@larksuiteoapi/node-sdk";
 import type { AppConfig } from "../config/schema.js";
@@ -395,7 +396,7 @@ function toCardAction(data: unknown) {
   const openId = event.operator?.open_id ?? event.operator?.user_id;
   const chatId = event.context?.open_chat_id ?? event.chat_id;
   return {
-    actionId: getEventId(data) ?? event.action.action_id ?? event.action.name ?? `${Date.now()}`,
+    actionId: getEventId(data) ?? event.action.action_id ?? randomUUID(),
     contextKey: chatId ? `chat_id:${chatId}` : `open_id:${openId}`,
     userId: openId,
     ...(typeof event.context?.open_message_id === "string" ? { messageId: event.context.open_message_id } : {}),
@@ -415,8 +416,11 @@ function getCardActionValue(action: Record<string, unknown>): Record<string, unk
 }
 
 function getEventId(data: unknown): string | undefined {
-  const value = getNested<unknown>(data, ["header", "event_id"]) ?? getNested(data, ["data", "header", "event_id"]);
-  return typeof value === "string" ? value : undefined;
+  // The SDK flattens header fields into the event passed to handlers.
+  const value = getNested<unknown>(data, ["header", "event_id"])
+    ?? getNested(data, ["data", "header", "event_id"])
+    ?? getNested(data, ["event_id"]);
+  return typeof value === "string" && value ? value : undefined;
 }
 
 function getFeishuEvent(data: unknown): Record<string, any> | undefined {

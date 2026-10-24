@@ -2997,10 +2997,14 @@ describe("ProxySessionController", () => {
     expect(updatedSerialized).not.toContain("Parent");
   });
 
-  test("creates a named child directory from the browser card form", async () => {
+  test("creates a named child directory and enters it without changing the task directory", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-dir-new-folder-"));
     tempDirs.push(root);
-    const { controller, outbound } = fixture();
+    fs.writeFileSync(path.join(root, "parent-only.txt"), "parent");
+    const { controller, outbound, store } = fixture();
+    await controller.onMessage(message(`/new --dir "${root}"`));
+    const sessionId = store.getUserContext("chat_id:c1")?.currentSessionId;
+    store.claimInboundEvent("directory_new_folder_create", "card_action");
 
     await controller.onCardAction({
       actionId: "directory-new-folder-prompt",
@@ -3031,14 +3035,92 @@ describe("ProxySessionController", () => {
       },
     });
 
-    expect(fs.statSync(path.join(root, "new-child")).isDirectory()).toBe(true);
+    const newDirectory = path.join(root, "new-child");
+    expect(fs.statSync(newDirectory).isDirectory()).toBe(true);
     const browserCard = (outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
     expect(browserCard).toMatchObject({ header: { title: { content: "文件浏览" } } });
-    expect(JSON.stringify(browserCard)).toContain("new-child");
+    expect(outbound.updateInteractiveCard).toHaveBeenLastCalledWith("om_directory", browserCard);
+    expect(JSON.stringify(browserCard)).toContain("第 1/1 页");
+    expect(JSON.stringify(browserCard)).not.toContain("parent-only.txt");
+    expect(sessionOverflowActions(browserCard)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "directory_open", directory: root }),
+      expect.objectContaining({ action: "directory_new_folder_prompt", directory: newDirectory, page: "0" }),
+      expect.objectContaining({ action: "directory_new", directory: newDirectory }),
+      expect.objectContaining({ action: "directory_new_group", directory: newDirectory }),
+    ]));
+    expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe(sessionId);
+    expect(store.getSession(sessionId!)?.cwd).toBe(root);
     expect(outbound.sendText).toHaveBeenLastCalledWith(
       "chat_id:c1",
-      `已创建目录：${path.join(root, "new-child")}`,
+      `已创建目录：${newDirectory}`,
     );
+  });
+
+  test("creates successive folders in a topic and ignores a redelivered submission", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-dir-topic-folder-"));
+    tempDirs.push(root);
+    const { controller, outbound, store, runtime } = fixture();
+    const contextKey = "chat_id:c1:thread_id:omt_directory";
+    let directory = root;
+    for (const [index, folderName] of ["first", "second"].entries()) {
+      const action: CardAction = {
+        actionId: `directory-topic-submit-${index}`,
+        contextKey: "chat_id:c1",
+        messageId: "om_directory_topic",
+        value: {
+          action: "directory_new_folder_submit",
+          contextKey,
+          directory,
+          page: "2",
+          formValue: { folderName },
+        },
+      };
+      await controller.onCardAction(action);
+      const textCalls = (outbound.replyText as ReturnType<typeof vi.fn>).mock.calls.length;
+      await controller.onCardAction(action);
+      expect(outbound.replyText).toHaveBeenCalledTimes(textCalls);
+      directory = path.join(directory, folderName);
+      expect(fs.statSync(directory).isDirectory()).toBe(true);
+      const card = (outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
+      expect(sessionOverflowActions(card)).toContainEqual(expect.objectContaining({
+        action: "directory_new_folder_prompt", directory, page: "0", contextKey,
+      }));
+    }
+    expect(outbound.replyText).toHaveBeenLastCalledWith(
+      contextKey,
+      { messageId: "om_directory_topic", replyInThread: true },
+      `已创建目录：${directory}`,
+    );
+    expect(runtime.createSession).not.toHaveBeenCalled();
+    expect(store.getUserContext(contextKey)?.currentSessionId).toBeUndefined();
+  });
+
+  test("keeps the new-folder form when the name already exists or the card has no message ID", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-dir-existing-folder-"));
+    tempDirs.push(root);
+    fs.mkdirSync(path.join(root, "existing"));
+    const { controller, outbound } = fixture();
+    const value = {
+      action: "directory_new_folder_submit",
+      directory: root,
+      contextKey: "chat_id:c1",
+      page: "0",
+      formValue: { folderName: "existing" },
+    };
+    await controller.onCardAction({
+      actionId: "directory-existing-submit",
+      contextKey: "chat_id:c1",
+      messageId: "om_directory",
+      value,
+    });
+    expect(outbound.sendText).toHaveBeenLastCalledWith("chat_id:c1", expect.stringContaining("目录已存在"));
+    await controller.onCardAction({
+      actionId: "directory-missing-card-submit",
+      contextKey: "chat_id:c1",
+      value: { ...value, formValue: { folderName: "not-created" } },
+    });
+    expect(fs.existsSync(path.join(root, "not-created"))).toBe(false);
+    expect(outbound.updateInteractiveCard).not.toHaveBeenCalled();
   });
 
   test("rejects path traversal in a new-folder card submission", async () => {

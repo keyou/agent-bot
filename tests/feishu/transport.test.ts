@@ -1019,7 +1019,7 @@ test("dispatches direct Feishu SDK card action events", async () => {
   });
 });
 
-test("preserves submitted form values in Feishu card actions", async () => {
+test.each(["envelope", "sdk", "wrapped_envelope"])("preserves event IDs and form values in %s card actions", async (shape) => {
   const config = {
     feishu: {
       transport: "sdk",
@@ -1033,16 +1033,22 @@ test("preserves submitted form values in Feishu card actions", async () => {
   const connector = new FeishuConnector(config, handler, logger);
 
   await connector.start();
-  await larkSdkMock.handlers["card.action.trigger"]({
-    header: { event_id: "evt_form_1" },
+  const event = {
     action: {
       tag: "button",
+      name: "directory_new_folder_create",
       value: { action: "directory_new_folder_submit", directory: "D:\\work" },
       form_value: { folderName: "src-new" },
     },
     operator: { open_id: "ou_1" },
     context: { open_chat_id: "oc_1", open_message_id: "om_form_1" },
-  });
+  };
+  const data = shape === "envelope"
+    ? { header: { event_id: "evt_form_1" }, event }
+    : shape === "sdk"
+      ? { event_id: "evt_form_1", ...event }
+      : { data: { header: { event_id: "evt_form_1" }, event } };
+  await larkSdkMock.handlers["card.action.trigger"](data);
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   expect(handler.onCardAction).toHaveBeenCalledWith({
@@ -1056,6 +1062,36 @@ test("preserves submitted form values in Feishu card actions", async () => {
       formValue: { folderName: "src-new" },
     },
   });
+});
+
+test("preserves form event IDs for deduplication and generates unique IDs when absent", async () => {
+  const config = {
+    feishu: { appId: "cli_app", appSecret: "secret" },
+  } as AppConfig;
+  const handler = { onMessage: vi.fn(), onCardAction: vi.fn() };
+  const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+  const connector = new FeishuConnector(config, handler, logger);
+  await connector.start();
+  const event = {
+    action: {
+      tag: "button",
+      name: "directory_new_folder_create",
+      value: { action: "directory_new_folder_submit", directory: "D:\\work" },
+      form_value: { folderName: "src-new" },
+    },
+    operator: { open_id: "ou_1" },
+    context: { open_chat_id: "oc_1", open_message_id: "om_form_1" },
+  };
+
+  for (const eventId of ["evt_create_1", "evt_create_2", "evt_create_1", undefined, undefined]) {
+    await larkSdkMock.handlers["card.action.trigger"]({ ...event, event_id: eventId });
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const ids = handler.onCardAction.mock.calls.map(([action]) => action.actionId);
+  expect(ids.slice(0, 3)).toEqual(["evt_create_1", "evt_create_2", "evt_create_1"]);
+  expect(ids[3]).not.toBe("directory_new_folder_create");
+  expect(ids[4]).not.toBe(ids[3]);
 });
 
 test("silently ignores card actions from users other than the configured owner", async () => {
