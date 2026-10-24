@@ -110,6 +110,55 @@ function startClient(initial = initialState(), lazy = false, options: {
 }
 
 describe("Turn Preview incremental client", () => {
+  test.each(["update", "patch"] as const)("adds a disclosure only when a reasoning body arrives via %s", async (event) => {
+    const initial = initialState();
+    initial.reasoningItems = [{ itemId: "r1", summary: ["**Reading build log**"], content: [" "] }];
+    let current = initial;
+    const client = startClient(initial, true);
+    client.fetchDetail.mockImplementation(async (url) => {
+      const detail = renderTurnPreviewDetail(current, url.searchParams.get("detail")!, localFileUrl);
+      return { ok: Boolean(detail), status: detail ? 200 : 404, json: async () => detail };
+    });
+    const selector = '[data-activity-id="reasoning:r1"]';
+    const tool = client.element(".tool-step");
+    expect(client.element(selector).tagName).toBe("ARTICLE");
+    expect(client.element(selector).hasAttribute("data-detail-key")).toBe(false);
+    expect(client.document.querySelector(`${selector} summary`)).toBeNull();
+    expect(client.fetchDetail).not.toHaveBeenCalled();
+
+    const publish = (content: string[]) => {
+      current = { ...initial, reasoningItems: [{ ...initial.reasoningItems![0]!, content }] };
+      if (event === "update") client.update(current);
+      else client.listeners.get("patch")!({ data: JSON.stringify(renderTurnPreviewPatch(
+        current, new Set(["reasoning:r1"]), new Set(), localFileUrl, "zh",
+      )) });
+    };
+    publish(["The build finished successfully."]);
+    const details = client.element(selector);
+    expect(details.tagName).toBe("DETAILS");
+    expect(client.document.querySelectorAll(selector)).toHaveLength(1);
+    expect(client.fetchDetail).not.toHaveBeenCalled();
+    client.toggle(selector, true);
+    await client.settle();
+    expect(client.fetchDetail).toHaveBeenCalledTimes(1);
+    expect(client.element(`${selector} .reasoning-part`).textContent).toContain("The build finished successfully.");
+
+    publish(["The build finished successfully. All checks passed."]);
+    await client.settle();
+    expect(client.element(selector)).toBe(details);
+    expect(details.hasAttribute("open")).toBe(true);
+    expect(client.fetchDetail).toHaveBeenCalledTimes(2);
+    expect(client.element(`${selector} .reasoning-part`).textContent).toContain("All checks passed.");
+
+    publish([]);
+    await client.settle();
+    expect(client.element(selector).tagName).toBe("ARTICLE");
+    expect(client.element(`${selector} .reasoning-title`).textContent).toBe("💭 Reading build log");
+    expect(client.document.querySelector(`${selector} summary, ${selector} [data-detail-body]`)).toBeNull();
+    expect(client.fetchDetail).toHaveBeenCalledTimes(2);
+    expect(client.element(".tool-step")).toBe(tool);
+  });
+
   test.each(["update", "patch"] as const)("retains command approval expansion and scroll during live %s updates", (event) => {
     const initial = initialState();
     initial.status = "waiting_for_approval";

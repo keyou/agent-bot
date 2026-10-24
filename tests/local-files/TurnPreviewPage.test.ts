@@ -158,6 +158,7 @@ describe("Turn Preview", () => {
     ["__Reviewing tests__\nTest the changes.", "Reviewing tests", "Test the changes."],
     ["# Inspect `src/index.ts` &amp; **tests**\n\nKeep the body.", "Inspect src/index.ts & tests", "Keep the body."],
     ["**Title only**", "Title only", ""],
+    ["## Reading build log\n\n \t\r\n", "Reading build log", ""],
   ])("moves a leading title into the header without changing saved reasoning (%s)", (text, title, body) => {
     for (const field of ["summary", "content"] as const) {
       const input = state();
@@ -167,12 +168,20 @@ describe("Turn Preview", () => {
         const { document } = parseHTML(renderTurnPreviewSnapshot(input, undefined, "zh", { deferDetails }).content);
         expect(document.querySelector(".reasoning-header")?.textContent).toBe(`💭 ${title}`);
         expect(document.querySelector(".reasoning-header")?.getAttribute("title")).toBe(title);
-        const details = renderTurnPreviewDetail(input, "reasoning:r1")!;
-        const expanded = parseHTML(details.content).document;
-        expect(details.content).not.toContain(title);
+        const details = renderTurnPreviewDetail(input, "reasoning:r1");
+        if (!body) {
+          expect(document.querySelector("article.reasoning-step")).not.toBeNull();
+          expect(document.querySelector(".reasoning-step summary, details.reasoning-step, [data-detail-key]")).toBeNull();
+          expect(details).toBeUndefined();
+          continue;
+        }
+        expect(document.querySelector("details.reasoning-step")).not.toBeNull();
+        expect(details).toBeDefined();
+        const expanded = parseHTML(details!.content).document;
+        expect(details!.content).not.toContain(title);
         expect(expanded.querySelector(".reasoning-part")?.textContent?.trim() ?? "").toBe(body);
         if (!deferDetails) {
-          expect(document.querySelector(".reasoning-section")?.outerHTML ?? "").toBe(details.content);
+          expect(document.querySelector(".reasoning-section")?.outerHTML ?? "").toBe(details!.content);
         }
       }
       expect(input).toEqual(saved);

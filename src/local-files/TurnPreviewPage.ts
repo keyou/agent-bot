@@ -287,6 +287,10 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
   };
   const compatible = (current, next) => current.nodeType === next.nodeType && current.nodeName === next.nodeName;
   const patchNode = (current, next) => {
+    if (!compatible(current, next)) {
+      current.replaceWith(next.cloneNode(true));
+      return;
+    }
     // Summary snapshots never own a detail body that has already been fetched.
     if (current.nodeType === 1 && current.hasAttribute("data-detail-body") && next.hasAttribute("data-detail-body")) return;
     if (current.isEqualNode(next)) return;
@@ -797,8 +801,12 @@ function renderReasoningItem(
   deferDetails: boolean,
 ): string {
   const presentation = reasoningPresentation(item);
-  if (!presentation.title && !presentation.sections.some((section) => section.parts.length > 0)) return "";
+  const hasBody = presentation.sections.some((section) => section.parts.length > 0);
+  if (!presentation.title && !hasBody) return "";
   const title = presentation.title ?? previewLabels(language).reasoning;
+  if (!hasBody) {
+    return `<article class="reasoning-step" data-activity-id="reasoning:${escapeAttribute(item.itemId)}"><div class="reasoning-header" title="${escapeAttribute(title)}"><span class="reasoning-title">💭 ${escapeHtml(title)}</span></div></article>`;
+  }
   const lazy = deferDetails ? lazyDetailAttributes(`reasoning:${item.itemId}`, reasoningRevision(item, cwd)) : "";
   const body = deferDetails ? lazyDetailBody() : renderReasoningBody(item, cwd, localFileUrl, language, presentation);
   return `<details class="reasoning-step" data-activity-id="reasoning:${escapeAttribute(item.itemId)}"${lazy}><summary class="reasoning-header" title="${escapeAttribute(title)}"><span class="reasoning-title">💭 ${escapeHtml(title)}</span></summary>${body}</details>`;
@@ -1168,9 +1176,11 @@ export function renderTurnPreviewDetail(
   }
   if (key.startsWith("reasoning:")) {
     const item = turnReasoningItems(state).find((item) => `reasoning:${item.itemId}` === key);
-    if (!item || ![...item.summary, ...item.content].some((text) => text?.trim())) return undefined;
+    if (!item) return undefined;
+    const presentation = reasoningPresentation(item);
+    if (!presentation.sections.some((section) => section.parts.length > 0)) return undefined;
     return { key, revision: reasoningRevision(item, state.projectCwd),
-      content: renderReasoningBody(item, state.projectCwd, localFileUrl, language) };
+      content: renderReasoningBody(item, state.projectCwd, localFileUrl, language, presentation) };
   }
   const activity = state.activities?.find((item) => item.kind === "tool" && `tool:${item.id}` === key);
   if (activity?.kind !== "tool") return undefined;
@@ -1339,7 +1349,7 @@ main { max-width: 1320px; margin: 0 auto; padding: 0 20px 40px; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
 .reasoning-step { margin:8px 0; border:1px solid var(--line); border-radius:7px; min-width:0; }
-.reasoning-header { cursor:pointer; padding:8px 10px; color:var(--muted); }
+.reasoning-header { display:flex; align-items:center; gap:8px; min-height:32px; padding:8px 10px; color:var(--muted); }
 .reasoning-title { min-width:0; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .reasoning-section { margin:0 10px 10px; max-height:30em; overflow:auto; overflow-wrap:anywhere; }
 .reasoning-part + .reasoning-part { border-top:1px solid var(--line); padding-top:8px; }

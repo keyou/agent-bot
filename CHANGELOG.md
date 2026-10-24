@@ -6,6 +6,22 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 中文
+
+- 修复 Turn Preview 只有思考标题、没有正文时仍显示空折叠箭头的问题；后续收到正文才启用展开，保留实时局部更新及飞书思考卡片行为。
+- 修复飞书 SDK 展平事件 ID 后，新建目录按钮因固定名称被误去重而失效的问题；创建成功后原文件浏览卡片进入新目录，不改变任务工作目录。
+- 允许无轮次、分支历史或 Goal 的空会话切换 Provider：验证目标设置后更换底层线程，保留本地任务和群绑定，失败保留原会话。
+- Codex 遇到特定的 Responses 续接状态失效时，在原任务中自动尝试一次空输入续接，保留历史和已完成的工具结果，不重发 Prompt/图片；尊重取消、Reset、设置变化和任务接管。
+- 修复思考卡片及 Preview 重复显示同一运行警告与最终错误，实时更新移除重复项；提取结构化错误的可读信息并保留原始诊断记录。
+
+### English
+
+- Render title-only reasoning in Turn Preview without an empty disclosure or detail request; enable expansion when a body arrives, preserving live incremental updates and Feishu thinking cards.
+- Fix folder creation being silently deduplicated by the button's fixed name after the Feishu SDK flattens event IDs; open the created directory in the same browser card without changing the task's working directory.
+- Allow verified empty tasks without Turns, inherited history, or a Goal to switch Providers through a new remote thread, preserving local task/chat bindings and retaining the original on failure.
+- Recover a specific Codex Responses continuation-state rejection once with empty input on the same task, preserving history and completed tool outputs without replaying the Prompt/images; honor cancellation, Reset, settings changes, and newer work.
+- Deduplicate matching runtime warnings and final errors in thinking cards and Preview, including live updates; display readable structured error details while retaining original diagnostic records.
+
 ## [0.1.24-alpha.8] - 2026-10-19
 
 ### 中文
