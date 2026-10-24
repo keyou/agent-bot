@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-10-24
+
 ### 中文
 
 - 修复 Turn Preview 只有思考标题、没有正文时仍显示空折叠箭头的问题；后续收到正文才启用展开，保留实时局部更新及飞书思考卡片行为。
