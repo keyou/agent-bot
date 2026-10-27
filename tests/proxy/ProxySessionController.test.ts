@@ -668,6 +668,75 @@ function fixture(
   };
 }
 
+describe("delayed inbound message diagnostics", () => {
+  test.each([
+    { deliveryDelayMs: 59_999, dispatchDelayMs: 0, warnings: 0 },
+    { deliveryDelayMs: 60_000, dispatchDelayMs: 0, warnings: 1 },
+    { deliveryDelayMs: 65 * 60_000, dispatchDelayMs: 0, warnings: 1 },
+    { deliveryDelayMs: 0, dispatchDelayMs: 60_000, warnings: 1 },
+    { deliveryDelayMs: 30_000, dispatchDelayMs: 30_000, warnings: 1 },
+  ])("logs $warnings warning for $deliveryDelayMs ms before callback and $dispatchDelayMs ms dispatch", async ({
+    deliveryDelayMs, dispatchDelayMs, warnings,
+  }) => {
+    const { controller, runtime, store, logger } = fixture();
+    const acceptedAt = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(acceptedAt);
+    const incoming: IncomingMessage = {
+      ...message("private instruction"),
+      messageId: "m-delay",
+      eventId: "evt-delay",
+      receivedAt: acceptedAt - dispatchDelayMs,
+      createdAt: acceptedAt - dispatchDelayMs - deliveryDelayMs,
+    };
+    const audit = vi.spyOn(store, "audit");
+
+    await controller.onMessage(incoming);
+    await controller.onMessage(incoming);
+
+    expect(runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledTimes(warnings);
+    if (warnings) {
+      expect(logger.warn).toHaveBeenCalledWith({
+        messageId: "m-delay",
+        eventId: "evt-delay",
+        contextKey: incoming.contextKey,
+        messageCreatedAt: incoming.createdAt,
+        receivedAt: incoming.receivedAt,
+        acceptedAt,
+        deliveryDelayMs,
+        dispatchDelayMs,
+      }, "Accepted a delayed Feishu message.");
+      expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(incoming.text);
+    }
+    const incomingAudits = audit.mock.calls.filter(([, type]) => type === "incoming_message");
+    expect(incomingAudits).toEqual([[incoming.contextKey, "incoming_message", {
+      messageId: incoming.messageId,
+      eventId: incoming.eventId,
+      messageCreatedAt: incoming.createdAt,
+      receivedAt: incoming.receivedAt,
+      text: incoming.text,
+    }]]);
+  });
+
+  test("does not warn for missing timestamps or future message clocks", async () => {
+    const { controller, logger } = fixture();
+    await controller.onMessage(message("no timestamp"));
+    await controller.onMessage({ ...message("future clock"), createdAt: Date.now() + 120_000, receivedAt: Date.now() });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test("does not warn for old messages rejected by the mention filter", async () => {
+    const { controller, store, runtime, logger } = fixture();
+    store.recordChatContext("chat_id:c1", "group");
+    store.setChatRequiresMention("chat_id:c1", true);
+    await controller.onMessage({
+      ...message("unmentioned"), chatType: "group", createdAt: Date.now() - 120_000, receivedAt: Date.now(),
+    });
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+  });
+});
+
 function recoveryFixture(status: "active" | "not_loaded" = "active") {
   const value = fixture();
   const { store, remoteSessions } = value;

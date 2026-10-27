@@ -192,6 +192,7 @@ const MESSAGE_RECEIVED_REACTION = "OnIt";
 const MESSAGE_COMPLETED_REACTION = "DONE";
 const MESSAGE_FAILED_REACTION = "ERROR";
 const MESSAGE_CANCELLED_REACTION = "CrossMark";
+const INBOUND_MESSAGE_DELAY_WARNING_MS = 60_000;
 const SESSION_PAGE_SIZE = 10;
 const SESSION_PROMPT_PREVIEW_LENGTH = 50;
 const DIRECTORY_PAGE_SIZE = 15;
@@ -647,6 +648,26 @@ export class ProxySessionController {
     // For accepted messages, claim durable deduplication before acknowledgement so event
     // retries cannot add duplicate reactions.
     if (!this.store.claimInboundEvent(message.messageId, "message")) return;
+    const acceptedAt = Date.now();
+    const receivedAt = message.receivedAt ?? acceptedAt;
+    const deliveryDelayMs = message.createdAt === undefined
+      ? 0 : Math.max(0, receivedAt - message.createdAt);
+    const dispatchDelayMs = Math.max(0, acceptedAt - receivedAt);
+    if (deliveryDelayMs + dispatchDelayMs >= INBOUND_MESSAGE_DELAY_WARNING_MS) {
+      this.logger.warn(
+        {
+          messageId: message.messageId,
+          eventId: message.eventId,
+          contextKey: message.contextKey,
+          messageCreatedAt: message.createdAt,
+          receivedAt,
+          acceptedAt,
+          deliveryDelayMs,
+          dispatchDelayMs,
+        },
+        "Accepted a delayed Feishu message.",
+      );
+    }
     const attachmentReservation = message.mergedForwardMessageId
       ? undefined
       : this.reserveForwardAttachment(message);
@@ -827,6 +848,9 @@ export class ProxySessionController {
     const fileCount = fileReferences.length;
     this.store.audit(message.contextKey, "incoming_message", {
       messageId: message.messageId,
+      eventId: message.eventId,
+      messageCreatedAt: message.createdAt,
+      receivedAt: message.receivedAt,
       text: message.text,
       ...(imageCount > 0 ? { imageCount } : {}),
       ...(fileCount > 0 ? { fileCount } : {}),

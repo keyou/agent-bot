@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Add minimal delayed-Feishu-message diagnostics: retain source timestamps and event IDs in existing audits, with one content-free warning only for newly accepted messages delayed by at least one minute. Message handling remains unchanged.
+
 ## [0.1.24] - 2026-10-24
 
 ### 中文

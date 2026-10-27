@@ -188,7 +188,7 @@ test("fails startup and closes the client when the initial connection reaches a 
   );
 });
 
-test("dispatches direct Feishu SDK message events", async () => {
+test.each(["sdk", "raw", "wrapped"])("dispatches %s message events with source timing and event ID", async (shape) => {
   const config = {
     feishu: {
       transport: "sdk",
@@ -202,7 +202,7 @@ test("dispatches direct Feishu SDK message events", async () => {
   const connector = new FeishuConnector(config, handler, logger);
 
   await connector.start();
-  await larkSdkMock.handlers["im.message.receive_v1"]({
+  const event = {
     message: {
       message_id: "om_1",
       create_time: "1790067600123",
@@ -215,18 +215,30 @@ test("dispatches direct Feishu SDK message events", async () => {
         open_id: "ou_1",
       },
     },
-  });
+  };
+  const data = shape === "sdk"
+    ? { event_id: "evt_message_1", ...event }
+    : shape === "raw"
+      ? { header: { event_id: "evt_message_1" }, event }
+      : { data: { header: { event_id: "evt_message_1" }, event } };
+  const beforeDispatch = Date.now();
+  await larkSdkMock.handlers["im.message.receive_v1"](data);
 
   expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_1",
     messageType: "text",
     createdAt: 1790067600123,
+    receivedAt: expect.any(Number),
+    eventId: "evt_message_1",
     contextKey: "chat_id:oc_1",
     chatId: "oc_1",
     chatType: "p2p",
     userId: "ou_1",
     text: "/help",
   });
+  expect(handler.onMessage.mock.calls[0]![0].receivedAt).toBeGreaterThanOrEqual(beforeDispatch);
+  expect(handler.onMessage.mock.calls[0]![0].receivedAt).toBeLessThanOrEqual(Date.now());
+  expect(logger.warn).not.toHaveBeenCalled();
 });
 
 test("ignores non-owner messages before dispatch and accepts the configured owner", async () => {
@@ -385,6 +397,7 @@ test("dispatches an image message with its Feishu image key", async () => {
   await vi.waitFor(() => expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_image",
     messageType: "image",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_image",
     chatId: "oc_image",
     chatType: "group",
@@ -422,6 +435,7 @@ test("dispatches a file message with its Feishu file key and name", async () => 
   await vi.waitFor(() => expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_file",
     messageType: "file",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_file",
     chatId: "oc_file",
     chatType: "p2p",
@@ -459,6 +473,7 @@ test("dispatches a merged-forward message for deferred content retrieval", async
   await vi.waitFor(() => expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_merged",
     messageType: "merge_forward",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_private",
     chatId: "oc_private",
     chatType: "p2p",
@@ -505,6 +520,7 @@ test("extracts text and de-duplicated images from a rich-text message", async ()
   await vi.waitFor(() => expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_post",
     messageType: "post",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_post",
     chatId: "oc_post",
     chatType: "p2p",
@@ -544,6 +560,7 @@ test("preserves markdown elements in rich-text messages", async () => {
   await vi.waitFor(() => expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_post_md",
     messageType: "post",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_post_md",
     chatId: "oc_post_md",
     chatType: "p2p",
@@ -585,6 +602,7 @@ test("extracts images from the top-level rich-text shape used by received Feishu
   await vi.waitFor(() => expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_real_post",
     messageType: "post",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_real_post",
     chatId: "oc_real_post",
     chatType: "p2p",
@@ -668,6 +686,7 @@ test("dispatches group-thread mentions with an isolated task context and thread 
   expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_topic_1",
     messageType: "text",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_topic_1:thread_id:omt_topic_1",
     chatId: "oc_topic_1",
     chatType: "group",
@@ -709,6 +728,7 @@ test("dispatches group-main mentions without creating a thread reply", async () 
   expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_group_main",
     messageType: "text",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_group",
     chatId: "oc_group",
     chatType: "group",
@@ -966,6 +986,7 @@ test("dispatches private-chat thread messages with an isolated task context", as
   expect(handler.onMessage).toHaveBeenCalledWith({
     messageId: "om_private_reply",
     messageType: "text",
+    receivedAt: expect.any(Number),
     contextKey: "chat_id:oc_private:thread_id:omt_private_topic",
     chatId: "oc_private",
     chatType: "p2p",

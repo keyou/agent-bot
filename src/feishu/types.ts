@@ -9,6 +9,9 @@ export interface IncomingMessage {
   messageId: string;
   messageType?: string;
   createdAt?: number;
+  /** SDK callback time, not WebSocket frame arrival time. */
+  receivedAt?: number;
+  eventId?: string;
   contextKey: string;
   chatId?: string;
   chatType?: "p2p" | "group";

@@ -63,6 +63,7 @@ export class FeishuConnector {
     const lark = await import("@larksuiteoapi/node-sdk");
     const eventDispatcher = new lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (data: unknown) => {
+        const receivedAt = Date.now();
         const senderOpenId = getFeishuEvent(data)?.sender?.sender_id?.open_id;
         if (!allowsFeishuUser(this.config, senderOpenId)) {
           this.logger.debug(
@@ -76,6 +77,8 @@ export class FeishuConnector {
           this.logger.debug({ data }, "Ignored unsupported Feishu message event.");
           return;
         }
+        message.receivedAt = receivedAt;
+        message.eventId = getEventId(data);
 
         void Promise.resolve()
           .then(() => this.handler.onMessage(message))
