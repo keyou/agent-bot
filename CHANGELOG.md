@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.25-alpha.0] - 2026-10-30
+
 - 修复合并转发聊天记录中的图片、文件下载失败：改用外层消息 ID 读取资源，同时覆盖直接转发和引用聊天记录，保留用户正文为主 Prompt。
 - Fix image and file downloads in merged-forward chat records by using the container message ID, including quoted records, while keeping the user's instruction as the main Prompt.
 
