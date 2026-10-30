@@ -13,6 +13,7 @@ import type { AppConfig } from "../../src/config/schema.js";
 import { generateGroupAvatarPng, resolveGroupAvatarProjectName } from "../../src/feishu/GroupAvatarGenerator.js";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
 import { FeishuTurnPresenter } from "../../src/feishu/FeishuTurnPresenter.js";
+import { renderMergedForwardPrompt, renderReferencedMessage } from "../../src/feishu/MergedForwardMessage.js";
 import type { CardAction, FeishuOutbound, IncomingMessage } from "../../src/feishu/types.js";
 import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
@@ -292,6 +293,7 @@ function fixture(
     inspect: vi.fn(async () => []),
     close: vi.fn(async () => undefined),
   },
+  referenceInstructionWindowMs = 0,
 ) {
   const sessions = new Map<string, RuntimeSession>();
   const remoteSessions: RemoteSessionSummary[] = [];
@@ -632,6 +634,7 @@ function fixture(
     windowsDriveLister,
     shellCommandJobs,
     threadWriterProcesses,
+    referenceInstructionWindowMs,
   );
   cleanups.push(() => {
     controller.close();
@@ -3574,7 +3577,7 @@ describe("ProxySessionController", () => {
   });
 
   test("combines a merged-forward message and its attached instruction into one Agent turn", async () => {
-    const { controller, runtime, outbound, presenter, store } = fixture();
+    const { controller, runtime, outbound, presenter, store } = fixture({}, undefined, 1_500);
     vi.mocked(outbound.addReaction!).mockImplementation(async (messageId) => `reaction-${messageId}`);
 
     const mergedProcessing = controller.onMessage({
@@ -3630,8 +3633,8 @@ describe("ProxySessionController", () => {
       messageCount: 2,
       truncated: false,
       images: [
-        { messageId: "om_child_image", imageKey: "img_direct" },
-        { messageId: "om_child_post", imageKey: "img_post" },
+        { messageId: "om_merged_images", imageKey: "img_direct" },
+        { messageId: "om_merged_images", imageKey: "img_post" },
       ],
       files: [],
     });
@@ -3645,8 +3648,8 @@ describe("ProxySessionController", () => {
       mergedForwardMessageId: "om_merged_images",
     });
 
-    expect(outbound.downloadImage).toHaveBeenNthCalledWith(1, "om_child_image", "img_direct");
-    expect(outbound.downloadImage).toHaveBeenNthCalledWith(2, "om_child_post", "img_post");
+    expect(outbound.downloadImage).toHaveBeenNthCalledWith(1, "om_merged_images", "img_direct");
+    expect(outbound.downloadImage).toHaveBeenNthCalledWith(2, "om_merged_images", "img_post");
     expect(runtime.startTurn).toHaveBeenCalledWith(
       expect.any(String),
       {
@@ -3666,7 +3669,7 @@ describe("ProxySessionController", () => {
       messageCount: 1,
       truncated: false,
       images: [],
-      files: [{ messageId: "om_child_file", fileKey: "file_error", fileName: "error.log" }],
+      files: [{ messageId: "om_merged_file", fileKey: "file_error", fileName: "error.log" }],
     });
 
     await controller.onMessage({
@@ -3678,11 +3681,51 @@ describe("ProxySessionController", () => {
       mergedForwardMessageId: "om_merged_file",
     });
 
-    expect(outbound.downloadFile).toHaveBeenCalledWith("om_child_file", "file_error", "error.log");
+    expect(outbound.downloadFile).toHaveBeenCalledWith("om_merged_file", "file_error", "error.log");
     expect(runtime.startTurn).toHaveBeenCalledWith(
       expect.any(String),
       `请参考以下内容回复用户\n\n参考聊天记录：\n[消息 1 · 成员 1]\n[文件 1：error.log]\n\n参考文件（已下载到本地）：\n[文件 1：error.log] ${path.join(process.cwd(), "error.log")}`,
     );
+  });
+
+  test.each([false, true])("keeps the instruction primary with merged-forward images and files (pending source: %s)", async (pendingSource) => {
+    const { controller, runtime, outbound, presenter } = fixture({}, undefined, 1_500);
+    const items = [
+      { message_id: "om_bundle", msg_type: "merge_forward" },
+      {
+        message_id: "om_child_image", upper_message_id: "om_bundle", msg_type: "image",
+        body: { content: JSON.stringify({ image_key: "img_background" }) },
+      },
+      {
+        message_id: "om_child_file", upper_message_id: "om_bundle", msg_type: "file",
+        body: { content: JSON.stringify({ file_key: "file_background", file_name: "research.md" }) },
+      },
+    ];
+    vi.mocked(outbound.readMergedForward!).mockResolvedValueOnce(renderMergedForwardPrompt("om_bundle", items));
+    vi.mocked(outbound.readReferencedMessage!).mockResolvedValueOnce(renderReferencedMessage("om_bundle", items));
+    const source = pendingSource ? controller.onMessage({
+      messageId: "om_bundle", contextKey: "chat_id:c1", text: "", mergedForwardMessageId: "om_bundle",
+    }) : undefined;
+    if (source) await vi.waitFor(() => expect(outbound.readMergedForward).toHaveBeenCalledWith("om_bundle"));
+    const instruction = "熟悉一下当前项目以及这个任务的背景";
+    await controller.onMessage({
+      messageId: "om_instruction", contextKey: "chat_id:c1", parentMessageId: "om_bundle", text: instruction,
+    });
+    await source;
+
+    expect(outbound.downloadImage).toHaveBeenCalledExactlyOnceWith("om_bundle", "img_background");
+    expect(outbound.downloadFile).toHaveBeenCalledExactlyOnceWith("om_bundle", "file_background", "research.md");
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(expect.any(String), {
+      text: expect.stringMatching(new RegExp(`^${instruction}`)),
+      localImagePaths: [path.join(process.cwd(), "img_background.png")],
+    });
+    const prompt = vi.mocked(runtime.startTurn).mock.calls[0]?.[1];
+    expect(prompt).toMatchObject({ text: expect.stringContaining("[图片 1]") });
+    expect(prompt).toMatchObject({ text: expect.stringContaining(`[文件 1：research.md] ${path.join(process.cwd(), "research.md")}`) });
+    expect(presenter.startPendingTurn).toHaveBeenLastCalledWith(
+      expect.any(String), "chat_id:c1", instruction, undefined, instruction, [path.join(process.cwd(), "img_background.png")],
+    );
+    expect(vi.mocked(presenter.startPendingTurn).mock.calls.every((call) => call[2] === instruction)).toBe(true);
   });
 
   test("reports a merged-forward read failure without starting an Agent turn", async () => {
@@ -4141,7 +4184,7 @@ describe("ProxySessionController", () => {
   });
 
   test("combines a forwarded image and its attached instruction into one Agent turn", async () => {
-    const { controller, runtime, outbound, presenter, store } = fixture();
+    const { controller, runtime, outbound, presenter, store } = fixture({}, undefined, 1_500);
     vi.mocked(outbound.addReaction!).mockImplementation(async (messageId) => `reaction-${messageId}`);
 
     const imageProcessing = controller.onMessage({
@@ -4185,8 +4228,24 @@ describe("ProxySessionController", () => {
     expect(store.getMessageReaction("om_image_instruction")).toMatchObject({ turnId: "turn_1" });
   });
 
-  test.each([false, true])("uses the attached instruction as the main Prompt for a rich-text forward (images: %s)", async (withImages) => {
+  test.each(["text", "post", "interactive", "custom", undefined])("uses the explicit reply as the main Prompt for any source type: %s", async (messageType) => {
     const { controller, runtime, outbound, presenter, store } = fixture();
+    const source = { ...message("reference material"), messageId: "reference", messageType, userId: "ou_owner" };
+    const instruction = "review the skill changes";
+    const first = controller.onMessage(source);
+    const second = controller.onMessage({ ...message(instruction), messageId: "instruction",
+      parentMessageId: source.messageId, userId: source.userId });
+    await Promise.all([first, second]);
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(expect.any(String), `${instruction}\n\n引用消息：\n${source.text}`);
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
+    expect(outbound.readReferencedMessage).not.toHaveBeenCalled();
+    expect(presenter.startPendingTurn).toHaveBeenCalledWith(expect.any(String), source.contextKey, instruction, undefined, instruction);
+    expect(store.findTurnAnchorByMessageId(source.messageId)?.turnId).toBe("turn_1");
+    expect(store.findTurnAnchorByMessageId("instruction")?.turnId).toBe("turn_1");
+  });
+
+  test.each([false, true])("uses the attached instruction as the main Prompt for a rich-text forward (images: %s)", async (withImages) => {
+    const { controller, runtime, outbound, presenter, store } = fixture({}, undefined, 1_500);
     vi.mocked(outbound.addReaction!).mockImplementation(async (id) => "reaction-" + id);
     const sourceText = "反馈内容: https://example.com/issue\n日志 ID: test-log";
     const instruction = "排查下这个问题，为什么点击没有进入详情页";
@@ -4336,20 +4395,45 @@ describe("ProxySessionController", () => {
     expect(store.findTurnAnchorByMessageId("om_source_guard")).toBeDefined();
   });
 
-  test("keeps a plain-text prompt immediate and does not wait on a rich-text command or quote", async () => {
-    const { controller, runtime, outbound } = fixture();
+  test("waits for references on ordinary text but keeps commands and existing quotes outside the wait", async () => {
+    const { controller, runtime, outbound } = fixture({}, undefined, 20);
     const delay = vi.spyOn(globalThis, "setTimeout");
     await controller.onMessage({ ...message("hello"), messageType: "text" });
+    expect(delay.mock.calls.filter((call) => call[1] === 20)).toHaveLength(1);
     await controller.onMessage({ ...message("/help"), messageType: "post" });
     await controller.onMessage({ ...message("question"), messageType: "post", parentMessageId: "om_quote" });
     expect(runtime.startTurn).toHaveBeenCalledOnce();
     expect(runtime.steerTurn).toHaveBeenCalledOnce();
     expect(outbound.readReferencedMessage).toHaveBeenCalledWith("om_quote");
-    expect(delay.mock.calls.some((call) => call[1] === 1_500)).toBe(false);
+    expect(delay.mock.calls.filter((call) => call[1] === 20)).toHaveLength(1);
+  });
+
+  test.each([false, true])("does not submit buffered messages when the controller closes (pending instruction: %s)", async (withInstruction) => {
+    const { controller, runtime, outbound } = fixture({}, undefined, 1_500);
+    const processing = controller.onMessage(message("pending reference"));
+    await vi.waitFor(() => expect(outbound.addReaction).toHaveBeenCalled());
+    let acknowledge!: () => void;
+    const reaction = new Promise<string>((resolve) => { acknowledge = () => resolve("received"); });
+    vi.mocked(outbound.addReaction!).mockReturnValueOnce(reaction);
+    const instruction = withInstruction ? controller.onMessage({ ...message("pending instruction"), parentMessageId: "m-pending reference" }) : undefined;
+    controller.close();
+    acknowledge();
+    await Promise.all([processing, instruction]);
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
+  });
+
+  test("normalizes the explicit parent ID consistently when reserving and completing a pair", async () => {
+    const { controller, runtime } = fixture();
+    const source = controller.onMessage({ ...message("reference text"), messageId: "reference-id" });
+    const instruction = controller.onMessage({ ...message("main instruction"), parentMessageId: " reference-id " });
+    await Promise.all([source, instruction]);
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "main instruction\n\n引用消息：\nreference text");
+    expect(runtime.steerTurn).not.toHaveBeenCalled();
   });
 
   test("combines a forwarded file and its attached instruction into one Agent turn", async () => {
-    const { controller, runtime, outbound, presenter, store } = fixture();
+    const { controller, runtime, outbound, presenter, store } = fixture({}, undefined, 1_500);
     vi.mocked(outbound.addReaction!).mockImplementation(async (messageId) => `reaction-${messageId}`);
 
     const fileProcessing = controller.onMessage({
@@ -4430,6 +4514,17 @@ describe("ProxySessionController", () => {
       expect.any(String),
       "你这样说的原因是什么？\n\n引用消息：\n[消息类型：文本]\n这是被引用的消息",
     );
+  });
+
+  test.each(["text", "post", "interactive", "merge_forward", "custom"])("keeps the current body primary when quoting an older %s message", async (messageType) => {
+    const { controller, runtime, outbound, presenter } = fixture({}, undefined, 1_500);
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    const reference = `Original ${messageType} content\n\nkeep its formatting`;
+    vi.mocked(outbound.readReferencedMessage!).mockResolvedValueOnce({ text: reference, messageType, images: [], files: [] });
+    await controller.onMessage({ ...message("review this reference"), parentMessageId: "older-message" });
+    expect(runtime.startTurn).toHaveBeenCalledExactlyOnceWith(expect.any(String), `review this reference\n\n引用消息：\n${reference}`);
+    expect(presenter.startPendingTurn).toHaveBeenCalledWith(expect.any(String), "chat_id:c1", "review this reference", undefined, "review this reference");
+    expect(timer.mock.calls.some((call) => call[1] === 1_500)).toBe(false);
   });
 
   test("downloads a referenced image and passes it with the combined Prompt", async () => {

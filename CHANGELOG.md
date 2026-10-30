@@ -6,6 +6,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- 修复合并转发聊天记录中的图片、文件下载失败：改用外层消息 ID 读取资源，同时覆盖直接转发和引用聊天记录，保留用户正文为主 Prompt。
+- Fix image and file downloads in merged-forward chat records by using the container message ID, including quoted records, while keeping the user's instruction as the main Prompt.
+
+- 统一引用消息处理：不再按类型筛选待合并消息，普通文字和纯链接也可与同一用户、同一会话的显式引用附言合并；以当前正文作为主 Prompt 和卡片标题，保留引用资源、Reaction 和旧消息引用行为。
+- Unify quoted-message pairing across message types, including plain text and URLs: use the explicitly linked current instruction as the Prompt/card title, preserving reference resources, reactions, and older-quote behavior.
+
 - Add minimal delayed-Feishu-message diagnostics: retain source timestamps and event IDs in existing audits, with one content-free warning only for newly accepted messages delayed by at least one minute. Message handling remains unchanged.
 
 ## [0.1.24] - 2026-10-24

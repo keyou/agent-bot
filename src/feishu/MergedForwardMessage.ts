@@ -105,6 +105,7 @@ export function renderMergedForwardPrompt(
 
   const senderLabels = new Map<string, string>();
   const imageNumbers = new Map<string, number>();
+  const fileNumbers = new Map<string, number>();
   const images: MergedForwardImageReference[] = [];
   const files: MergedForwardFileReference[] = [];
   let userIndex = 0;
@@ -126,22 +127,24 @@ export function renderMergedForwardPrompt(
     const time = formatMessageTime(item.create_time);
     const heading = [`消息 ${index + 1}`, senderLabel, time].filter(Boolean).join(" · ");
     return `[${heading}]\n${renderMessageContent(item, (imageKey) => {
-      const messageId = item.message_id?.trim();
-      if (!messageId || !imageKey) return "[图片]";
-      const referenceKey = `${messageId}:${imageKey}`;
-      let imageNumber = imageNumbers.get(referenceKey);
+      if (!imageKey) return "[图片]";
+      let imageNumber = imageNumbers.get(imageKey);
       if (!imageNumber) {
         imageNumber = images.length + 1;
-        imageNumbers.set(referenceKey, imageNumber);
-        images.push({ messageId, imageKey });
+        imageNumbers.set(imageKey, imageNumber);
+        // Forwarded resources belong to the container, not the listed child IDs.
+        images.push({ messageId: parentMessageId, imageKey });
       }
       return `[图片 ${imageNumber}]`;
     }, (fileKey, fileName) => {
-      const messageId = item.message_id?.trim();
-      if (!messageId || !fileKey) return namedPlaceholder("文件", fileName);
-      const fileNumber = files.length + 1;
-      files.push({ messageId, fileKey, fileName: fileName || `file-${fileNumber}` });
-      return `[文件 ${fileNumber}：${fileName || `file-${fileNumber}`}]`;
+      if (!fileKey) return namedPlaceholder("文件", fileName);
+      let fileNumber = fileNumbers.get(fileKey);
+      if (!fileNumber) {
+        fileNumber = files.length + 1;
+        fileNumbers.set(fileKey, fileNumber);
+        files.push({ messageId: parentMessageId, fileKey, fileName: fileName || `file-${fileNumber}` });
+      }
+      return `[文件 ${fileNumber}：${files[fileNumber - 1]!.fileName}]`;
     })}`;
   });
   const prompt = [

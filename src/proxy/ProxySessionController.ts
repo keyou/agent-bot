@@ -125,7 +125,7 @@ interface StartTurnOptions {
   responseContinuationTurnId?: string;
 }
 
-interface PendingForwardAttachment {
+interface PendingMessageReference {
   contextKey: string;
   userId?: string;
   attachmentMessageId?: string;
@@ -133,11 +133,9 @@ interface PendingForwardAttachment {
   resolveAttachment: (message: IncomingMessage | undefined) => void;
 }
 
-interface ForwardAttachmentReservation {
+interface MessageReferenceReservation {
   sourceMessageId: string;
-  sourceKind: "merged_forward" | "resource";
-  pending: PendingForwardAttachment;
-  registry: Map<string, PendingForwardAttachment>;
+  pending: PendingMessageReference;
 }
 
 interface PreparedTopicRootPrompt {
@@ -206,7 +204,7 @@ const RECOVERY_HEARTBEAT_INTERVAL_MS = 60 * 1_000;
 const SHELL_COMMAND_JOB_POLL_INTERVAL_MS = 1_000;
 const SHELL_COMMAND_JOB_RELAUNCH_DELAY_MS = 5_000;
 const APP_SERVER_RELEASE_POLL_INTERVAL_MS = 500;
-const FORWARD_ATTACHMENT_WINDOW_MS = 1_500;
+const REFERENCE_INSTRUCTION_WINDOW_MS = 1_500;
 const DEFAULT_MERGED_FORWARD_INSTRUCTION = "请参考以下内容回复用户";
 const DEFAULT_REFERENCED_MESSAGE_INSTRUCTION = "请参考引用消息回复用户";
 const TURN_STOP_REQUESTED_MESSAGE = "已发送停止信号，任务会自动停止。";
@@ -578,8 +576,7 @@ export class ProxySessionController {
   private readonly recoveryRetryStartedAt = new Map<string, number>();
   private readonly recoveredLiveAttempts = new Set<string>();
   private recoveryClosed = false;
-  private readonly pendingMergedForwards = new Map<string, PendingForwardAttachment>();
-  private readonly pendingResourceForwards = new Map<string, PendingForwardAttachment>();
+  private readonly pendingMessageReferences = new Map<string, PendingMessageReference>();
   private readonly relatedReactionMessageIds = new Map<string, string[]>();
   private readonly shellCommandJobMonitors = new Map<string, ShellCommandJobMonitor>();
   private readonly appServerReleaseSchedules = new Map<string, AppServerReleaseSchedule>();
@@ -602,6 +599,7 @@ export class ProxySessionController {
       path.join(path.dirname(config.storage.sqlitePath), "command-jobs"),
     ),
     private readonly threadWriterProcesses: ThreadWriterProcessController = new SystemThreadWriterProcessController(),
+    private readonly referenceInstructionWindowMs = REFERENCE_INSTRUCTION_WINDOW_MS,
   ) {
     for (const [, runtime] of this.runtimes.entries()) {
       this.unsubscribe.push(
@@ -668,14 +666,9 @@ export class ProxySessionController {
         "Accepted a delayed Feishu message.",
       );
     }
-    const attachmentReservation = message.mergedForwardMessageId
-      ? undefined
-      : this.reserveForwardAttachment(message);
-    const pendingMergedForward = message.mergedForwardMessageId
-      ? this.registerPendingForwardAttachment(message, this.pendingMergedForwards)
-      : undefined;
-    const pendingResourceForward = !attachmentReservation && isForwardAttachmentSource(message)
-      ? this.registerPendingForwardAttachment(message, this.pendingResourceForwards)
+    const attachmentReservation = this.reserveReferenceInstruction(message);
+    const pendingReference = !attachmentReservation && isReferenceSource(message)
+      ? this.registerPendingReference(message)
       : undefined;
     try {
       const reactionId = await this.outbound.addReaction(
@@ -693,8 +686,9 @@ export class ProxySessionController {
       );
     }
     await this.waitForCurrentSessionReset(message.contextKey);
-    if (attachmentReservation && this.completeForwardAttachment(message, attachmentReservation)) {
-      this.store.audit(message.contextKey, `${attachmentReservation.sourceKind}_attachment_coalesced`, {
+    if (this.recoveryClosed) return;
+    if (attachmentReservation && this.completeReferenceInstruction(message, attachmentReservation)) {
+      this.store.audit(message.contextKey, "referenced_message_coalesced", {
         messageId: message.messageId,
         parentMessageId: message.parentMessageId,
       });
@@ -715,24 +709,24 @@ export class ProxySessionController {
       this.store.recordChatContext(chatContextKey, message.chatType);
       this.store.markChatActive(chatContextKey);
     }
-    if (pendingResourceForward) {
-      const resourceMessage = message;
-      const attachment = await this.waitForForwardAttachment(
+    if (pendingReference && !message.mergedForwardMessageId) {
+      const sourceMessage = message;
+      const attachment = await this.waitForReferenceInstruction(
         message.messageId,
-        pendingResourceForward,
-        this.pendingResourceForwards,
+        pendingReference,
       );
+      if (this.recoveryClosed) return;
       if (attachment) {
         coalescedForwardAttachment = true;
-        const sourceText = resourceMessage.text.trim();
-        const instruction = normalizeFeishuPostText(attachment.text)
-          || (sourceText ? DEFAULT_REFERENCED_MESSAGE_INSTRUCTION : defaultResourcePrompt(resourceMessage));
-        forwardedImages = (resourceMessage.images ?? []).map((image) => ({
-          messageId: resourceMessage.messageId,
+        const sourceText = sourceMessage.text.trim();
+        const instruction = normalizeFeishuPostText(attachment.displayText ?? attachment.text)
+          || (sourceText ? DEFAULT_REFERENCED_MESSAGE_INSTRUCTION : defaultResourcePrompt(sourceMessage));
+        forwardedImages = (sourceMessage.images ?? []).map((image) => ({
+          messageId: sourceMessage.messageId,
           imageKey: image.imageKey,
         }));
-        forwardedFiles = (resourceMessage.files ?? []).map((file) => ({
-          messageId: resourceMessage.messageId,
+        forwardedFiles = (sourceMessage.files ?? []).map((file) => ({
+          messageId: sourceMessage.messageId,
           fileKey: file.fileKey,
           fileName: file.fileName,
         }));
@@ -741,7 +735,7 @@ export class ProxySessionController {
           text: sourceText ? referencedMessagePrompt(instruction, sourceText) : instruction,
           displayText: instruction,
         };
-        this.relatedReactionMessageIds.set(message.messageId, [resourceMessage.messageId]);
+        this.relatedReactionMessageIds.set(message.messageId, [sourceMessage.messageId]);
       }
     }
     if (message.mergedForwardMessageId) {
@@ -753,16 +747,15 @@ export class ProxySessionController {
         (content) => ({ content } as const),
         (error: unknown) => ({ error } as const),
       );
-      const attachment = pendingMergedForward
-        ? await this.waitForForwardAttachment(
+      const attachment = pendingReference
+        ? await this.waitForReferenceInstruction(
             message.messageId,
-            pendingMergedForward,
-            this.pendingMergedForwards,
+            pendingReference,
           )
         : undefined;
       if (attachment) {
         coalescedForwardAttachment = true;
-        const instruction = normalizeFeishuPostText(attachment.text)
+        const instruction = normalizeFeishuPostText(attachment.displayText ?? attachment.text)
           || ((attachment.images?.length ?? 0) > 0 ? "请查看附带的内容。" : "请结合参考聊天记录处理。");
         message = {
           ...attachment,
@@ -772,6 +765,7 @@ export class ProxySessionController {
         this.relatedReactionMessageIds.set(message.messageId, [mergedForwardMessage.messageId]);
       }
       const result = await mergedForwardResult;
+      if (this.recoveryClosed) return;
       if ("error" in result) {
         const replyTarget = message.replyInThread
           ? { messageId: message.messageId, replyInThread: true as const }
@@ -1428,10 +1422,8 @@ export class ProxySessionController {
     this.remoteTurnHistoryRefreshes.clear();
     this.forkHistoryCursors.clear();
     this.turnHistoryHydrations.clear();
-    for (const pending of this.pendingMergedForwards.values()) pending.resolveAttachment(undefined);
-    this.pendingMergedForwards.clear();
-    for (const pending of this.pendingResourceForwards.values()) pending.resolveAttachment(undefined);
-    this.pendingResourceForwards.clear();
+    for (const pending of this.pendingMessageReferences.values()) pending.resolveAttachment(undefined);
+    this.pendingMessageReferences.clear();
     this.relatedReactionMessageIds.clear();
     for (const timer of this.queuedPromptRetryTimers.values()) clearTimeout(timer);
     this.queuedPromptRetryTimers.clear();
@@ -5226,10 +5218,7 @@ export class ProxySessionController {
     }
   }
 
-  private registerPendingForwardAttachment(
-    message: IncomingMessage,
-    registry: Map<string, PendingForwardAttachment>,
-  ): PendingForwardAttachment {
+  private registerPendingReference(message: IncomingMessage): PendingMessageReference {
     let resolveAttachment!: (message: IncomingMessage | undefined) => void;
     const attachmentPromise = new Promise<IncomingMessage | undefined>((resolve) => {
       resolveAttachment = resolve;
@@ -5240,61 +5229,51 @@ export class ProxySessionController {
       attachmentPromise,
       resolveAttachment,
     };
-    registry.set(message.messageId, pending);
+    this.pendingMessageReferences.set(message.messageId, pending);
     return pending;
   }
 
-  private reserveForwardAttachment(message: IncomingMessage): ForwardAttachmentReservation | undefined {
-    if (!message.parentMessageId || isCommandMessage(message)) return undefined;
-    const candidates = [
-      { sourceKind: "merged_forward" as const, registry: this.pendingMergedForwards },
-      { sourceKind: "resource" as const, registry: this.pendingResourceForwards },
-    ];
-    for (const candidate of candidates) {
-      const pending = candidate.registry.get(message.parentMessageId);
-      if (!pending || pending.contextKey !== message.contextKey
-        || pending.userId !== message.userId || pending.attachmentMessageId) continue;
-      pending.attachmentMessageId = message.messageId;
-      return {
-        sourceMessageId: message.parentMessageId,
-        sourceKind: candidate.sourceKind,
-        pending,
-        registry: candidate.registry,
-      };
-    }
-    return undefined;
+  private reserveReferenceInstruction(message: IncomingMessage): MessageReferenceReservation | undefined {
+    const parentMessageId = quotedMessageId(message);
+    if (!parentMessageId || isCommandMessage(message)) return undefined;
+    const pending = this.pendingMessageReferences.get(parentMessageId);
+    if (!pending || pending.contextKey !== message.contextKey
+      || pending.userId !== message.userId || pending.attachmentMessageId) return undefined;
+    pending.attachmentMessageId = message.messageId;
+    return { sourceMessageId: parentMessageId, pending };
   }
 
-  private completeForwardAttachment(
+  private completeReferenceInstruction(
     message: IncomingMessage,
-    reservation: ForwardAttachmentReservation,
+    reservation: MessageReferenceReservation,
   ): boolean {
-    if (!message.parentMessageId) return false;
-    if (reservation.sourceMessageId !== message.parentMessageId) return false;
-    if (reservation.registry.get(message.parentMessageId) !== reservation.pending) return false;
+    const parentMessageId = quotedMessageId(message);
+    if (!parentMessageId || reservation.sourceMessageId !== parentMessageId) return false;
+    if (this.pendingMessageReferences.get(parentMessageId) !== reservation.pending) return false;
     if (reservation.pending.attachmentMessageId !== message.messageId) return false;
     reservation.pending.resolveAttachment(message);
     return true;
   }
 
-  private async waitForForwardAttachment(
+  private async waitForReferenceInstruction(
     messageId: string,
-    pending: PendingForwardAttachment,
-    registry: Map<string, PendingForwardAttachment>,
+    pending: PendingMessageReference,
   ): Promise<IncomingMessage | undefined> {
-    const timer = setTimeout(() => {
+    const expire = (): void => {
       // Arrival reserves the pair before acknowledgement. A slow Reaction must not split it.
       if (pending.attachmentMessageId) return;
-      if (registry.get(messageId) === pending) registry.delete(messageId);
+      if (this.pendingMessageReferences.get(messageId) === pending) this.pendingMessageReferences.delete(messageId);
       pending.resolveAttachment(undefined);
-    }, FORWARD_ATTACHMENT_WINDOW_MS);
-    timer.unref?.();
+    };
+    const timer = this.referenceInstructionWindowMs > 0 ? setTimeout(expire, this.referenceInstructionWindowMs) : undefined;
+    if (timer) timer.unref?.();
+    else expire();
     try {
       return await pending.attachmentPromise;
     } finally {
-      clearTimeout(timer);
-      if (registry.get(messageId) === pending) {
-        registry.delete(messageId);
+      if (timer) clearTimeout(timer);
+      if (this.pendingMessageReferences.get(messageId) === pending) {
+        this.pendingMessageReferences.delete(messageId);
       }
     }
   }
@@ -9852,13 +9831,10 @@ function isCommandMessage(message: IncomingMessage): boolean {
   return text.startsWith("/") || text.startsWith("!");
 }
 
-function isForwardAttachmentSource(message: IncomingMessage): boolean {
-  return !message.mergedForwardMessageId
-    && !message.parentMessageId
+function isReferenceSource(message: IncomingMessage): boolean {
+  return !quotedMessageId(message)
     && !message.contextKey.startsWith("console:")
-    && !isCommandMessage(message)
-    && (message.messageType === "post"
-      || (message.images?.length ?? 0) > 0 || (message.files?.length ?? 0) > 0);
+    && !isCommandMessage(message);
 }
 
 function deduplicateImageReferences(

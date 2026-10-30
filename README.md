@@ -432,9 +432,9 @@ Whitespace-only Commentary does not use a pinned message slot. Adjacent omission
 
 Turn Preview shows saved reasoning with a body in a collapsed panel. A leading Markdown heading or standalone bold title appears directly in the header; expanding shows the remaining summary and content without extra Summary/Content labels or a repeated title. Title-only items remain visible as non-interactive rows without a disclosure arrow or detail request; live updates add a disclosure if a body arrives later. Items without an explicit title keep the Reasoning fallback and all original text. Collapsed panels load their full Markdown on expansion and retain expansion during live updates. Reasoning content and authoritative completed items are stored separately from card activities; this does not change thinking-card titles, grouping, or final replies. Existing saved summaries remain viewable, but previously unrecorded content is not backfilled from Agent history.
 
-Quoted cards and cards inside merged forwards include their available original text and images in the Agent's context.
+Quoted cards and cards inside merged forwards include their available original text and images in the Agent's context. Images and files in forwarded chat records are downloaded as reference attachments, including when you quote the chat record with your own instruction.
 
-When forwarding rich text, images, files, or chat records with an attached message, Agent Bot combines the associated messages into one request: your attached text is the main Prompt, and the forwarded content remains reference material.
+When you quote a message, your current message body is the main Prompt; the quoted content remains reference material regardless of its type. Ordinary Feishu messages, including plain text and links, briefly wait up to 1.5 seconds after acknowledgement for an explicitly linked follow-up from the same sender in the same conversation. A matching follow-up combines them into one request and supplies the card Prompt. Commands do not wait. Quotes of older or already-submitted messages use normal quoting/steering without replacing completed history.
 
 File-change summaries display paths as plain text, preserving Windows separators and literal underscores (including `\__init__.py`) instead of interpreting them as Markdown formatting.
 

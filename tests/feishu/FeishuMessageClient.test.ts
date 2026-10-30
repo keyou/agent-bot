@@ -246,8 +246,8 @@ describe("FeishuMessageClient", () => {
       messageCount: 3,
       truncated: false,
       text: expect.stringContaining("merged child text"),
-      images: [{ messageId: "om_image_child", imageKey: "img_child" }],
-      files: [{ messageId: "om_file_child", fileKey: "file_child", fileName: "notes.txt" }],
+      images: [{ messageId: "om_merged", imageKey: "img_child" }],
+      files: [{ messageId: "om_merged", fileKey: "file_child", fileName: "notes.txt" }],
     });
 
     expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
@@ -285,6 +285,55 @@ describe("FeishuMessageClient", () => {
       "https://open.feishu.cn/open-apis/im/v1/messages/om_quoted_image?card_msg_content_type=user_card_content",
     );
   });
+
+  test.each(["readMergedForward", "readReferencedMessage"] as const)(
+    "%s downloads merged-forward images and files through the container message",
+    async (read) => {
+      const imageBytes = new Uint8Array([1, 2, 3, 4]);
+      const fileText = "# Task background\nForwarded research notes.\n";
+      const fetchMock = vi.fn<typeof fetch>(async (input) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        if (url.pathname.endsWith("/tenant_access_token/internal")) {
+          return Response.json({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 });
+        }
+        if (url.pathname.endsWith("/messages/om_merged")) {
+          return Response.json({ code: 0, msg: "ok", data: { items: [
+            { message_id: "om_merged", msg_type: "merge_forward", body: { content: "Merged and Forwarded Message" } },
+            {
+              message_id: "om_image_child", upper_message_id: "om_merged", msg_type: "image",
+              body: { content: JSON.stringify({ image_key: "img_child" }) },
+            },
+            {
+              message_id: "om_file_child", upper_message_id: "om_merged", msg_type: "file",
+              body: { content: JSON.stringify({ file_key: "file_child", file_name: "research.md" }) },
+            },
+          ] } });
+        }
+        if (url.pathname.endsWith("/messages/om_merged/resources/img_child") && url.searchParams.get("type") === "image") {
+          return new Response(imageBytes, { headers: { "content-type": "image/png" } });
+        }
+        if (url.pathname.endsWith("/messages/om_merged/resources/file_child") && url.searchParams.get("type") === "file") {
+          return new Response(fileText, { headers: { "content-type": "text/markdown" } });
+        }
+        return Response.json({ code: 234003, msg: "File not in msg." }, { status: 400 });
+      });
+      globalThis.fetch = fetchMock;
+      const client = new FeishuMessageClient(config(), logger());
+
+      const content = await client[read]("om_merged");
+      const image = content.images[0]!;
+      const file = content.files[0]!;
+      const imagePath = await client.downloadImage(image.messageId, image.imageKey);
+      const filePath = await client.downloadFile(file.messageId, file.fileKey, file.fileName);
+
+      expect(content.text).toContain("[图片 1]");
+      expect(content.text).toContain("[文件 1：research.md]");
+      expect(fs.readFileSync(imagePath)).toEqual(Buffer.from(imageBytes));
+      expect(fs.readFileSync(filePath, "utf8")).toBe(fileText);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock.mock.calls.every(([url]) => !String(url).includes("_child/resources/"))).toBe(true);
+    },
+  );
 
   test("reads original Card 2.0 text and images instead of the compatibility placeholder", async () => {
     const fetchMock = vi.fn()

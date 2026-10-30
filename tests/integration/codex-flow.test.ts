@@ -14,6 +14,37 @@ import { AgentRuntimeRegistry } from "../../src/runtime/AgentRuntimeRegistry.js"
 import type { AgentRuntime } from "../../src/runtime/types.js";
 import { StateStore } from "../../src/state/StateStore.js";
 
+test("pairs a plain-text link with its quoted instruction before starting the Turn and progress card", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-reference-flow-"));
+  const app = createApplication(path.join(dir, "state.sqlite"), new FakeClient("quoted_turn"));
+  const url = "https://example.test/merge-request/123";
+  const instruction = "review 这个 MR 中的 skill 改动";
+  try {
+    app.store.getOrCreateUserContext("chat_id:c1", "codex");
+    app.store.setBoundProjectCwd("chat_id:c1", dir);
+    await app.controller.onMessage({ messageId: "create", contextKey: "chat_id:c1", text: "/new Existing task title" });
+    const source = app.controller.onMessage({ messageId: "source", contextKey: "chat_id:c1", messageType: "text", text: url });
+    await new Promise((resolve) => setTimeout(resolve, 365));
+    expect(app.client.requests.filter((request) => request.method === "turn/start")).toEqual([]);
+    await app.controller.onMessage({ messageId: "instruction", contextKey: "chat_id:c1", parentMessageId: "source", text: instruction });
+    await source;
+    expect(app.client.requests.filter((request) => request.method === "turn/start")).toEqual([
+      { method: "turn/start", params: expect.objectContaining({ input: [expect.objectContaining({ type: "text", text: `${instruction}\n\n引用消息：\n${url}` })] }) },
+    ]);
+    expect(app.client.requests.some((request) => request.method === "turn/steer")).toBe(false);
+    expect(app.store.getTurnSnapshot("quoted_turn")).toMatchObject({ prompt: instruction, taskTitle: "Existing task title" });
+    expect(app.store.listSessions("chat_id:c1")).toHaveLength(1);
+    expect(app.outbound.cards).toHaveLength(1);
+    expect(JSON.stringify(app.outbound.cards[0]?.header)).toContain(instruction);
+    expect(JSON.stringify(app.outbound.cards[0]?.header)).not.toContain(url);
+    app.client.emit("turn/completed", { threadId: "thr_1", turn: { id: "quoted_turn", status: "completed" } });
+    await vi.waitFor(() => expect(app.store.getTurnSnapshot("quoted_turn")).toMatchObject({ status: "completed" }));
+  } finally {
+    await app.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("sends one progress card and one final answer per turn, then resumes without history replay", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-codex-flow-"));
   const dbPath = path.join(dir, "state.sqlite");
@@ -168,6 +199,7 @@ function createApplication(dbPath: string, client: FakeClient) {
     client,
     controller,
     outbound,
+    store,
     close: async () => {
       controller.close();
       await router.flushAll();

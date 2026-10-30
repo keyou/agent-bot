@@ -58,10 +58,10 @@ describe("merged-forward message rendering", () => {
       messageCount: 4,
       truncated: false,
       images: [
-        { messageId: "om_2", imageKey: "img_1" },
-        { messageId: "om_3", imageKey: "img_2" },
+        { messageId: "om_parent", imageKey: "img_1" },
+        { messageId: "om_parent", imageKey: "img_2" },
       ],
-      files: [{ messageId: "om_4", fileKey: "file_report", fileName: "report.pdf" }],
+      files: [{ messageId: "om_parent", fileKey: "file_report", fileName: "report.pdf" }],
     });
     expect(result.text).toContain("一组聊天记录（共 4 条）");
     expect(result.text).toContain("[消息 1 · 成员 1 · 2026-08-13 02:00:00 UTC]");
@@ -175,7 +175,45 @@ describe("merged-forward message rendering", () => {
       }) },
     }]);
     expect(result.text).toContain("Forwarded report\nThe original card body.\nDetails\nNested diagnostic details.\n[图片 1]");
-    expect(result.images).toEqual([{ messageId: "om_child_card", imageKey: "img_nested" }]);
+    expect(result.images).toEqual([{ messageId: "om_parent", imageKey: "img_nested" }]);
+  });
+
+  test("deduplicates shared resources across children and does not require child IDs", () => {
+    const result = renderMergedForwardPrompt("om_parent", [
+      {
+        message_id: "om_image", upper_message_id: "om_parent", msg_type: "image",
+        body: { content: JSON.stringify({ image_key: "img_shared" }) },
+      },
+      {
+        upper_message_id: "om_parent", msg_type: "post",
+        body: { content: JSON.stringify({ content: [[{ tag: "img", image_key: "img_shared" }]] }) },
+      },
+      {
+        upper_message_id: "om_parent", msg_type: "file",
+        body: { content: JSON.stringify({ file_key: "file_1", file_name: "research.md" }) },
+      },
+      {
+        upper_message_id: "om_parent", msg_type: "file",
+        body: { content: JSON.stringify({ file_key: "file_1", file_name: "research.md" }) },
+      },
+      {
+        upper_message_id: "om_parent", msg_type: "file",
+        body: { content: JSON.stringify({ file_key: "file_2", file_name: "notes.md" }) },
+      },
+      {
+        upper_message_id: "om_other_parent", msg_type: "image",
+        body: { content: JSON.stringify({ image_key: "img_unrelated" }) },
+      },
+    ]);
+
+    expect(result.images).toEqual([{ messageId: "om_parent", imageKey: "img_shared" }]);
+    expect(result.text.match(/\[图片 1\]/g)).toHaveLength(2);
+    expect(result.text.match(/\[文件 1：research.md\]/g)).toHaveLength(2);
+    expect(result.text).toContain("[文件 2：notes.md]");
+    expect(result.files).toEqual([
+      { messageId: "om_parent", fileKey: "file_1", fileName: "research.md" },
+      { messageId: "om_parent", fileKey: "file_2", fileName: "notes.md" },
+    ]);
   });
 
   test("preserves images from cards returned with the client-version placeholder", () => {
