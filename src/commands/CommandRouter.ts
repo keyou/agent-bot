@@ -1,4 +1,5 @@
 import type { Command } from "./commandTypes.js";
+import { parseScheduleCommand } from "../scheduling/ScheduleCommand.js";
 
 export const COMMAND_NAMES = [
   "agent",
@@ -22,6 +23,7 @@ export const COMMAND_NAMES = [
   "queue",
   "release",
   "restart",
+  "schedule",
   "sessions",
   "status",
   "stop",
@@ -58,6 +60,8 @@ export class CommandRouter {
     const command = resolveCommandName(rawCommand);
 
     switch (command) {
+      case "schedule":
+        return { type: "schedule", command: parseScheduleCommand(args) };
       case "dir":
         return { type: "dir", directory: args.join(" ").trim() || undefined };
       case "file": {

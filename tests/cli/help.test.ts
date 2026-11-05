@@ -111,6 +111,7 @@ describe("CLI help", () => {
       release: "task release",
       update: "agentbot update",
       restart: "task restart",
+      schedule: "schedule list",
       sessions: "task list",
       status: "task status|chat",
       stop: "task stop",

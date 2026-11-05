@@ -296,6 +296,31 @@ Only groups explicitly enabled with `/mute` or `/mute on` supplement ordinary @-
 
 `/dir` opens the file browser. `NewFolder` creates a child directory and opens it in the same card at page one, without changing the task's working directory. `Back` cancels creation and restores the previous directory and page.
 
+### Scheduled Tasks
+
+`/schedule` opens this conversation's plans: create/edit forms, confirmation, pause/resume, run-now, deletion, and the latest ten run records. Plan details and run history use separate views: plan controls stay in details, while history only offers per-run details and verification. Compact navigation switches views, refreshes the current view, or returns to the list. Only the configured Agent Bot owner can manage them in Lark. A plan targets an existing local task and preserves its original private/group/topic reply route; switching the current task does not retarget it. Execution follows that task's current Provider, model, and permissions, without forking, changing history, or elevating permissions.
+
+The CLI uses the same service and prints JSON:
+
+```powershell
+agentbot schedule add --task <task> --name "Build check" --cron "0 9 * * 1-5" --timezone Asia/Singapore --prompt "Check the project build"
+agentbot schedule add --task <task> --at "2026-12-01T10:00:00+08:00" --prompt "Check the build result"
+agentbot schedule list
+agentbot schedule show <schedule-id>
+agentbot schedule history <schedule-id>
+agentbot schedule pause <schedule-id>
+agentbot schedule resume <schedule-id>
+agentbot schedule run <schedule-id>
+agentbot schedule edit <schedule-id> --cron "0 10 * * 1-5" --prompt "Check the project build"
+agentbot schedule delete <schedule-id>
+```
+
+Creation/editing saves a draft and sends a confirmation card to the original conversation. The owner must confirm before activation. Inside an Agent Bot Agent, `add` may omit `--task`. Slash commands accept the same operations/options without `--task`. Cron has five fields (minute precision); `--at` requires an ISO timestamp with an offset. Each plan stores an IANA timezone, defaulting to the host's timezone at creation. Prompts are limited to 1,000 characters to match Lark forms. `edit` replaces the full specification. CLI lists return up to 100 plans; Lark lists are paginated.
+
+Scheduled Prompts enter the persistent queue as independent Turns, never steering active work. When execution starts, Agent Bot first posts the original Prompt to the plan's original conversation/topic, then sends the thinking card and submits the Turn. Nothing is posted while merely waiting in the queue; recovery and approved-plan continuation do not repost the Prompt. If posting the Prompt fails, no Turn is submitted and enabled plans are paused. Each plan permits one queued/running/unconfirmed occurrence; overlaps are skipped. `--max-delay <minutes>` sets the latest start relative to the scheduled time (default 60). Before submission Agent Bot rechecks expiration, pause/delete, owner, target, and safe-restart state. Pause/delete cancels queued/preparing work, not submitted work; use normal Stop for active work. Run-now does not change the calendar.
+
+Missed occurrences after restart, sleep, or a delay over one minute are skipped by default. `--catch-up <minutes>` opts into only the latest missed occurrence inside that window, still subject to `--max-delay`; history is never replayed in bulk. Plan/run/queue writes are transactional and deduplicated. Known active App Server Turns can be reattached; ambiguous submissions and interrupted runs are not automatically resubmitted. Verify the Agent's state, then use **已核实结束** in run history to unblock an unconfirmed occurrence. Closed targets and owner changes pause plans. Safe restart suspends dispatch. The host and service must be running; automatic wake-up is not provided. Timing is best-effort (five-second polling plus queue wait), not hard real-time.
+
 `/file` accepts relative paths, absolute paths, and paths beginning with `~`; relative paths resolve from the current task directory.
 
 `/fork` and `/forkgroup` branch from completed work without interrupting a running turn. `/sessions` manages tasks across projects and Providers in pages of up to 10 tasks; switching Provider does not hide a task from the list or search. Use each project menu for `New` and `NewGroup`. Each task’s `SwitchGroup` action creates a new group bound to that same task, preserving its history, title, and execution settings without creating or forking an Agent task. The original conversation stays unchanged. An Agent Bot Turn already in progress keeps replying to its original conversation; new messages from the new group queue until it finishes. Tasks running in an external client cannot be switched until they finish. Expanding a task directly shows the first 50 characters of its latest user Prompt, its update time, and task-specific actions. Running tasks also show a direct `Stop` button, including the current task and tasks running in other conversations or external clients. It sends the normal Agent interrupt without switching tasks or killing processes. The list refresh preserves search and pagination and keeps Stop available until the Agent reports the task idle; Archive is available only when idle. Use `Turns` to view that task’s history without switching tasks, including tasks not yet bound to Agent Bot; non-current tasks are read-only until you switch to them. `/turns` restores conversation context without reverting local files.

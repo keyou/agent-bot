@@ -365,7 +365,7 @@ describe("CommandRouter", () => {
     expect(router.parse("/fork 2")).toEqual({ type: "fork", sessionId: "2" });
     expect(() => router.parse("/m")).toThrow("命令前缀 /m 不唯一，可匹配：/model、/mute");
     expect(() => router.parse("/s")).toThrow(
-      "命令前缀 /s 不唯一，可匹配：/sessions、/status、/stop、/switch",
+      "命令前缀 /s 不唯一，可匹配：/schedule、/sessions、/status、/stop、/switch",
     );
     expect(() => router.parse("/f")).toThrow(
       "命令前缀 /f 不唯一，可匹配：/file、/fork、/forkgroup",

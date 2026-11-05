@@ -145,6 +145,30 @@ Provider changes for tasks with history must keep the same remote task ID and co
 
 After the specific Codex Responses failure `unsupported_persisted_item_context` for `previous_response_id`, Agent Bot can automatically start one empty-input continuation in the same thread. It retains history and completed tool results without resending the original Prompt/images; it creates a new Turn/card, not a new task or Fork. Do not also send a retry Prompt while recovery is pending. Stop/Reset cancel recovery; changed settings, newer work, or a lost attachment block it. A second rejection remains a failure, not an unlimited retry. Matching progress warnings and final errors appear once in cards and Preview, with raw diagnostic events retained. This execution recovery is separate from Provider switching; it never changes settings or restarts the shared process.
 
+## Scheduled Tasks
+
+Use `agentbot schedule` for explicitly requested future or recurring Agent work:
+
+```powershell
+agentbot schedule add --task <task> --cron "0 9 * * 1-5" --timezone Asia/Singapore --prompt "Check the build"
+agentbot schedule add --task <task> --at "2026-12-01T10:00:00+08:00" --prompt "Check results"
+agentbot schedule list
+agentbot schedule show|history <schedule-id>
+agentbot schedule pause|resume|run|delete <schedule-id>
+agentbot schedule edit <schedule-id> --cron "0 10 * * 1-5" --prompt "Check the build"
+```
+
+- Only create a schedule when the user explicitly requests scheduling; an ordinary task is not permission to add recurrence.
+- `add` may omit `--task` inside an Agent Bot Agent. Bind the requested existing task; never fork or replace it to create a schedule.
+- Creation/editing sends a draft confirmation card to the task's original conversation. Wait for the owner to confirm; do not activate drafts on their behalf.
+- Plan details contain plan-editing controls; run history only contains per-run detail and verification actions. Use the card's navigation to switch views or refresh the current view.
+- `edit` replaces the entire specification. Preserve unchanged fields from `show`. Specify exactly one of five-field `--cron` and offset-aware ISO `--at`; Prompts are limited to 1,000 characters.
+- Agent Bot persists timezone and reply route, uses the task's execution-time settings, queues without steering, skips overlap, and expires starts after `--max-delay` minutes (default 60).
+- At execution start, Agent Bot posts the original Prompt to the saved conversation/topic before the thinking card and model submission. Queueing alone sends nothing; recovery and approved-plan continuation do not repost it. Failed Prompt delivery prevents submission and pauses enabled plans.
+- Missed slots are skipped by default. Use `--catch-up <minutes>` only when requested; it permits only the latest missed slot within the window and maximum start deadline.
+- Do not automatically rerun ambiguous submissions. Ask the user to verify run history/Agent state; the owner can acknowledge an ended unknown run in its history card. Pause/delete cancels unsubmitted work only; Stop active work separately when requested.
+- Scheduling requires the host and Agent Bot to remain running. Safe restart suspends dispatch and does not bulk-replay old Prompts.
+
 ## Goals And Turns
 
 ```powershell

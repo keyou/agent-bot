@@ -142,7 +142,7 @@ export class SafeRestartNotifier {
     const waitingTasks = status.phase === "cancelled"
       ? []
       : this.store.listAllSessions()
-        .filter((session) => session.status === "running" || this.store.countQueuedPrompts(session.localSessionId) > 0)
+        .filter((session) => this.store.sessionBlocksSafeRestart(session.localSessionId))
         .map((session) => ({
           id: session.remoteSessionId ?? session.localSessionId,
           localSessionId: session.localSessionId,

@@ -223,4 +223,29 @@ export const migrations = [
     value_json TEXT NOT NULL
   );
   `,
+  `
+  CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id TEXT PRIMARY KEY,
+    local_session_id TEXT NOT NULL,
+    context_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    next_run_at INTEGER,
+    revision INTEGER NOT NULL,
+    value_json TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ON scheduled_jobs(status, next_run_at);
+  CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_context ON scheduled_jobs(context_key);
+  CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_session ON scheduled_jobs(local_session_id);
+  CREATE TABLE IF NOT EXISTS scheduled_runs (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    occurrence_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    UNIQUE(job_id, occurrence_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_scheduled_runs_status ON scheduled_runs(status);
+  CREATE INDEX IF NOT EXISTS idx_scheduled_runs_job ON scheduled_runs(job_id);
+  CREATE INDEX IF NOT EXISTS idx_turn_attempts_pending_turn ON turn_attempts(pending_turn_id);
+  `,
 ] as const;

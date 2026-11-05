@@ -34,6 +34,7 @@ import { createAgentRuntimeRegistry } from "./runtime/createAgentRuntimeRegistry
 import { StateStore } from "./state/StateStore.js";
 import { ManualUpdateController } from "./updates/ManualUpdateController.js";
 import { DailyUpdateMonitor } from "./updates/DailyUpdateMonitor.js";
+import { TaskScheduler } from "./scheduling/TaskScheduler.js";
 import { readLatestStableVersion, readReleaseNotes, readPublishedReleases } from "./updates/PublishedRelease.js";
 import { checkAutomaticUpdateSupport, prepareAutomaticUpdate, prepareSelectedUpdate } from "./updates/AutomaticUpdatePreparer.js";
 import { StartupNotifier } from "./startup/StartupNotifier.js";
@@ -120,6 +121,7 @@ let consoleConnector: ConsoleConnector | undefined;
 let startupNotifier: StartupNotifier | undefined;
 let safeRestartNotifier: SafeRestartNotifier | undefined;
 let dailyUpdateMonitor: DailyUpdateMonitor | undefined;
+let taskScheduler: TaskScheduler | undefined;
 let controlServer: LocalControlServer | undefined;
 let serverReady = false;
 
@@ -265,6 +267,7 @@ function serverActivity() {
 }
 
 const controller = new ProxySessionController(config, store, runtimes, outbound, logger, {
+  canStartScheduledTasks: () => serverReady && !shuttingDown && !restartRequested && !safeRestart.scheduled,
   supervised,
   terminalUrl: (jobId) => terminalServer?.createUrl(jobId),
   authorizeTerminal: (action) => {
@@ -353,12 +356,20 @@ if (feishuConnector && startupNotifier) {
   await feishuConnector?.start();
   serverReady = true;
 }
+taskScheduler = new TaskScheduler({
+  store, logger,
+  canDispatch: () => serverReady && !shuttingDown && !restartRequested && !safeRestart.scheduled,
+  ownerId: () => config.feishu.userOpenId,
+  drain: (sessionId) => controller.drainScheduledPrompts(sessionId),
+  notify: (job, text) => controller.notifySchedule(job, text),
+});
 await controller.recoverInterruptedTasks().catch((error: unknown) => {
   logger.error({ error }, "Startup task recovery failed; the server will remain available.");
 });
 consoleConnector?.start();
 recoverPendingSelfUpdate();
 await dailyUpdateMonitor?.start();
+await taskScheduler.start();
 
 function recoverPendingSelfUpdate(): void {
   const pending = readPendingSelfUpdate(agentBotHome());
@@ -518,6 +529,8 @@ async function handleControlRequest(request: ControlRequest): Promise<ControlRes
           activity: serverActivity(),
         },
       };
+    case "schedule":
+      return { ok: true, data: await controller.controlSchedule(request.command, request.localSessionId) };
     case "server_restart": {
       if (pendingSelfUpdatePlanPath) {
         return { ok: false, message: "An Agent Bot update is already pending." };
@@ -669,6 +682,7 @@ async function shutdown(
 ): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  await taskScheduler?.stop();
   await dailyUpdateMonitor?.stop();
   if (pendingSelfUpdatePlanPath) {
     releaseSelfUpdatePlan(pendingSelfUpdatePlanPath);

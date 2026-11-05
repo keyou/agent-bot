@@ -13,6 +13,7 @@ import type { SessionRecord, PendingProviderSettings } from "../state/StateStore
 import type { ShellCommandResult } from "../utils/executeShellCommand.js";
 
 export type ControlRequest =
+  | { action: "schedule"; command: import("../scheduling/types.js").ScheduleCommand; localSessionId?: string }
   | { action: "health" }
   | {
       action: "server_restart";

@@ -115,6 +115,7 @@ import {
   parseTaskNewGroupOptions,
 } from "./cli/taskGroupOptions.js";
 import { StateStore, type SessionRecord } from "./state/StateStore.js";
+import { parseScheduleCommand } from "./scheduling/ScheduleCommand.js";
 import {
   nodeDiagnosticReportArguments,
   prepareCrashReportDirectory,
@@ -179,6 +180,10 @@ async function main(input: string[]): Promise<void> {
   }
   if (command === "task" || command === "tasks") {
     await taskCommand(rest);
+    return;
+  }
+  if (command === "schedule") {
+    await scheduleCommand(rest);
     return;
   }
   if (command === "skill" || command === "skills") {
@@ -1228,6 +1233,26 @@ function resolveRestartNotificationSessionId(sqlitePath: string, args: string[])
   } finally {
     store.close();
   }
+}
+
+async function scheduleCommand(input: string[]): Promise<void> {
+  if (["--help", "-h", "help"].includes(input[0] ?? "")) { printHelp(); return; }
+  const args = input.filter((argument) => argument !== "--json");
+  const config = loadConfig();
+  const store = new StateStore(config.storage.sqlitePath);
+  try {
+    let localSessionId: string | undefined;
+    let command;
+    if (args[0] === "add") {
+      const target = resolveTaskCommandTarget(store.listAllSessions(), args.slice(1), "schedule add");
+      localSessionId = target.session.localSessionId;
+      command = parseScheduleCommand(["add", ...target.args]);
+    } else command = parseScheduleCommand(args);
+    const result = controlData<unknown>(await sendControlRequest(controlEndpoint(config.storage.sqlitePath), {
+      action: "schedule", command, localSessionId,
+    }, 60_000));
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } finally { store.close(); }
 }
 
 async function taskCommand(input: string[]): Promise<void> {

@@ -52,6 +52,9 @@ import {
 import { normalizeFeishuPostText } from "../feishu/InboundText.js";
 import { RECENT_CONTEXT_LIMIT, RECENT_CONTEXT_IMAGE_LIMIT, RECENT_CONTEXT_TEXT_LIMIT, recentContextPrompt } from "../feishu/RecentMessageContext.js";
 import { allowsFeishuUser } from "../feishu/ownerAccess.js";
+import type { ScheduleCommand, ScheduledJob, ScheduleInput } from "../scheduling/types.js";
+import { scheduleCommandSchema } from "../scheduling/types.js";
+import { renderSchedule, renderScheduleList, renderScheduleForm } from "../scheduling/ScheduleCards.js";
 import { classifyFileContent } from "../local-files/LocalFileViewerServer.js";
 import { errorLogValue } from "../logging/errorLogValue.js";
 import type { OutboundRouter } from "../presentation/OutboundRouter.js";
@@ -117,6 +120,7 @@ interface LoadedSession {
 }
 
 interface StartTurnOptions {
+  scheduleRunId?: string;
   attemptId?: string;
   messageId?: string;
   displayPrompt?: string;
@@ -286,6 +290,7 @@ const HELP_COMMAND_SECTIONS: Array<{
         requiresArgument: true,
       },
       { command: "/sessions", usage: "[关键词]", description: "查找本机任务" },
+      { command: "/schedule", description: "创建和管理绑定现有任务的定时计划" },
       {
         command: "/archive",
         usage: "[序号或任务 ID]",
@@ -515,6 +520,7 @@ export interface ControlTaskReleaseResult {
 }
 
 export interface ProxyLifecycle {
+  canStartScheduledTasks?(): boolean;
   terminalUrl?(jobId: string): string | undefined;
   authorizeTerminal?(action: CardAction): Promise<string>;
   stopSafeRestartTerminal?(action: CardAction): Promise<string>;
@@ -1055,7 +1061,9 @@ export class ProxySessionController {
     await this.outbound.withReplyTarget(contextKey, replyTarget, async () => {
       try {
         const kind = String(scopedAction.value.action ?? "");
-        if (kind === "terminal_authorize") {
+        if (kind.startsWith("schedule_")) {
+          await this.handleScheduleAction(scopedAction, replyTarget);
+        } else if (kind === "terminal_authorize") {
           if (!this.lifecycle?.authorizeTerminal) throw new Error("网页终端未启用。");
           await this.outbound.sendText(contextKey, await this.lifecycle.authorizeTerminal(scopedAction));
         } else if (kind === "safe_restart_terminal_stop") {
@@ -1775,6 +1783,133 @@ export class ProxySessionController {
     return this.requireCurrentSession(contextKey);
   }
 
+  async drainScheduledPrompts(localSessionId: string): Promise<void> {
+    if (this.lifecycle?.canStartScheduledTasks?.() === false) return;
+    await this.scheduleNextQueuedPrompt(localSessionId);
+  }
+
+  async notifySchedule(job: ScheduledJob, text: string): Promise<void> {
+    const target = job.replyMessageId ? { messageId: job.replyMessageId, replyInThread: true as const } : undefined;
+    await this.outbound.withReplyTarget(job.contextKey, target, () => this.outbound.sendText(job.contextKey, text));
+  }
+
+  async controlSchedule(command: ScheduleCommand, localSessionId?: string): Promise<unknown> {
+    command = scheduleCommandSchema.parse(command);
+    if (command.operation === "list") return this.store.schedules.list(undefined, 100);
+    if (command.operation === "add") {
+      if (!localSessionId || !command.input) throw new Error("需要目标任务和计划参数。");
+      const session = this.requireControlSession(localSessionId);
+      const contextKey = this.controlSessionContextKey(session);
+      const target = this.controlSessionReplyTarget(session);
+      const job = this.createSchedule(command.input, session.localSessionId, contextKey, target?.messageId);
+      await this.outbound.withReplyTarget(contextKey, target, () => this.showSchedule(job));
+      return job;
+    }
+    const saved = this.store.schedules.get(command.id ?? "");
+    if (saved && command.operation === "show") return saved;
+    if (saved && command.operation === "history") return this.store.schedules.runs(saved.id);
+    const job = this.store.schedules.require(command.id ?? "");
+    if (command.operation === "show") return job;
+    if (command.operation === "history") return this.store.schedules.runs(job.id);
+    if (command.operation === "edit") {
+      if (!command.input) throw new Error("需要计划参数。");
+      const updated = this.store.schedules.edit(job.id, job.revision, command.input);
+      const target = job.replyMessageId ? { messageId: job.replyMessageId, replyInThread: true as const } : undefined;
+      await this.outbound.withReplyTarget(job.contextKey, target, () => this.showSchedule(updated));
+      return updated;
+    }
+    if (command.operation === "run") {
+      this.assertScheduleTarget(job);
+      const run = this.store.schedules.dispatch(job, Date.now(), Date.now(), { manual: true });
+      await this.drainScheduledPrompts(job.localSessionId);
+      return run;
+    }
+    if (!["pause", "resume", "delete"].includes(command.operation)) throw new Error("无效的定时任务操作。");
+    if (command.operation === "resume") this.assertScheduleTarget(job);
+    return this.store.schedules.change(job.id, job.revision, command.operation as "pause" | "resume" | "delete");
+  }
+
+  private createSchedule(input: ScheduleInput, localSessionId: string, contextKey: string, replyMessageId?: string): ScheduledJob {
+    if (!this.config.feishu.userOpenId) throw new Error("请先配置 Agent Bot 所有者，才能创建定时任务。");
+    this.requireSession(contextKey, localSessionId);
+    if (isThreadContextKey(contextKey) && !replyMessageId) throw new Error("缺少话题回复位置，请在原话题中创建计划。");
+    return this.store.schedules.create(input, { localSessionId, contextKey, replyMessageId, ownerId: this.config.feishu.userOpenId });
+  }
+
+  private assertScheduleTarget(job: ScheduledJob): void {
+    if (job.ownerId !== this.config.feishu.userOpenId) throw new Error("计划所有者已变化，请重新创建计划。");
+    const session = this.store.getSession(job.localSessionId);
+    if (!session || session.status === "closed") throw new Error("目标任务已关闭，不能执行该计划。");
+    if (!this.outbound.canRoute(job.contextKey)) throw new Error("计划的原始会话不可用。");
+  }
+
+  private async showSchedule(job: ScheduledJob, messageId?: string, history = false): Promise<void> {
+    const title = this.store.getSession(job.localSessionId)?.title ?? job.localSessionId;
+    const card = renderSchedule(job, title, this.store.schedules.runs(job.id, history ? 10 : 1), history);
+    if (messageId) await this.outbound.updateInteractiveCard(job.contextKey, messageId, card);
+    else await this.outbound.sendInteractiveCard(job.contextKey, card);
+  }
+
+  private async showScheduleList(contextKey: string, page = 0, messageId?: string): Promise<void> {
+    if (!Number.isSafeInteger(page) || page < 0 || page > 10_000) throw new Error("无效的计划页码。");
+    const card = renderScheduleList(this.store.schedules.list(contextKey, 11, page * 10), contextKey, page);
+    if (messageId) await this.outbound.updateInteractiveCard(contextKey, messageId, card);
+    else await this.outbound.sendInteractiveCard(contextKey, card);
+  }
+
+  private async handleScheduleAction(action: CardAction, replyTarget?: MessageReplyTarget): Promise<void> {
+    if (!this.config.feishu.userOpenId || action.userId !== this.config.feishu.userOpenId) throw new Error("只有 Agent Bot 所有者可以管理定时任务。");
+    const operation = String(action.value.action).slice("schedule_".length);
+    const messageId = requiredCardMessageId(action.messageId);
+    if (operation === "list") return this.showScheduleList(action.contextKey, Number(action.value.page ?? 0), messageId);
+    if (operation === "new") {
+      const session = this.requireCurrentSession(action.contextKey);
+      return this.outbound.updateInteractiveCard(action.contextKey, messageId, renderScheduleForm(action.contextKey, undefined, session.localSessionId));
+    }
+    const id = String(action.value.scheduleId ?? "");
+    const job = id ? (["show", "history"].includes(operation) ? this.store.schedules.get(id) : this.store.schedules.require(id)) : undefined;
+    if (job && (job.contextKey !== action.contextKey || job.ownerId !== action.userId)) throw new Error("此会话无权操作该计划。");
+    if (operation === "show" || operation === "history") {
+      if (!job) throw new Error("计划不存在。");
+      return this.showSchedule(job, messageId, operation === "history");
+    }
+    if (job && job.revision !== Number(action.value.revision)) throw new Error("计划卡片已过期，请刷新。");
+    if (operation === "resolve" && job) {
+      const run = this.store.schedules.getRun(String(action.value.runId ?? ""));
+      if (!run || run.jobId !== job.id || run.status !== "unknown") throw new Error("本次运行状态已变化，请刷新。");
+      const session = this.store.getSession(job.localSessionId);
+      if (session && run.turnId && this.runtimes.forAgent(session.agentName).getSession(session.localSessionId)?.activeTurnId === run.turnId) {
+        throw new Error("本次运行仍活跃，请先停止或等待完成。");
+      }
+      this.store.schedules.finish(run.id, "cancelled", "用户已核实本次运行结束，解除调度阻塞。");
+      return this.showSchedule(job, messageId, true);
+    }
+    if (operation === "edit") {
+      if (!job) throw new Error("计划不存在。");
+      return this.outbound.updateInteractiveCard(action.contextKey, messageId, renderScheduleForm(action.contextKey, job));
+    }
+    if (operation === "submit") {
+      const form = action.value.formValue as Record<string, unknown> | undefined;
+      if (!form || typeof form !== "object") throw new Error("缺少计划表单。");
+      const string = (key: string) => typeof form[key] === "string" ? form[key] as string : "";
+      const input: ScheduleInput = { name: string("name"), prompt: string("prompt"), timeZone: string("timeZone"),
+        maxDelayMinutes: Number(string("maxDelayMinutes")), catchUpMinutes: Number(string("catchUpMinutes")),
+        ...(string("cron").trim() ? { cron: string("cron") } : {}), ...(string("at").trim() ? { at: string("at") } : {}) };
+      const updated = job ? this.store.schedules.edit(job.id, job.revision, input)
+        : this.createSchedule(input, String(action.value.sessionId ?? ""), action.contextKey, replyTarget?.messageId);
+      return this.showSchedule(updated, messageId);
+    }
+    if (!job) throw new Error("计划不存在。");
+    if (operation === "run") {
+      await this.controlSchedule({ operation: "run", id: job.id });
+      return this.showSchedule(this.store.schedules.require(job.id), messageId, true);
+    }
+    if (!["confirm", "pause", "resume", "delete"].includes(operation)) throw new Error("无效的定时任务操作。");
+    if (operation === "confirm" || operation === "resume") this.assertScheduleTarget(job);
+    const updated = this.store.schedules.change(job.id, job.revision, operation as "confirm" | "pause" | "resume" | "delete");
+    await this.showSchedule(updated, messageId);
+  }
+
   async controlQueueTaskPrompt(localSessionId: string, text: string): Promise<{ promptId: string; queued: number }> {
     const promptText = text.trim();
     if (!promptText) throw new Error("The queued Prompt cannot be empty.");
@@ -2079,6 +2214,27 @@ export class ProxySessionController {
       throw new Error(unboundThreadTaskMessage());
     }
     switch (command.type) {
+      case "schedule": {
+        if (!this.config.feishu.userOpenId || userId !== this.config.feishu.userOpenId) throw new Error("只有 Agent Bot 所有者可以管理定时任务。");
+        if (command.command.operation === "list") {
+          await this.showScheduleList(contextKey);
+          return;
+        }
+        if (command.command.operation === "add") {
+          const session = this.requireCurrentSession(contextKey);
+          const job = this.createSchedule(command.command.input!, session.localSessionId, contextKey, replyTarget?.messageId);
+          await this.showSchedule(job);
+          return;
+        }
+        const job = ["show", "history"].includes(command.command.operation)
+          ? this.store.schedules.get(command.command.id ?? "") : this.store.schedules.require(command.command.id ?? "");
+        if (!job) throw new Error("计划不存在。");
+        if (job.contextKey !== contextKey || job.ownerId !== userId) throw new Error("此会话无权操作该计划。");
+        await this.controlSchedule(command.command);
+        if (command.command.operation === "edit") return;
+        await this.showSchedule(this.store.schedules.get(job.id)!, undefined, command.command.operation === "history");
+        return;
+      }
       case "shell":
         await this.runShellCommand(contextKey, command.command, messageId, incomingMessage);
         return;
@@ -2403,6 +2559,8 @@ export class ProxySessionController {
       const persistedTurnId = latest?.turnId;
       const pendingTurnId = persistedTurnId?.startsWith("pending_") ? persistedTurnId : undefined;
       const turnId = pendingTurnId ? undefined : persistedTurnId ?? session.lastTurnId;
+      if (persistedTurnId && this.store.schedules.ownsTurn(persistedTurnId)) continue;
+      if (turnId && this.store.schedules.ownsTurn(turnId)) continue;
       const replyTarget = snapshot?.replyTarget?.replyInThread ? snapshot.replyTarget : undefined;
       this.store.createTurnAttempt({
         attemptId: createId("attempt"),
@@ -2525,6 +2683,12 @@ export class ProxySessionController {
       this.store.updateTurnAttempt(attempt.attemptId, { status: "interrupted" });
       return;
     }
+    const scheduledRun = this.store.schedules.getRun(attempt.attemptId);
+    if (scheduledRun?.status === "unknown"
+      || (scheduledRun && !attempt.turnId && ["cancelled", "expired", "failed", "skipped", "completed"].includes(scheduledRun.status))) {
+      this.store.updateTurnAttempt(attempt.attemptId, { status: scheduledRun.status === "cancelled" ? "cancelled" : "interrupted" });
+      return;
+    }
     const contextKey = attempt.contextKey || session.contextKey;
     const replyTarget = attempt.replyMessageId
       ? { messageId: attempt.replyMessageId, replyInThread: true as const }
@@ -2552,6 +2716,10 @@ export class ProxySessionController {
 
     const runtime = this.runtimes.forAgent(session.agentName);
     const sourceTurnId = attempt.turnId;
+    if (this.store.schedules.getRun(attempt.attemptId) && (!sourceTurnId || runtime.kind === "acp")) {
+      await this.markScheduledAttemptUnknown(attempt, "重启后无法确认本次运行状态，未自动重发。请核实执行记录。");
+      return;
+    }
     if (runtime.kind === "acp") {
       await this.continueInterruptedAttempt(attempt, session, sourceTurnId, replyTarget);
       return;
@@ -2589,7 +2757,22 @@ export class ProxySessionController {
       this.scheduleRecoveryRetry(attempt.attemptId);
       return;
     }
+    if (this.store.schedules.getRun(attempt.attemptId)) {
+      await this.markScheduledAttemptUnknown(attempt, "原轮次状态待核实，未自动重发。请核实执行记录。");
+      return;
+    }
     await this.continueInterruptedAttempt(attempt, session, sourceTurnId, replyTarget);
+  }
+
+  private async markScheduledAttemptUnknown(attempt: TurnAttemptRecord, detail: string): Promise<void> {
+    this.store.updateTurnAttempt(attempt.attemptId, { status: "interrupted" });
+    this.store.schedules.finish(attempt.attemptId, "unknown", detail);
+    const run = this.store.schedules.getRun(attempt.attemptId)!;
+    const job = this.store.schedules.get(run.jobId);
+    if (attempt.pendingTurnId) {
+      await this.outbound.interruptTurnForRecovery(attempt.localSessionId, attempt.contextKey, attempt.pendingTurnId, detail);
+    }
+    if (job) await this.notifySchedule(job, `定时任务「${job.spec.name}」：${detail}`);
   }
 
   private async reconcileRecoveredRemoteTurn(
@@ -4068,6 +4251,15 @@ export class ProxySessionController {
             localImagePaths,
           );
         } catch (error) {
+          if (options.scheduleRunId) {
+            const run = this.store.schedules.getRun(options.scheduleRunId)!;
+            const job = this.store.schedules.get(run.jobId);
+            if (job?.status === "enabled") {
+              const paused = this.store.schedules.change(job.id, job.revision, "pause");
+              this.store.schedules.update({ ...paused, notice: "原会话的思考卡片创建失败，计划已暂停。请修复后恢复。" });
+            }
+            this.store.schedules.finish(run.id, "failed", "无法创建原会话的思考卡片，未提交模型。");
+          }
           this.store.updateTurnAttempt(attemptId, {
             status: options.preserveAttemptOnFailure ? "recovering" : "failed",
           });
@@ -4088,6 +4280,13 @@ export class ProxySessionController {
             }
             turnId = await loaded.runtime.recoverResponseContinuation(loaded.record.localSessionId, options.responseContinuationTurnId, recovery.abort.signal);
           } else {
+            if (options.scheduleRunId) {
+              const run = this.store.schedules.getRun(options.scheduleRunId);
+              if ((!options.approvedPlanTurnId && !this.store.schedules.canSubmit(options.scheduleRunId))
+                || this.lifecycle?.canStartScheduledTasks?.() === false) throw new Error("定时任务已取消、过期或正在安全重启。");
+              this.assertScheduleTarget(this.store.schedules.require(run!.jobId));
+              this.store.schedules.saveRun({ ...run!, status: "submitting" });
+            }
             turnId = await loaded.runtime.startTurn(
               loaded.record.localSessionId,
               options.approvedPlanTurnId
@@ -4099,7 +4298,13 @@ export class ProxySessionController {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const attempt = this.store.getTurnAttempt(attemptId);
+          if (options.scheduleRunId && attempt?.turnId && attempt.turnId !== options.approvedPlanTurnId) {
+            turnId = attempt.turnId;
+            if (isIncompleteTurnAttemptStatus(attempt.status)) this.store.updateTurnAttempt(attemptId, { status: "running" });
+            break;
+          }
           const retryAttempt = attempt
+            && !options.scheduleRunId
             && !options.responseContinuationTurnId
             && isRetryableLlmTurnFailure(message)
             && attempt.retryCount < MAX_LLM_TURN_RETRIES
@@ -4156,6 +4361,13 @@ export class ProxySessionController {
     if (!alreadyTerminal) {
       this.store.updateSession(loaded.record.localSessionId, { status: "running" });
       this.store.updateRuntimeSession(loaded.record.localSessionId, { lastTurnId: turnId, lastTurnStatus: "running" });
+    }
+    if (options.scheduleRunId) {
+      const run = this.store.schedules.getRun(options.scheduleRunId)!;
+      const completedAttempt = this.store.getTurnAttempt(attemptId);
+      const status = completedAttempt?.status;
+      this.store.schedules.saveRun({ ...run, turnId,
+        status: status === "completed" || status === "failed" || status === "cancelled" ? status : "running" });
     }
     return turnId;
   }
@@ -4811,6 +5023,8 @@ export class ProxySessionController {
       }
       if (event.type === "turn_started") {
         const attempt = this.store.bindTurnAttempt(event.sessionId, event.turnId);
+        const scheduledRun = attempt ? this.store.schedules.getRun(attempt.attemptId) : undefined;
+        if (scheduledRun) this.store.schedules.saveRun({ ...scheduledRun, status: "running", turnId: event.turnId });
         if (attempt?.recoveredFromTurnId && attempt.recoveredFromTurnId !== event.turnId) {
           this.store.rebindPendingTurnMessages(event.sessionId, attempt.recoveredFromTurnId, event.turnId);
         }
@@ -4849,7 +5063,7 @@ export class ProxySessionController {
           return;
         }
       }
-      if (failedAttempt && !this.responseContinuations.has(event.sessionId)
+      if (failedAttempt && !this.store.schedules.getRun(failedAttempt.attemptId) && !this.responseContinuations.has(event.sessionId)
         && isRetryableLlmTurnFailure(event.message) && failedAttempt.retryCount < MAX_LLM_TURN_RETRIES) {
         const retryAttempt = this.store.prepareTurnAttemptRetry(failedAttempt.attemptId, event.turnId);
         if (retryAttempt) {
@@ -4944,7 +5158,12 @@ export class ProxySessionController {
     const source = this.store.getSession(sessionId);
     if (!source || source.status === "closed" || source.lastTurnId !== turnId) return;
     this.planHandoffs.set(sessionId, turnId);
+    const scheduledRun = this.store.schedules.getRun(attempt.attemptId);
     this.store.markTurnAttemptTerminal(turnId, "completed");
+    if (scheduledRun) {
+      this.store.schedules.saveRun({ ...scheduledRun, status: "running" });
+      this.store.updateTurnAttempt(attempt.attemptId, { status: "recovering" });
+    }
     this.store.updateRuntimeSession(sessionId, { lastTurnId: turnId, lastTurnStatus: "completed" });
     let continued = false;
     let failed = false;
@@ -4973,7 +5192,8 @@ export class ProxySessionController {
             "The proposed plan has been approved. Continue in the current task and workspace without asking for plan approval again; preserve the existing conversation and completed work. Implement the plan unless the user explicitly requested discussion or planning only, or prohibited implementation; those constraints still apply.",
             attempt.replyMessageId ? { messageId: attempt.replyMessageId, replyInThread: true } : undefined,
             undefined,
-            { messageId: attempt.messageId, displayPrompt: "方案已确认，继续执行", approvedPlanTurnId: turnId },
+            { messageId: attempt.messageId, displayPrompt: "方案已确认，继续执行", approvedPlanTurnId: turnId,
+              ...(scheduledRun ? { attemptId: attempt.attemptId, scheduleRunId: attempt.attemptId } : {}) },
           );
         }
         continued = true;
@@ -4993,6 +5213,10 @@ export class ProxySessionController {
     } finally {
       if (this.planHandoffs.get(sessionId) === turnId) this.planHandoffs.delete(sessionId);
       if (!continued) {
+        if (scheduledRun) {
+          this.store.updateTurnAttempt(attempt.attemptId, { status: failed ? "failed" : "cancelled" });
+          this.store.schedules.finish(attempt.attemptId, failed ? "failed" : "cancelled");
+        }
         try {
           await this.outbound.onEvent(failed
             ? { type: "turn_failed", sessionId, turnId, message: "方案已确认，但后续执行未能启动。" }
@@ -5139,6 +5363,9 @@ export class ProxySessionController {
   private async startNextQueuedPromptIfIdleNow(sessionId: string): Promise<void> {
     if (this.planHandoffs.has(sessionId) || this.sessionResets.has(sessionId)) return;
     if (this.store.countQueuedPrompts(sessionId) === 0) return;
+    const queuedHead = this.store.peekQueuedPrompt(sessionId);
+    if (queuedHead && this.store.schedules.getRun(queuedHead.promptId)
+      && this.lifecycle?.canStartScheduledTasks?.() === false) return;
     const baseRecord = this.store.getSession(sessionId);
     if (!baseRecord || baseRecord.status === "closed") return;
     let prompt: QueuedPromptRecord | undefined;
@@ -5154,18 +5381,44 @@ export class ProxySessionController {
       if (this.store.getPendingProviderSettings(sessionId)) return;
       prompt = this.store.takeNextQueuedPrompt(sessionId);
       if (!prompt) return;
+      const scheduledRun = this.store.schedules.getRun(prompt.promptId);
       const record = this.store.getSessionForContext(sessionId, prompt.contextKey) ?? baseRecord;
       loaded = { ...loaded, record };
       await this.refreshPromptQueueCards(sessionId);
+      if (scheduledRun) {
+        if (!this.store.schedules.canSubmit(scheduledRun.id)
+          || this.lifecycle?.canStartScheduledTasks?.() === false) throw new Error("定时任务已取消、过期或正在安全重启。");
+        const job = this.store.schedules.require(scheduledRun.jobId);
+        this.assertScheduleTarget(job);
+        try {
+          await this.notifySchedule(job, prompt.text);
+        } catch (error) {
+          const currentJob = this.store.schedules.get(job.id);
+          if (currentJob?.status === "enabled") {
+            const paused = this.store.schedules.change(job.id, currentJob.revision, "pause");
+            this.store.schedules.update({ ...paused, notice: "原会话的 Prompt 发送失败，计划已暂停。请修复后恢复。" });
+          }
+          this.store.schedules.finish(scheduledRun.id, "failed", "无法向原会话发送 Prompt，未提交模型。");
+          this.store.updateTurnAttempt(scheduledRun.id, { status: "failed" });
+          throw error;
+        }
+      }
       const turnId = await this.startTurnNow(
         loaded,
         prompt.text,
         prompt.replyMessageId ? { messageId: prompt.replyMessageId, replyInThread: true } : undefined,
         prompt.localImagePaths,
-        { messageId: prompt.messageId, displayPrompt: prompt.displayPrompt },
+        { messageId: prompt.messageId, displayPrompt: prompt.displayPrompt,
+          ...(scheduledRun ? { attemptId: prompt.promptId, scheduleRunId: prompt.promptId } : {}) },
       );
       if (prompt.messageId) await this.bindMessageReactionToTurn(prompt.messageId, sessionId, turnId);
     } catch (error) {
+      if (prompt) {
+        const run = this.store.schedules.getRun(prompt.promptId);
+        if (run && ["dispatching", "submitting"].includes(run.status)) {
+          this.store.schedules.finish(run.id, run.status === "submitting" ? "unknown" : "failed", runtimeErrorMessage(error));
+        }
+      }
       this.logger.warn(
         {
           error,

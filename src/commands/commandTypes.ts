@@ -1,4 +1,5 @@
 export type Command =
+  | { type: "schedule"; command: import("../scheduling/types.js").ScheduleCommand }
   | { type: "shell"; command: string }
   | { type: "new"; title?: string; cwd?: string; projectless?: boolean; agentName?: string }
   | { type: "newgroup"; title?: string; cwd?: string; projectless?: boolean; agentName?: string }

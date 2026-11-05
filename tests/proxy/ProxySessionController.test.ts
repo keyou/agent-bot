@@ -27,6 +27,7 @@ import type {
   ShellCommandJobSnapshot,
 } from "../../src/shell/ShellCommandJobManager.js";
 import { StateStore } from "../../src/state/StateStore.js";
+import type { ScheduledJob } from "../../src/scheduling/types.js";
 import type {
   ShellCommandOptions,
   ShellCommandResult,
@@ -588,6 +589,7 @@ function fixture(
   } as unknown as AppConfig;
   const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } as unknown as Logger;
   const restart = vi.fn(async () => undefined);
+  const canStartScheduledTasks = vi.fn(() => true);
   const cancelSafeRestart = vi.fn(async () => true);
   const forceSafeRestart = vi.fn(async () => true);
   const terminalUrl = vi.fn((id: string) => `https://terminal.example/open/${id}/signature`);
@@ -618,6 +620,7 @@ function fixture(
     logger,
     {
       restart,
+      canStartScheduledTasks,
       supervised: true,
       cancelSafeRestart,
       forceSafeRestart,
@@ -668,8 +671,285 @@ function fixture(
     windowsDriveLister,
     threadWriterProcesses,
     config,
+    canStartScheduledTasks,
   };
 }
+
+describe("scheduled prompt integration", () => {
+  async function scheduledFixture() {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    await f.controller.onMessage(message("/new Scheduled target"));
+    const id = f.store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId!;
+    const draft = await f.controller.controlSchedule({ operation: "add", input: {
+      name: "检查", prompt: "scheduled prompt", cron: "0 9 * * *", timeZone: "Asia/Singapore",
+    } }, id) as ScheduledJob;
+    await f.controller.onCardAction({ actionId: "confirm-schedule", contextKey: draft.contextKey, messageId: "schedule-card", userId: "ou_owner",
+      value: { action: "schedule_confirm", scheduleId: draft.id, revision: String(draft.revision) } });
+    return { ...f, id, job: f.store.schedules.get(draft.id)! };
+  }
+
+  test("an explicitly confirmed scheduled prompt starts exactly once through the normal queue", async () => {
+    const f = await scheduledFixture();
+    vi.mocked(f.outbound.sendText).mockClear();
+    expect(f.job.status).toBe("enabled");
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(f.id);
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.runtime.startTurn).toHaveBeenCalledExactlyOnceWith(f.id, "scheduled prompt");
+    expect(f.outbound.sendText).toHaveBeenCalledExactlyOnceWith(f.job.contextKey, "scheduled prompt");
+    expect(f.outbound.sendText).toHaveBeenCalledBefore(vi.mocked(f.presenter.startPendingTurn!));
+    expect(f.presenter.startPendingTurn).toHaveBeenCalledBefore(vi.mocked(f.runtime.startTurn));
+    expect(f.runtime.steerTurn).not.toHaveBeenCalled();
+    expect(f.store.schedules.getRun(run.id)).toMatchObject({ status: "running", turnId: "turn_1" });
+    expect(f.store.getTurnAttempt(run.id)).toMatchObject({ turnId: "turn_1", status: "running" });
+    expect(f.store.getOrCreateUserContext(f.job.contextKey, "codex").currentSessionId).toBe(f.id);
+    expect(f.runtime.forkSession).not.toHaveBeenCalled();
+  });
+
+  test("the thinking card and model wait until the scheduled prompt has been posted", async () => {
+    const f = await scheduledFixture();
+    let release!: () => void;
+    vi.mocked(f.outbound.sendText).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { release = resolve; }); return "prompt-message";
+    });
+    f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true });
+    const starting = f.controller.drainScheduledPrompts(f.id);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    expect(f.presenter.startPendingTurn).not.toHaveBeenCalled();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    release(); await starting;
+    expect(f.presenter.startPendingTurn).toHaveBeenCalledTimes(1);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failed scheduled prompt delivery pauses the plan without creating a card or submitting work", async () => {
+    const f = await scheduledFixture();
+    vi.mocked(f.outbound.sendText).mockRejectedValueOnce(new Error("prompt delivery failed"));
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.presenter.startPendingTurn).not.toHaveBeenCalled();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.schedules.getRun(run.id)).toMatchObject({ status: "failed", detail: expect.stringContaining("Prompt") });
+    expect(f.store.getTurnAttempt(run.id)?.status).toBe("failed");
+    expect(f.store.schedules.get(f.job.id)?.status).toBe("paused");
+  });
+
+  test("busy targets queue a separate prompt without steering or replacing the task", async () => {
+    const f = await scheduledFixture();
+    await f.controller.onMessage(message("ordinary work"));
+    await f.controller.controlSchedule({ operation: "run", id: f.job.id });
+    expect(f.store.countQueuedPrompts(f.id)).toBe(1);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.runtime.steerTurn).not.toHaveBeenCalled();
+    expect(f.outbound.sendText).not.toHaveBeenCalledWith(f.job.contextKey, "scheduled prompt");
+    f.sessions.get(f.id)!.activeTurnId = undefined;
+    Object.assign(f.remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.outbound.sendText).toHaveBeenCalledWith(f.job.contextKey, "scheduled prompt");
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(2);
+  });
+
+  test("pause while the thinking card is being prepared prevents model submission", async () => {
+    const f = await scheduledFixture();
+    let release!: () => void;
+    vi.mocked(f.presenter.startPendingTurn).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { release = resolve; }); return "pending";
+    });
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    const starting = f.controller.drainScheduledPrompts(f.id);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    await f.controller.controlSchedule({ operation: "pause", id: f.job.id });
+    release(); await starting;
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("cancelled");
+  });
+
+  test("expiry during card preparation is checked again immediately before submission", async () => {
+    const f = await scheduledFixture();
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    let release!: () => void;
+    vi.mocked(f.presenter.startPendingTurn).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { release = resolve; }); return "pending";
+    });
+    const run = f.store.schedules.dispatch(f.job, now, now, { manual: true })!;
+    const starting = f.controller.drainScheduledPrompts(f.id);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    clock.mockReturnValue(now + 61 * 60_000);
+    release(); await starting;
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("expired");
+  });
+
+  test("safe restart blocks scheduled dispatch without dropping its queue entry", async () => {
+    const f = await scheduledFixture();
+    f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true });
+    f.canStartScheduledTasks.mockReturnValue(false);
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.countQueuedPrompts(f.id)).toBe(1);
+    f.canStartScheduledTasks.mockReturnValue(true);
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+  });
+
+  test("ambiguous submission failures do not automatically replay and remain blocked for verification", async () => {
+    const f = await scheduledFixture();
+    vi.mocked(f.runtime.startTurn).mockRejectedValue(new Error("stream disconnected before completion"));
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("unknown");
+    await f.controller.recoverInterruptedTasks();
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(f.outbound.sendText).mock.calls.filter(([, text]) => text === "scheduled prompt")).toHaveLength(1);
+  });
+
+  test("startup recovery never replays an unconfirmed scheduled submission", async () => {
+    const f = await scheduledFixture();
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    f.store.takeNextQueuedPrompt(f.id);
+    await f.controller.recoverInterruptedTasks();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.outbound.sendText).not.toHaveBeenCalledWith(f.job.contextKey, "scheduled prompt");
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("unknown");
+  });
+
+  test("cancelled preparation remains cancelled after restart rather than becoming an unknown run", async () => {
+    const f = await scheduledFixture();
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    f.store.takeNextQueuedPrompt(f.id);
+    await f.controller.controlSchedule({ operation: "pause", id: f.job.id });
+    await f.controller.recoverInterruptedTasks();
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("cancelled");
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("a known started turn is retained when the start response is lost", async () => {
+    const f = await scheduledFixture();
+    const original = vi.mocked(f.runtime.startTurn).getMockImplementation()!;
+    vi.mocked(f.runtime.startTurn).mockImplementationOnce(async (...args) => {
+      await original(...args); throw new Error("stream disconnected before completion");
+    });
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.store.schedules.getRun(run.id)).toMatchObject({ status: "running", turnId: "turn_1" });
+    expect(f.store.getTurnAttempt(run.id)?.status).toBe("running");
+  });
+
+  test("a failed thinking-card delivery pauses future occurrences without submitting a model request", async () => {
+    const f = await scheduledFixture();
+    vi.mocked(f.presenter.startPendingTurn).mockRejectedValueOnce(new Error("chat unavailable"));
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("failed");
+    expect(f.store.schedules.get(f.job.id)?.status).toBe("paused");
+  });
+
+  test("only the configured owner can activate a draft", async () => {
+    const f = await scheduledFixture();
+    const draft = f.store.schedules.create({ prompt: "other", cron: "* * * * *" }, {
+      localSessionId: f.id, contextKey: f.job.contextKey, ownerId: "ou_owner",
+    });
+    await f.controller.onCardAction({ actionId: "forbidden", contextKey: draft.contextKey, messageId: "card", userId: "ou_other",
+      value: { action: "schedule_confirm", scheduleId: draft.id, revision: String(draft.revision) } });
+    expect(f.store.schedules.get(draft.id)?.status).toBe("draft");
+  });
+
+  test("deleted plans retain readable run history but cannot execute again", async () => {
+    const f = await scheduledFixture();
+    f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true });
+    await f.controller.controlSchedule({ operation: "delete", id: f.job.id });
+    expect(await f.controller.controlSchedule({ operation: "show", id: f.job.id })).toMatchObject({ status: "deleted" });
+    expect(await f.controller.controlSchedule({ operation: "history", id: f.job.id })).toEqual([expect.objectContaining({ status: "cancelled" })]);
+    await expect(f.controller.controlSchedule({ operation: "run", id: f.job.id })).rejects.toThrow("已删除");
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("editing by slash command sends only one replacement confirmation card", async () => {
+    const f = await scheduledFixture();
+    vi.mocked(f.outbound.sendInteractiveCard).mockClear();
+    await f.controller.onMessage({ ...message(`/schedule edit ${f.job.id} --cron "0 10 * * *" --prompt updated`), userId: "ou_owner" });
+    expect(f.outbound.sendInteractiveCard).toHaveBeenCalledTimes(1);
+    expect(f.store.schedules.get(f.job.id)).toMatchObject({ status: "draft", spec: { prompt: "updated" } });
+  });
+
+  test("schedule navigation updates the same card while separating history from plan editing", async () => {
+    const f = await scheduledFixture();
+    const action = { contextKey: f.job.contextKey, messageId: "schedule-card", userId: "ou_owner" };
+    await f.controller.onCardAction({ ...action, actionId: "open-history", value: {
+      action: "schedule_history", scheduleId: f.job.id,
+    } });
+    expect(f.outbound.updateInteractiveCard).toHaveBeenLastCalledWith("schedule-card", expect.any(Object));
+    const history = JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard!).mock.calls.at(-1)?.[1]);
+    expect(history).toContain("暂无执行记录");
+    expect(history).not.toContain('"action":"schedule_edit"');
+    await f.controller.onCardAction({ ...action, actionId: "open-plan", value: {
+      action: "schedule_show", scheduleId: f.job.id,
+    } });
+    expect(f.outbound.updateInteractiveCard).toHaveBeenLastCalledWith("schedule-card", expect.any(Object));
+    const detail = JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard!).mock.calls.at(-1)?.[1]);
+    expect(detail).toContain('"action":"schedule_edit"');
+    expect(detail).toContain("scheduled prompt");
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("approved-plan continuation remains part of one scheduled run", async () => {
+    const f = await scheduledFixture();
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(f.id);
+    f.sessions.get(f.id)!.activeTurnId = undefined;
+    Object.assign(f.remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+    vi.mocked(f.runtime.startTurn).mockImplementationOnce(async (sessionId) => {
+      f.sessions.get(sessionId)!.activeTurnId = "implementation";
+      Object.assign(f.remoteSessions[0]!, { status: "active", lastTurnId: "implementation", lastTurnStatus: "inProgress" });
+      for (const listener of f.listeners) listener({ type: "turn_started", sessionId, turnId: "implementation", startedAt: Date.now() });
+      return "implementation";
+    });
+    for (const listener of f.listeners) listener({ type: "turn_completed", sessionId: f.id, turnId: "turn_1", finalResponse: "", approvedPlan: true });
+    await vi.waitFor(() => expect(f.store.schedules.getRun(run.id)).toMatchObject({ status: "running", turnId: "implementation" }));
+    expect(f.store.schedules.runs(f.job.id)).toHaveLength(1);
+    expect(f.store.getTurnAttempt(run.id)).toMatchObject({ status: "running", turnId: "implementation" });
+    expect(vi.mocked(f.outbound.sendText).mock.calls.filter(([, text]) => text === "scheduled prompt")).toHaveLength(1);
+  });
+
+  test("form submission keeps the chosen target even if the current task changed", async () => {
+    const f = await scheduledFixture();
+    await f.controller.onMessage({ ...message("/new Replacement current"), messageId: "replacement-task" });
+    await f.controller.onCardAction({ actionId: "schedule-form", contextKey: f.job.contextKey, messageId: "form-card", userId: "ou_owner",
+      value: { action: "schedule_submit", sessionId: f.id, formValue: {
+        name: "表单计划", prompt: "form prompt", cron: "0 10 * * *", at: "", timeZone: "Asia/Singapore",
+        maxDelayMinutes: "10", catchUpMinutes: "0",
+      } } });
+    const job = f.store.schedules.list(f.job.contextKey)[0]!;
+    expect(job).toMatchObject({ localSessionId: f.id, status: "draft", spec: { name: "表单计划", prompt: "form prompt" } });
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("topic schedules retain their original anchor after the current task changes", async () => {
+    const f = fixture(); f.config.feishu.userOpenId = "ou_owner";
+    const topic = threadMessage("c1", "group", "topic1", "root", "/new Topic target");
+    await f.controller.onMessage(topic);
+    const id = f.store.getOrCreateUserContext(topic.contextKey, "codex").currentSessionId!;
+    await f.controller.onMessage({ ...topic, messageId: "schedule-topic", userId: "ou_owner",
+      text: '/schedule add --cron "0 9 * * *" --prompt "topic check"' });
+    const draft = f.store.schedules.list(topic.contextKey)[0]!;
+    const job = f.store.schedules.change(draft.id, draft.revision, "confirm");
+    await f.controller.onMessage({ ...topic, messageId: "new-current", text: "/new Other topic task" });
+    const run = f.store.schedules.dispatch(job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(id);
+    expect(f.outbound.replyText).toHaveBeenCalledWith(topic.contextKey,
+      { messageId: "schedule-topic", replyInThread: true }, "topic check");
+    expect(f.outbound.replyText).toHaveBeenCalledBefore(vi.mocked(f.presenter.startPendingTurn!));
+    expect(f.presenter.startPendingTurn).toHaveBeenLastCalledWith(id, topic.contextKey, expect.any(String),
+      { messageId: "schedule-topic", replyInThread: true }, expect.stringContaining("topic check"));
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("running");
+    expect(f.store.getOrCreateUserContext(topic.contextKey, "codex").currentSessionId).not.toBe(id);
+  });
+});
 
 describe("delayed inbound message diagnostics", () => {
   test.each([
@@ -12524,6 +12804,7 @@ describe("ProxySessionController", () => {
       "/clonegroup",
       "/turns",
       "/sessions",
+      "/schedule",
       "/archive",
       "/dismiss",
       "/switch",

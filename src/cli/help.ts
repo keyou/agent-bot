@@ -20,6 +20,12 @@ export function renderCliHelp(version: string, language: CliLanguage = cliLangua
   server stop                       停止 Agent Bot
   skills status                     显示内置 Skill 状态
   skills install                    安装内置 Skill
+  schedule list                     列出定时计划（JSON）
+  schedule add --task <任务> --cron "0 9 * * 1-5" --prompt "检查构建"  创建待确认计划
+  schedule add --task <任务> --at <ISO时间> --prompt <提示词>          创建一次性计划
+  schedule edit <计划> <参数>        修改计划并重新确认；参数与 add 相同
+  schedule show|history <计划>       查看计划或最近运行记录
+  schedule pause|resume|run|delete <计划>  暂停、恢复、立即执行或删除
 
 任务命令：
   task list                         列出任务；支持 --search，sessions 是别名
@@ -115,6 +121,12 @@ Common commands:
   server stop                       Stop Agent Bot
   skills status                     Show the built-in Skill status
   skills install                    Install the built-in Skill
+  schedule list                     List scheduled jobs as JSON
+  schedule add --task <task> --cron "0 9 * * 1-5" --prompt "Check build"  Create a draft
+  schedule add --task <task> --at <ISO-time> --prompt <prompt>           Schedule once
+  schedule edit <id> <options>       Edit a draft; same options as add
+  schedule show|history <id>         Inspect a plan or its recent runs
+  schedule pause|resume|run|delete <id>  Manage a scheduled job
 
 Task commands:
   task list                         List tasks; supports --search; sessions is an alias

@@ -4,6 +4,7 @@ import { compactTurnView } from "../presentation/TurnStateReducer.js";
 import type { TurnViewState } from "../presentation/turnViewTypes.js";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { ScheduledTaskStore } from "../scheduling/ScheduledTaskStore.js";
 import { migrations } from "./migrations.js";
 import type { UpdateCheckSchedule, UpdateNotice } from "../updates/types.js";
 import type { ConversationTurn, RuntimeExecutionSettings } from "../runtime/types.js";
@@ -19,6 +20,17 @@ export interface PendingProviderSettings {
 }
 
 export type SessionStatus = "starting" | "ready" | "running" | "closed" | "failed";
+
+// Scheduled queue entries survive a safe restart, but an in-flight submission must block it.
+const RESTART_BLOCKING_WORK_SQL = `sessions.status = 'running'
+  OR EXISTS (
+    SELECT 1 FROM queued_prompts q WHERE q.local_session_id = sessions.local_session_id
+    AND NOT EXISTS (SELECT 1 FROM scheduled_runs r WHERE r.id = q.prompt_id)
+  )
+  OR EXISTS (
+    SELECT 1 FROM scheduled_jobs j JOIN scheduled_runs r ON r.job_id = j.id
+    WHERE j.local_session_id = sessions.local_session_id AND r.status IN ('dispatching','submitting','running')
+  )`;
 
 export interface UserContextRecord {
   contextKey: string;
@@ -274,6 +286,7 @@ interface TurnAttemptRow {
 export class StateStore {
   private readonly db: Database.Database;
   readonly previews: TurnPreviewJournal;
+  readonly schedules: ScheduledTaskStore;
 
   constructor(sqlitePath: string, onPreviewError?: (error: unknown) => void) {
     this.previews = new TurnPreviewJournal(path.join(path.dirname(sqlitePath), "turn-previews"), onPreviewError);
@@ -290,6 +303,7 @@ export class StateStore {
     this.ensureChatContextColumns();
     this.ensureTurnAttemptColumns();
     this.ensureQueuedPromptColumns();
+    this.schedules = new ScheduledTaskStore(this.db);
     this.initializeContextSessionMappings();
     this.db.exec("DROP INDEX IF EXISTS idx_sessions_remote_session_id_unique");
     this.reconcileDuplicateRemoteSessions();
@@ -619,6 +633,16 @@ export class StateStore {
     return rows.map(mapQueuedPrompt);
   }
 
+  hasQueuedPrompt(promptId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM queued_prompts WHERE prompt_id = ?").get(promptId));
+  }
+
+  peekQueuedPrompt(localSessionId: string): QueuedPromptRecord | undefined {
+    const row = this.db.prepare(`SELECT * FROM queued_prompts WHERE local_session_id = ?
+      ORDER BY created_at ASC, rowid ASC LIMIT 1`).get(localSessionId) as QueuedPromptRow | undefined;
+    return row ? mapQueuedPrompt(row) : undefined;
+  }
+
   listQueuedPromptSessionIds(): string[] {
     const rows = this.db.prepare(`
       SELECT local_session_id, min(created_at) AS first_created_at, min(rowid) AS first_rowid
@@ -638,15 +662,22 @@ export class StateStore {
 
   takeNextQueuedPrompt(localSessionId: string): QueuedPromptRecord | undefined {
     const take = this.db.transaction(() => {
-      const row = this.db.prepare(`
-        SELECT * FROM queued_prompts
-        WHERE local_session_id = ?
-        ORDER BY created_at ASC, rowid ASC
-        LIMIT 1
-      `).get(localSessionId) as QueuedPromptRow | undefined;
-      if (!row) return undefined;
-      this.db.prepare("DELETE FROM queued_prompts WHERE prompt_id = ?").run(row.prompt_id);
-      return mapQueuedPrompt(row);
+      while (true) {
+        const row = this.db.prepare(`
+          SELECT * FROM queued_prompts
+          WHERE local_session_id = ?
+          ORDER BY created_at ASC, rowid ASC
+          LIMIT 1
+        `).get(localSessionId) as QueuedPromptRow | undefined;
+        if (!row) return undefined;
+        this.db.prepare("DELETE FROM queued_prompts WHERE prompt_id = ?").run(row.prompt_id);
+        if (!this.schedules.claimStart(row.prompt_id)) continue;
+        if (this.schedules.getRun(row.prompt_id)) {
+          this.createTurnAttempt({ attemptId: row.prompt_id, localSessionId, contextKey: row.context_key,
+            promptText: row.prompt_text, replyMessageId: row.reply_message_id ?? undefined });
+        }
+        return mapQueuedPrompt(row);
+      }
     });
     return take();
   }
@@ -658,6 +689,8 @@ export class StateStore {
       `).get(promptId, localSessionId) as QueuedPromptRow | undefined;
       if (!row) return undefined;
       this.db.prepare("DELETE FROM queued_prompts WHERE prompt_id = ?").run(promptId);
+      const scheduled = this.schedules.getRun(promptId);
+      if (scheduled?.status === "queued") this.schedules.finish(promptId, "cancelled", "已取消排队。");
       return mapQueuedPrompt(row);
     });
     return cancel();
@@ -801,6 +834,9 @@ export class StateStore {
       SET status = ?, updated_at = ?
       WHERE turn_id = ?
     `).run(status, new Date().toISOString(), turnId);
+    const runs = this.db.prepare(`SELECT s.id FROM scheduled_runs s JOIN turn_attempts t ON t.attempt_id = s.id
+      WHERE t.turn_id = ?`).all(turnId) as Array<{ id: string }>;
+    for (const run of runs) this.schedules.finish(run.id, status);
   }
 
   findIncompleteTurnAttemptByTurnId(turnId: string): TurnAttemptRecord | undefined {
@@ -1857,10 +1893,7 @@ export class StateStore {
       .prepare(`
         SELECT COUNT(*) AS count
         FROM sessions
-        WHERE status = 'running'
-           OR EXISTS (
-             SELECT 1 FROM queued_prompts WHERE queued_prompts.local_session_id = sessions.local_session_id
-           )
+        WHERE ${RESTART_BLOCKING_WORK_SQL}
       `)
       .get() as { count: number };
     const pending = this.db.prepare(`
@@ -1880,6 +1913,11 @@ export class StateStore {
       pendingFinalDeliveries: pending.count,
       latestInboundAt: inbound.latest ?? undefined,
     };
+  }
+
+  sessionBlocksSafeRestart(localSessionId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM sessions WHERE local_session_id = ? AND (${RESTART_BLOCKING_WORK_SQL})`)
+      .get(localSessionId));
   }
 
   findSessionByRemoteSessionId(
