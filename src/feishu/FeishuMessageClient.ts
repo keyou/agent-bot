@@ -5,7 +5,7 @@ import type { Logger } from "pino";
 import { defaultSqlitePath } from "../config/paths.js";
 import type { AppConfig } from "../config/schema.js";
 import { normalizeFeishuMarkdown } from "./FeishuMarkdown.js";
-import { LOCAL_CARD_IMAGE_PATH } from "./LocalCardImage.js";
+import { LOCAL_CARD_IMAGE_PATH, LOCAL_CARD_MARKDOWN_IMAGES } from "./LocalCardImage.js";
 import { renderMarkdownWithLocalImages } from "./LocalImageMarkdown.js";
 import { splitFinalResponseBranding } from "./FinalResponseBranding.js";
 import {
@@ -904,8 +904,29 @@ export class FeishuMessageClient implements FeishuOutbound {
   }
 
   private async prepareCardValue(value: unknown): Promise<unknown> {
-    if (Array.isArray(value)) return Promise.all(value.map((item) => this.prepareCardValue(item)));
+    if (Array.isArray(value)) {
+      // Marked Markdown expands to sibling text/image elements; other arrays keep their shape.
+      const prepared = await Promise.all(value.map(async (item) => {
+        const result = await this.prepareCardValue(item);
+        return isRecord(item) && item.tag === "markdown" && item[LOCAL_CARD_MARKDOWN_IMAGES] === true && Array.isArray(result)
+          ? result : [result];
+      }));
+      return prepared.flat();
+    }
     if (!isRecord(value)) return value;
+    if (value.tag === "markdown" && value[LOCAL_CARD_MARKDOWN_IMAGES] === true && typeof value.content === "string") {
+      const { content, element_id: elementId, [LOCAL_CARD_MARKDOWN_IMAGES]: _marker, ...format } = value;
+      const elements = await renderMarkdownWithLocalImages(
+        content,
+        (filePath) => this.uploadImageCached(filePath),
+        (error, filePath) => this.logger.warn({ error, filePath }, "Failed to upload local card image to Feishu."),
+      );
+      return (elements.length ? elements : [{ tag: "markdown", content }]).map((element, index) => ({
+        ...(element.tag === "markdown" ? format : {}),
+        ...element,
+        ...(index === 0 && typeof elementId === "string" ? { element_id: elementId } : {}),
+      }));
+    }
     const localImagePath = value[LOCAL_CARD_IMAGE_PATH];
     if (value.tag === "img" && typeof localImagePath === "string") {
       const image = { ...value };

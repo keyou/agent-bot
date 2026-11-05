@@ -8034,10 +8034,12 @@ export class ProxySessionController {
       ...(current ? [{
         title: "最终结果",
         lines: finalResultLines(snapshot, remote),
+        localImages: true,
       }] : []),
       ...(current ? [{
         title: "执行详情",
         lines: executionDetailLines(localCurrent ?? current, snapshot, remote, activeTurnId, queued),
+        localImages: true,
         collapsible: true,
         elementId: "status_execution_details",
       }] : []),
@@ -8128,7 +8130,7 @@ export class ProxySessionController {
           `**创建时间 / 最近活动**：${formatRemoteTime(remote.createdAt)} / ${formatRemoteTime(latestRemoteTimestamp(remote.recencyAt, remote.updatedAt))}`,
         ],
       },
-      { title: "最终结果", lines: finalResultLines(undefined, remote) },
+      { title: "最终结果", lines: finalResultLines(undefined, remote), localImages: true },
       {
         title: "执行详情",
         lines: [
@@ -8137,6 +8139,7 @@ export class ProxySessionController {
             ? "外部 Agent 正在执行；Agent Bot 只读取状态，不会接管。"
             : `发送 **/switch ${cardText(remote.id)}** 切换到此任务。`,
         ],
+        localImages: true,
         collapsible: true,
         elementId: "status_execution_details",
       },

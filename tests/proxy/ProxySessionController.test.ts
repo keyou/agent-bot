@@ -12406,6 +12406,36 @@ describe("ProxySessionController", () => {
     expect(store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId).toBe(task.localSessionId);
   });
 
+  test.each(["local", "external"] as const)("marks %s task results and execution details for local-image rendering without taking over", async (kind) => {
+    const { controller, outbound, remoteSessions, runtime, store, sessions } = fixture();
+    let target = "external_images";
+    if (kind === "local") {
+      await controller.onMessage(message("/new image status"));
+      const local = store.listSessions("chat_id:c1")[0]!;
+      target = local.remoteSessionId!;
+      sessions.get(local.localSessionId)!.activeTurnId = undefined;
+    }
+    const remote: RemoteSessionSummary = {
+      id: target, title: "Screenshot task", cwd: "D:\\work\\desktop", source: "vscode", status: "idle",
+      lastTurnId: "image_turn", lastTurnStatus: "completed", finalResponse: "![截图](C:/outputs/result.jpg)",
+      lastActivity: "![步骤截图](C:/outputs/step.jpg)",
+    };
+    const index = remoteSessions.findIndex((item) => item.id === target);
+    if (index < 0) remoteSessions.push(remote); else remoteSessions[index] = remote;
+    vi.mocked(runtime.resumeSession).mockClear();
+    await controller.onMessage(message(`/status ${target}`));
+    const card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1] as { body: { elements: Array<Record<string, unknown>> } };
+    expect(card.body.elements).toContainEqual(expect.objectContaining({
+      tag: "markdown", content: expect.stringContaining("![截图](C:/outputs/result.jpg)"), __acp_local_markdown_images: true,
+    }));
+    expect(card.body.elements.find((element) => element.element_id === "status_execution_details")).toMatchObject({
+      elements: [expect.objectContaining({ tag: "markdown", __acp_local_markdown_images: true })],
+    });
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(runtime.resumeSession).not.toHaveBeenCalled();
+    if (kind === "external") expect(store.findSessionByRemoteSessionId(target)).toBeUndefined();
+  });
+
   test("reads detailed status for any Codex task without switching to it", async () => {
     const { controller, outbound, remoteSessions, runtime, store } = fixture();
     remoteSessions.push({

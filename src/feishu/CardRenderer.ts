@@ -18,7 +18,7 @@ import { displayRuntimeError } from "../runtime/responseErrors.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
 import type { UpdateNotice } from "../updates/types.js";
 import type { ActiveTerminal, TerminalCardView } from "../terminal/TerminalServer.js";
-import { localCardImage } from "./LocalCardImage.js";
+import { localCardImage, localCardMarkdown } from "./LocalCardImage.js";
 
 export interface StartupStatusView {
   startedAt: Date;
@@ -176,6 +176,7 @@ export interface ExecutionSettingsCardView {
 export interface CardSection {
   title?: string;
   lines: string[];
+  localImages?: boolean;
   collapsible?: boolean;
   elementId?: string;
 }
@@ -1511,11 +1512,12 @@ export class CardRenderer {
     sections.forEach((section, index) => {
       if (index > 0) elements.push({ tag: "hr" });
       const content = section.lines.join("\n");
+      const renderMarkdown = section.localImages ? localCardMarkdown : markdown;
       if (section.collapsible && section.title) {
-        elements.push(collapsiblePanel(section.title, content, { elementId: section.elementId }));
+        elements.push(collapsiblePanel(section.title, [renderMarkdown(content)], { elementId: section.elementId }));
       } else {
         const heading = section.title ? `**${section.title}**\n` : "";
-        elements.push(markdown(`${heading}${content}`));
+        elements.push(renderMarkdown(`${heading}${content}`));
       }
     });
     if (actions.length > 0) elements.push({ tag: "hr" }, taskActionRow(actions));

@@ -5,6 +5,8 @@ import type { Logger } from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AppConfig } from "../../src/config/schema.js";
 import { FeishuApiError, FeishuMessageClient } from "../../src/feishu/FeishuMessageClient.js";
+import { CardRenderer } from "../../src/feishu/CardRenderer.js";
+import { localCardMarkdown } from "../../src/feishu/LocalCardImage.js";
 
 const originalFetch = globalThis.fetch;
 const temporaryDirectories: string[] = [];
@@ -874,6 +876,94 @@ describe("FeishuMessageClient", () => {
     const body = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
     expect(body).toMatchObject({ receive_id: "ou_owner", uuid: "update-uuid", msg_type: "interactive" });
     expect(String(fetchMock.mock.calls[1]?.[0])).toContain("receive_id_type=open_id");
+  });
+
+  test.each(["send", "reply", "update"] as const)("uploads local Markdown images in status sections on %s without losing controls", async (operation) => {
+    const imagePath = createImage("status-result.png");
+    const markdown = `结果前文\n![结果截图](${markdownPath(imagePath)})\n结果后文`;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", data: { image_key: "img_status_result" } }))
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", data: { message_id: "om_status" } }));
+    globalThis.fetch = fetchMock;
+    const client = new FeishuMessageClient(config(), logger());
+    const card = new CardRenderer().renderSectionsCard("Agent 状态", [
+      { title: "指定任务", lines: ["只读状态"] },
+      { title: "最终结果", lines: [markdown], localImages: true },
+      { title: "执行详情", lines: [markdown], localImages: true, collapsible: true, elementId: "status_execution_details" },
+    ], [{ text: "Refresh", value: { action: "session_status_refresh", sessionId: "target" } }]);
+    if (operation === "send") await client.sendInteractiveCard("chat_id:c1", card, "status-uuid");
+    else if (operation === "reply") await client.replyInteractiveCard("chat_id:c1", { messageId: "anchor", replyInThread: true }, card, "status-uuid");
+    else await client.updateInteractiveCard("om_status", card);
+
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]).includes("/im/v1/images"))).toHaveLength(1);
+    const body = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body)) as { content: string; reply_in_thread?: boolean; uuid?: string };
+    const prepared = JSON.parse(body.content) as { body: { elements: Array<Record<string, unknown>> } };
+    expect(prepared.body.elements).toContainEqual(expect.objectContaining({ tag: "img", img_key: "img_status_result" }));
+    expect(prepared.body.elements.find((element) => element.tag === "collapsible_panel")).toMatchObject({
+      element_id: "status_execution_details", expanded: false,
+      elements: expect.arrayContaining([expect.objectContaining({ tag: "img", img_key: "img_status_result" })]),
+    });
+    expect(body.content).toContain("结果前文");
+    expect(body.content).toContain("结果后文");
+    expect(body.content).toContain('"action":"session_status_refresh"');
+    expect(body.content).not.toContain("![");
+    expect(body.content).not.toContain("__acp_local_markdown_images");
+    expect(body.content).not.toContain(markdownPath(imagePath));
+    expect(JSON.stringify(card)).toContain(markdownPath(imagePath));
+    if (operation === "reply") {
+      expect(String(fetchMock.mock.calls[2]?.[0])).toContain("/messages/anchor/reply");
+      expect(body.reply_in_thread).toBe(true);
+    }
+    if (operation !== "update") expect(body.uuid).toBe("status-uuid");
+  });
+
+  test.each(["missing", "upload-failed"] as const)("keeps status cards readable when their Markdown image is %s", async (failure) => {
+    const imagePath = createImage("status-unavailable.png");
+    if (failure === "missing") fs.unlinkSync(imagePath);
+    const testLogger = logger();
+    const fetchMock = vi.fn().mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }));
+    if (failure === "upload-failed") fetchMock.mockResolvedValueOnce(response({ code: 234001, msg: "bad image" }));
+    fetchMock.mockResolvedValueOnce(response({ code: 0, msg: "ok", data: { message_id: "om_status" } }));
+    globalThis.fetch = fetchMock;
+    const card = new CardRenderer().renderSectionsCard("Agent 状态", [{
+      title: "最终结果", lines: [`结论\n![截图](${markdownPath(imagePath)})\n后续说明`], localImages: true,
+    }]);
+    await expect(new FeishuMessageClient(config(), testLogger).sendInteractiveCard("chat_id:c1", card)).resolves.toBe("om_status");
+    const sent = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body)) as { content: string };
+    expect(sent.content).toContain(failure === "missing" ? "图片不可用：截图" : "图片上传失败：截图");
+    expect(sent.content).toContain("结论");
+    expect(sent.content).toContain("后续说明");
+    expect(sent.content).not.toContain("![");
+    expect(sent.content).not.toContain('"tag":"img"');
+    expect(sent.content).not.toContain("__acp_local_markdown_images");
+    if (failure === "upload-failed") expect(testLogger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  test("preserves Markdown formatting and unique element IDs while expanding only marked sections", async () => {
+    const imagePath = createImage("status-format.png");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", data: { image_key: "img_status" } }))
+      .mockResolvedValueOnce(response({ code: 0, msg: "ok", data: { message_id: "om_status" } }));
+    globalThis.fetch = fetchMock;
+    const unchanged = { tag: "markdown", content: "原生图片：![图](img_existing_key)" };
+    const card = { schema: "2.0", body: { elements: [
+      { ...localCardMarkdown(`前文\n![图](${markdownPath(imagePath)})\n后文`), element_id: "status_result", text_size: "notation" },
+      { ...localCardMarkdown(" "), element_id: "empty_result" },
+      unchanged,
+      { tag: "button", text: { tag: "plain_text", content: "Refresh" }, value: { action: "refresh", groups: [["a", "b"]] } },
+    ] } };
+    await new FeishuMessageClient(config(), logger()).sendInteractiveCard("chat_id:c1", card);
+    const sent = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body)) as { content: string };
+    const elements = (JSON.parse(sent.content) as { body: { elements: Array<Record<string, unknown>> } }).body.elements;
+    expect(elements[0]).toMatchObject({ tag: "markdown", element_id: "status_result", text_size: "notation" });
+    expect(elements[2]).toMatchObject({ tag: "markdown", content: "\n后文", text_size: "notation" });
+    expect(elements.filter((element) => element.element_id === "status_result")).toHaveLength(1);
+    expect(elements).toContainEqual({ tag: "markdown", content: " ", element_id: "empty_result" });
+    expect(elements).toContainEqual(unchanged);
+    expect(elements.at(-1)).toMatchObject({ value: { action: "refresh", groups: [["a", "b"]] } });
+    expect(sent.content).not.toContain("__acp_local_markdown_images");
   });
 
   test("uploads view_image previews in cards once and reuses the image key on updates", async () => {
