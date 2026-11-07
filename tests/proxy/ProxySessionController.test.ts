@@ -20,6 +20,7 @@ import type { TurnPresenter } from "../../src/presentation/OutboundRouter.js";
 import type { TurnViewState } from "../../src/presentation/turnViewTypes.js";
 import { OutboundRouter } from "../../src/presentation/OutboundRouter.js";
 import { createTurnViewState } from "../../src/presentation/TurnStateReducer.js";
+import { TurnNotSubmittedError } from "../../src/runtime/submissionErrors.js";
 import { ProxySessionController } from "../../src/proxy/ProxySessionController.js";
 import { AgentRuntimeRegistry } from "../../src/runtime/AgentRuntimeRegistry.js";
 import type { AgentRuntime, RemoteSessionSummary, RemoteTurnPage, RuntimeEvent, RuntimeGoal, RuntimeSession } from "../../src/runtime/types.js";
@@ -1105,10 +1106,10 @@ describe("crash recovery", () => {
     try {
       vi.mocked(f.runtime.resumeSession).mockRejectedValue(new Error(`thread ${f.remoteId} already has an active writer`));
       await f.controller.recoverInterruptedTasks();
-      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
-      expect(f.store.getSession("crashed")).toMatchObject({ status: "ready", lastTurnStatus: "cancelled" });
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("unknown");
+      expect(f.store.getSession("crashed")).toMatchObject({ status: "ready", lastTurnStatus: "unknown" });
       expect(f.presenter.startPendingTurn).not.toHaveBeenCalled();
-      expect(f.presenter.interruptTurnForRecovery).toHaveBeenCalledWith("crashed", "chat_id:c1", "old-turn", expect.stringContaining("占用"));
+      expect(f.presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "turn_status_unknown", turnId: "old-turn" }));
       expect(JSON.stringify(vi.mocked(f.outbound.sendInteractiveCard).mock.calls)).toContain("任务被占用");
       await vi.advanceTimersByTimeAsync(11 * 60_000);
       expect(f.runtime.resumeSession).toHaveBeenCalledTimes(1);
@@ -1127,7 +1128,7 @@ describe("crash recovery", () => {
       expect(f.store.getTurnAttempt("recover")?.status).toBe("recovering");
       expect(f.runtime.startTurn).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(61_000);
-      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("unknown");
       expect(f.store.getSession("crashed")?.status).toBe("ready");
       expect(f.runtime.resumeSession).not.toHaveBeenCalled();
       const reads = vi.mocked(f.runtime.readRemoteSession!).mock.calls.length;
@@ -1159,17 +1160,17 @@ describe("crash recovery", () => {
     } finally { f.controller.close(); vi.useRealTimers(); }
   });
 
-  test("forgets only local monitoring after repeated synchronization errors, without stopping remote work", async () => {
+  test("retains the live writer while its execution result is unverified", async () => {
     vi.useFakeTimers();
     const f = recoveryFixture();
     try {
       vi.mocked(f.runtime.synchronizeSession).mockRejectedValue(new Error("connection lost"));
       await f.controller.recoverInterruptedTasks();
       await vi.advanceTimersByTimeAsync(61_000);
-      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
-      expect(f.store.getSession("crashed")?.status).toBe("ready");
-      expect(f.runtime.forgetSession).toHaveBeenCalledWith("crashed");
-      expect(f.runtime.getSession("crashed")).toBeUndefined();
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("unknown");
+      expect(f.store.getSession("crashed")?.status).toBe("running");
+      expect(f.runtime.forgetSession).not.toHaveBeenCalled();
+      expect(f.runtime.getSession("crashed")?.activeTurnId).toBeTruthy();
       expect(f.presenter.startPendingTurn).toHaveBeenCalledTimes(1);
       expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
       expect(f.runtime.release).not.toHaveBeenCalled();
@@ -1199,7 +1200,7 @@ describe("crash recovery", () => {
       vi.mocked(f.outbound.sendText).mockRejectedValue(new Error("Feishu offline"));
       await f.controller.recoverInterruptedTasks();
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("unknown");
       expect(f.store.getSession("crashed")?.status).toBe("ready");
       expect(f.runtime.resumeSession).toHaveBeenCalledTimes(1);
     } finally { f.controller.close(); vi.useRealTimers(); }
@@ -1232,7 +1233,7 @@ describe("crash recovery", () => {
       f.remoteSessions[0]!.lastTurnId = "external-turn";
       await f.controller.recoverInterruptedTasks();
       await vi.advanceTimersByTimeAsync(61_000);
-      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("unknown");
       expect(f.runtime.resumeSession).not.toHaveBeenCalled();
       expect(f.runtime.startTurn).not.toHaveBeenCalled();
       expect(f.runtime.interruptRemoteTurn).not.toHaveBeenCalled();
@@ -1248,7 +1249,7 @@ describe("crash recovery", () => {
       f.store.updateRuntimeSession("crashed", { lastTurnId: "new-turn", lastTurnStatus: "running" });
       f.sessions.set("crashed", { localSessionId: "crashed", remoteSessionId: f.remoteId, runtimeKind: "codex", agentName: "codex", cwd: process.cwd(), permissionMode: "auto", activeTurnId: "new-turn" });
       await vi.advanceTimersByTimeAsync(61_000);
-      expect(f.store.getTurnAttempt("recover")?.status).toBe("interrupted");
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("unknown");
       expect(f.store.getSession("crashed")).toMatchObject({ status: "running", lastTurnId: "new-turn", lastTurnStatus: "running" });
       expect(f.runtime.forgetSession).not.toHaveBeenCalled();
     } finally { f.controller.close(); vi.useRealTimers(); }
@@ -1421,7 +1422,7 @@ describe("ProxySessionController", () => {
       expect.any(String), expect.objectContaining({ replyInThread: true }), "读取历史上下文（1 轮对话）");
   });
 
-  test("recovers an interrupted turn in its original topic with a fresh thinking card", async () => {
+  test("reconciles the original interrupted turn without replaying its prompt", async () => {
     const { controller, runtime, remoteSessions, outbound, presenter, store } = fixture();
     const contextKey = "chat_id:c1:thread_id:t1";
     const recentAt = new Date(Date.now() - 6 * 60 * 1_000).toISOString();
@@ -1482,29 +1483,10 @@ describe("ProxySessionController", () => {
       { messageId: "om_original", replyInThread: true },
       "检测到任务在 Agent Bot 重启前尚未完成，正在自动恢复。",
     );
-    expect(presenter.interruptTurnForRecovery).toHaveBeenCalledWith(
-      "session_recovery",
-      contextKey,
-      "turn_interrupted",
-      expect.stringContaining("新的思考卡片"),
-    );
-    expect(presenter.startPendingTurn).toHaveBeenCalledWith(
-      "session_recovery",
-      contextKey,
-      "Interrupted work",
-      { messageId: "om_original", replyInThread: true },
-      "恢复重启前的任务：finish the original task",
-    );
-    expect(runtime.startTurn).toHaveBeenCalledWith(
-      "session_recovery",
-      expect.stringContaining("Finish the original request:\n\nfinish the original task"),
-    );
-    expect(store.getTurnAttempt("attempt_recovery")).toMatchObject({
-      turnId: "turn_1",
-      recoveredFromTurnId: "turn_interrupted",
-      recoveryCount: 1,
-      status: "running",
-    });
+    expect(presenter.startPendingTurn).not.toHaveBeenCalled();
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(runtime.synchronizeSession).toHaveBeenCalledWith("session_recovery");
+    expect(store.getTurnAttempt("attempt_recovery")?.turnId).toBe("turn_interrupted");
   });
 
   test("keeps a recovered turn in the attached group when the task was created in a private chat", async () => {
@@ -1565,17 +1547,8 @@ describe("ProxySessionController", () => {
       groupContextKey,
       "检测到任务在 Agent Bot 重启前尚未完成，正在自动恢复。",
     );
-    expect(presenter.startPendingTurn).toHaveBeenCalledWith(
-      "session_shared_recovery",
-      groupContextKey,
-      "Shared interrupted work",
-      undefined,
-      "恢复重启前的任务：finish the shared task",
-    );
-    expect(runtime.startTurn).toHaveBeenCalledWith(
-      "session_shared_recovery",
-      expect.stringContaining("Finish the original request:\n\nfinish the shared task"),
-    );
+    expect(presenter.startPendingTurn).not.toHaveBeenCalled();
+    expect(runtime.startTurn).not.toHaveBeenCalled();
     expect(outboundRouter.getSessionContextKey("session_shared_recovery")).toBe(groupContextKey);
     expect(store.getSession("session_shared_recovery")?.contextKey).toBe(privateContextKey);
   });
@@ -1614,16 +1587,13 @@ describe("ProxySessionController", () => {
     expect(runtime.startTurn).not.toHaveBeenCalled();
     expect(outbound.sendText).not.toHaveBeenCalled();
     expect(outbound.replyText).not.toHaveBeenCalled();
-    expect(presenter.interruptTurnForRecovery).toHaveBeenCalledWith(
-      "session_stale_recovery",
-      "chat_id:c1",
-      "turn_stale_recovery",
-      "执行中断已超过 10 分钟，未自动恢复。",
-    );
-    expect(store.getTurnAttempt("attempt_stale_recovery")?.status).toBe("interrupted");
+    expect(presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: "turn_status_unknown", turnId: "turn_stale_recovery",
+    }));
+    expect(store.getTurnAttempt("attempt_stale_recovery")?.status).toBe("unknown");
     expect(store.getSession("session_stale_recovery")).toMatchObject({
       status: "ready",
-      lastTurnStatus: "cancelled",
+      lastTurnStatus: "unknown",
     });
   });
 
@@ -1833,21 +1803,11 @@ describe("ProxySessionController", () => {
 
     await controller.recoverInterruptedTasks();
 
-    expect(presenter.interruptTurnForRecovery).toHaveBeenCalledWith(
-      "session_pending_window",
-      "chat_id:c1",
-      "pending_before_crash",
-      expect.any(String),
-    );
-    expect(runtime.startTurn).toHaveBeenCalledWith(
-      "session_pending_window",
-      expect.stringContaining("start after reconnect"),
-    );
-    expect(store.findIncompleteTurnAttemptForSession("session_pending_window")).toMatchObject({
-      turnId: "turn_1",
-      recoveredFromTurnId: "pending_before_crash",
-      recoveryCount: 1,
-    });
+    expect(presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: "turn_status_unknown", turnId: "pending_before_crash",
+    }));
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(store.hasUnknownTurnAttemptForSession("session_pending_window")).toBe(true);
   });
 
   test("reattaches a live approved-plan continuation to its existing card after restart", async () => {
@@ -1910,10 +1870,11 @@ describe("ProxySessionController", () => {
 
     test.each([false, true])("does not retry an ambiguous continuation start or replay the prompt (disconnect event: %s)", async (disconnect) => {
       const f = fixture();
+      vi.mocked(f.presenter.startPendingTurn).mockResolvedValue("pending_continuation");
       f.runtime.recoverResponseContinuation = vi.fn(async (sessionId) => {
         if (disconnect) {
           for (const listener of f.listeners) listener({ type: "turn_started", sessionId, turnId: "continued", startedAt: Date.now() });
-          for (const listener of f.listeners) listener({ type: "turn_failed", sessionId, turnId: "continued", message: "App Server disconnected: connection closed." });
+          for (const listener of f.listeners) listener({ type: "turn_status_unknown", sessionId, turnId: "continued", message: "App Server disconnected: connection closed." });
         }
         throw new Error("App Server request timed out: turn/start");
       });
@@ -1921,10 +1882,10 @@ describe("ProxySessionController", () => {
       const session = f.store.listSessions("chat_id:c1")[0]!;
       f.sessions.get(session.localSessionId)!.activeTurnId = undefined;
       for (const listener of f.listeners) listener({ type: "turn_failed", sessionId: session.localSessionId, turnId: "turn_1", message: error });
-      await vi.waitFor(() => expect(f.store.getSession(session.localSessionId)?.status).toBe("failed"));
+      await vi.waitFor(() => expect(f.store.getSession(session.localSessionId)?.lastTurnStatus).toBe("unknown"));
       expect(f.runtime.recoverResponseContinuation).toHaveBeenCalledTimes(1);
       expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
-      await vi.waitFor(() => expect(f.outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("模型续接恢复未能启动")));
+      expect(f.presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "turn_status_unknown" }));
     });
 
     test("allows Stop to cancel recovery before a new turn is submitted", async () => {
@@ -1965,89 +1926,55 @@ describe("ProxySessionController", () => {
     });
   });
 
-  test("retries transient LLM turn failures three times before making the task terminal", async () => {
-    const { controller, runtime, sessions, outbound, presenter, store, listeners } = fixture();
-    (outbound.addReaction as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce("reaction_on_it")
-      .mockResolvedValue("reaction_terminal");
-
-    await controller.onMessage(message("finish despite provider overload"));
-    const session = store.listSessions("chat_id:c1")[0]!;
-    const attemptId = store.findIncompleteTurnAttemptForSession(session.localSessionId)!.attemptId;
-    let failedTurnId = "turn_1";
-
-    for (let retryNumber = 1; retryNumber <= 3; retryNumber += 1) {
-      const retryTurnId = `turn_retry_${retryNumber}`;
-      (runtime.startTurn as ReturnType<typeof vi.fn>).mockImplementationOnce(async (sessionId: string) => {
-        sessions.get(sessionId)!.activeTurnId = retryTurnId;
-        for (const listener of listeners) {
-          listener({ type: "turn_started", sessionId, turnId: retryTurnId, startedAt: Date.now() });
-        }
-        return retryTurnId;
-      });
-      sessions.get(session.localSessionId)!.activeTurnId = undefined;
-      for (const listener of listeners) {
-        listener({
-          type: "turn_failed",
-          sessionId: session.localSessionId,
-          turnId: failedTurnId,
-          message: "503 Service Unavailable: model provider overloaded",
-        });
-      }
-
-      await vi.waitFor(() => expect(store.findIncompleteTurnAttemptForSession(session.localSessionId)).toMatchObject({
-        turnId: retryTurnId,
-        retryCount: retryNumber,
-        status: "running",
-      }));
-      expect(store.getMessageReaction("m-finish despite provider overload")).toMatchObject({
-        turnId: retryTurnId,
-        status: "pending",
-        emojiType: "OnIt",
-      });
-      failedTurnId = retryTurnId;
-    }
-
-    sessions.get(session.localSessionId)!.activeTurnId = undefined;
-    for (const listener of listeners) {
-      listener({
-        type: "turn_failed",
-        sessionId: session.localSessionId,
-        turnId: failedTurnId,
-        message: "503 Service Unavailable: model provider overloaded",
-      });
-    }
-
-    await vi.waitFor(() => expect(store.getSession(session.localSessionId)).toMatchObject({
-      status: "failed",
-      lastTurnId: failedTurnId,
-      lastTurnStatus: "failed",
+  test("does not replay a submitted prompt after transient model failure", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("finish despite provider overload"));
+    const session = f.store.listSessions("chat_id:c1")[0]!;
+    const attempt = f.store.findIncompleteTurnAttemptForSession(session.localSessionId)!;
+    f.sessions.get(session.localSessionId)!.activeTurnId = undefined;
+    for (const listener of f.listeners) listener({ type: "turn_failed", sessionId: session.localSessionId,
+      turnId: "turn_1", message: "503 Service Unavailable: model provider overloaded" });
+    await vi.waitFor(() => expect(f.store.getTurnAttempt(attempt.attemptId)).toMatchObject({
+      turnId: "turn_1", retryCount: 0, status: "failed", submissionState: "submitted",
     }));
-    expect(store.getTurnAttempt(attemptId)).toMatchObject({
-      turnId: failedTurnId,
-      retryCount: 3,
-      status: "failed",
-    });
-    expect(runtime.startTurn).toHaveBeenCalledTimes(4);
-    expect(store.getMessageReaction("m-finish despite provider overload")).toMatchObject({
-      turnId: failedTurnId,
-      status: "failed",
-      emojiType: "ERROR",
-    });
-    expect(presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({
-      type: "turn_failed",
-      turnId: failedTurnId,
-      message: expect.stringContaining("已自动重试 3 次"),
-    }));
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
   });
 
-  test("retries App Server connection failures before turn/start returns a turn id", async () => {
+  test("ambiguous submission survives restart without replay and keeps queued prompts", async () => {
+    const f = fixture();
+    vi.mocked(f.runtime.startTurn).mockRejectedValueOnce(new Error("turn/start response lost"));
+    vi.mocked(f.presenter.startPendingTurn).mockResolvedValue("pending_lost");
+    await f.controller.onMessage(message("perform irreversible work once"));
+    const session = f.store.listSessions("chat_id:c1")[0]!;
+    expect(f.store.hasUnknownTurnAttemptForSession(session.localSessionId)).toBe(true);
+    f.store.enqueuePrompt({ promptId: "later", localSessionId: session.localSessionId,
+      contextKey: "chat_id:c1", text: "separate queued request" });
+    await f.controller.recoverInterruptedTasks();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.store.countQueuedPrompts(session.localSessionId)).toBe(1);
+    expect(f.presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "turn_status_unknown" }));
+  });
+
+  test("ambiguous steering is not resubmitted or silently queued", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("original"));
+    vi.mocked(f.runtime.steerTurn).mockRejectedValueOnce(new Error("response lost"));
+    await f.controller.onMessage(message("addition"));
+    const session = f.store.listSessions("chat_id:c1")[0]!;
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.runtime.steerTurn).toHaveBeenCalledTimes(1);
+    expect(f.store.countQueuedPrompts(session.localSessionId)).toBe(0);
+    expect(f.outbound.sendText).toHaveBeenCalledWith("chat_id:c1", expect.stringContaining("提交结果待核实"));
+  });
+
+  test("retries only proven pre-dispatch connection failures", async () => {
     const { controller, runtime, store } = fixture();
     const startTurn = runtime.startTurn as ReturnType<typeof vi.fn>;
     startTurn
-      .mockRejectedValueOnce(new Error("App Server connection closed."))
-      .mockRejectedValueOnce(new Error("App Server connection closed."))
-      .mockRejectedValueOnce(new Error("App Server connection closed."));
+      .mockRejectedValueOnce(new TurnNotSubmittedError(new Error("App Server connection closed.")))
+      .mockRejectedValueOnce(new TurnNotSubmittedError(new Error("App Server connection closed.")))
+      .mockRejectedValueOnce(new TurnNotSubmittedError(new Error("App Server connection closed.")));
 
     await controller.onMessage(message("survive App Server startup crashes"));
 
@@ -2060,33 +1987,24 @@ describe("ProxySessionController", () => {
     });
   });
 
-  test("retries an active turn when the App Server process disconnects", async () => {
+  test("keeps a disconnected submitted turn unverified without replay", async () => {
     const { controller, runtime, sessions, store, listeners } = fixture();
     await controller.onMessage(message("continue after an App Server crash"));
     const session = store.listSessions("chat_id:c1")[0]!;
-    (runtime.startTurn as ReturnType<typeof vi.fn>).mockImplementationOnce(async (sessionId: string) => {
-      sessions.get(sessionId)!.activeTurnId = "turn_after_disconnect";
-      for (const listener of listeners) {
-        listener({ type: "turn_started", sessionId, turnId: "turn_after_disconnect", startedAt: Date.now() });
-      }
-      return "turn_after_disconnect";
-    });
     sessions.get(session.localSessionId)!.activeTurnId = undefined;
 
     for (const listener of listeners) {
       listener({
-        type: "turn_failed",
+        type: "turn_status_unknown",
         sessionId: session.localSessionId,
         turnId: "turn_1",
         message: "App Server disconnected: App Server exited (code=3221226505, signal=null).",
       });
     }
 
-    await vi.waitFor(() => expect(store.findIncompleteTurnAttemptForSession(session.localSessionId)).toMatchObject({
-      retryCount: 1,
-      status: "running",
-      turnId: "turn_after_disconnect",
-    }));
+    await vi.waitFor(() => expect(store.getSession(session.localSessionId)?.lastTurnStatus).toBe("unknown"));
+    expect(store.hasUnknownTurnAttemptForSession(session.localSessionId)).toBe(true);
+    expect(runtime.startTurn).toHaveBeenCalledTimes(1);
   });
 
   test.each([
@@ -7565,7 +7483,7 @@ describe("ProxySessionController", () => {
     await controller.onMessage(message("keep working"));
     const sessionId = store.getUserContext("chat_id:c1")!.currentSessionId!;
     if (reconciled) {
-      vi.mocked(runtime.steerTurn).mockRejectedValueOnce(new Error("Stale turn"));
+      vi.mocked(runtime.steerTurn).mockRejectedValueOnce(new TurnNotSubmittedError(new Error("Stale turn")));
       vi.mocked(runtime.synchronizeSession).mockImplementation(async () => {
         const session = runtime.getSession(sessionId)!;
         session.activeTurnId = "turn_reconciled";
@@ -13337,7 +13255,7 @@ describe("deferred Provider settings", () => {
     expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
   });
 
-  test("an automatic LLM retry applies the pending Provider first", async () => {
+  test("a failure applies pending settings without replay; the next explicit message uses them", async () => {
     const f = await runningFixture();
     await f.action({ action: "settings_provider_select", provider: "azure" });
     f.runtime.getSession(f.id)!.activeTurnId = undefined;
@@ -13347,7 +13265,10 @@ describe("deferred Provider settings", () => {
       return "retry-turn";
     });
     for (const listener of f.listeners) listener({ type: "turn_failed", sessionId: f.id, turnId: "turn_1", message: "stream disconnected before completion" });
-    await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce());
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    await f.controller.onMessage(message("continue explicitly"));
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(2);
     expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
   });
 

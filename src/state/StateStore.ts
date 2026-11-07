@@ -177,6 +177,8 @@ export type TurnAttemptStatus =
   | "interrupted"
   | "unknown";
 
+export type TurnSubmissionState = "not_submitted" | "submission_unknown" | "submitted";
+
 export interface TurnAttemptRecord {
   attemptId: string;
   localSessionId: string;
@@ -191,6 +193,7 @@ export interface TurnAttemptRecord {
   recoveryCount: number;
   retryCount: number;
   status: TurnAttemptStatus;
+  submissionState: TurnSubmissionState;
   createdAt: string;
   updatedAt: string;
 }
@@ -280,6 +283,7 @@ interface TurnAttemptRow {
   recovery_count: number;
   retry_count: number;
   status: TurnAttemptStatus;
+  submission_state: TurnSubmissionState;
   created_at: string;
   updated_at: string;
 }
@@ -710,6 +714,7 @@ export class StateStore {
     recoveredFromTurnId?: string;
     recoveryCount?: number;
     retryCount?: number;
+    submissionState?: TurnSubmissionState;
     status?: Extract<TurnAttemptStatus, "accepted" | "running" | "recovering">;
     createdAt?: string;
     updatedAt?: string;
@@ -721,8 +726,8 @@ export class StateStore {
       INSERT INTO turn_attempts (
         attempt_id, local_session_id, context_key, prompt_text, local_image_paths_json,
         message_id, reply_message_id, pending_turn_id, turn_id, recovered_from_turn_id,
-        recovery_count, retry_count, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        recovery_count, retry_count, submission_state, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.attemptId,
       input.localSessionId,
@@ -736,6 +741,7 @@ export class StateStore {
       input.recoveredFromTurnId ?? null,
       input.recoveryCount ?? 0,
       input.retryCount ?? 0,
+      input.submissionState ?? (input.turnId ? "submitted" : "not_submitted"),
       status,
       createdAt,
       updatedAt,
@@ -793,6 +799,7 @@ export class StateStore {
       recoveredFromTurnId: string | null;
       recoveryCount: number;
       retryCount: number;
+      submissionState: TurnSubmissionState;
       status: TurnAttemptStatus;
     }>,
   ): void {
@@ -803,7 +810,7 @@ export class StateStore {
     this.db.prepare(`
       UPDATE turn_attempts
       SET message_id = ?, reply_message_id = ?, pending_turn_id = ?, turn_id = ?,
-          recovered_from_turn_id = ?, recovery_count = ?, retry_count = ?, status = ?, updated_at = ?
+          recovered_from_turn_id = ?, recovery_count = ?, retry_count = ?, submission_state = ?, status = ?, updated_at = ?
       WHERE attempt_id = ?
     `).run(
       value(patch.messageId, existing.messageId),
@@ -813,6 +820,7 @@ export class StateStore {
       value(patch.recoveredFromTurnId, existing.recoveredFromTurnId),
       patch.recoveryCount ?? existing.recoveryCount,
       patch.retryCount ?? existing.retryCount,
+      patch.submissionState ?? (patch.turnId ? "submitted" : existing.submissionState),
       patch.status ?? existing.status,
       new Date().toISOString(),
       attemptId,
@@ -822,7 +830,7 @@ export class StateStore {
   bindTurnAttempt(localSessionId: string, turnId: string): TurnAttemptRecord | undefined {
     const attempt = this.findIncompleteTurnAttemptForSession(localSessionId);
     if (!attempt || (attempt.turnId && attempt.turnId !== turnId)) return undefined;
-    this.updateTurnAttempt(attempt.attemptId, { turnId, status: "running" });
+    this.updateTurnAttempt(attempt.attemptId, { turnId, status: "running", submissionState: "submitted" });
     return this.getTurnAttempt(attempt.attemptId);
   }
 
@@ -875,43 +883,56 @@ export class StateStore {
     `).run(timestamp, turnId, throttleCutoff);
   }
 
-  prepareTurnAttemptRecovery(attemptId: string, recoveredFromTurnId?: string): TurnAttemptRecord | undefined {
-    const existing = this.getTurnAttempt(attemptId);
-    if (!existing) return undefined;
-    this.updateTurnAttempt(attemptId, {
-      pendingTurnId: null,
-      turnId: null,
-      recoveredFromTurnId: recoveredFromTurnId ?? existing.turnId ?? existing.recoveredFromTurnId ?? null,
-      recoveryCount: existing.recoveryCount + 1,
-      status: "recovering",
-    });
-    return this.getTurnAttempt(attemptId);
+  hasUnknownTurnAttemptForSession(localSessionId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM turn_attempts WHERE local_session_id = ? AND status = 'unknown' LIMIT 1")
+      .get(localSessionId));
   }
 
-  prepareTurnAttemptRetry(attemptId: string, failedTurnId: string): TurnAttemptRecord | undefined {
-    const existing = this.getTurnAttempt(attemptId);
-    if (!existing || existing.turnId !== failedTurnId || !isIncompleteTurnAttemptStatus(existing.status)) {
-      return undefined;
-    }
-    this.updateTurnAttempt(attemptId, {
-      pendingTurnId: null,
-      turnId: null,
-      recoveredFromTurnId: failedTurnId,
-      retryCount: existing.retryCount + 1,
-      status: "recovering",
-    });
-    return this.getTurnAttempt(attemptId);
+  beginTurnAttemptSubmission(attemptId: string): void {
+    const result = this.db.prepare(`
+      UPDATE turn_attempts SET submission_state = 'submission_unknown', updated_at = ?
+      WHERE attempt_id = ? AND submission_state = 'not_submitted'
+        AND status IN ('accepted', 'recovering') AND turn_id IS NULL
+    `).run(new Date().toISOString(), attemptId);
+    if (result.changes !== 1) throw new Error("Prompt submission is not provably safe; automatic replay refused.");
   }
 
   prepareUnstartedTurnAttemptRetry(attemptId: string): TurnAttemptRecord | undefined {
     const existing = this.getTurnAttempt(attemptId);
-    if (!existing || existing.turnId || !isIncompleteTurnAttemptStatus(existing.status)) return undefined;
+    if (!existing || existing.turnId || existing.submissionState !== "not_submitted"
+      || !isIncompleteTurnAttemptStatus(existing.status)) return undefined;
     this.updateTurnAttempt(attemptId, {
       pendingTurnId: null,
       retryCount: existing.retryCount + 1,
       status: "recovering",
     });
     return this.getTurnAttempt(attemptId);
+  }
+
+  prepareTurnAttemptRecovery(attemptId: string, recoveredFromTurnId?: string): TurnAttemptRecord | undefined {
+    const existing = this.getTurnAttempt(attemptId);
+    if (!existing || existing.turnId || existing.submissionState !== "not_submitted"
+      || !isIncompleteTurnAttemptStatus(existing.status)) return undefined;
+    this.updateTurnAttempt(attemptId, {
+      recoveredFromTurnId, recoveryCount: existing.recoveryCount + 1, status: "recovering",
+    });
+    return this.getTurnAttempt(attemptId);
+  }
+
+  prepareTurnAttemptRetry(attemptId: string, failedTurnId: string, verifiedContinuation = false): TurnAttemptRecord | undefined {
+    const existing = this.getTurnAttempt(attemptId);
+    if (!verifiedContinuation || !existing || existing.turnId !== failedTurnId
+      || !isIncompleteTurnAttemptStatus(existing.status)) return undefined;
+    this.updateTurnAttempt(attemptId, {
+      pendingTurnId: null, turnId: null, recoveredFromTurnId: failedTurnId,
+      retryCount: existing.retryCount + 1, status: "recovering", submissionState: "not_submitted",
+    });
+    return this.getTurnAttempt(attemptId);
+  }
+
+  acknowledgeUnknownTurnAttempts(localSessionId: string): void {
+    this.db.prepare("UPDATE turn_attempts SET status = 'interrupted' WHERE local_session_id = ? AND status = 'unknown'")
+      .run(localSessionId);
   }
 
   rebindPendingTurnMessages(localSessionId: string, sourceTurnId: string, targetTurnId: string): void {
@@ -2361,6 +2382,12 @@ export class StateStore {
     const existing = new Set(
       (this.db.pragma("table_info(turn_attempts)") as Array<{ name: string }>).map((column) => column.name),
     );
+    if (!existing.has("submission_state")) {
+      this.db.transaction(() => {
+        this.db.exec("ALTER TABLE turn_attempts ADD COLUMN submission_state TEXT NOT NULL DEFAULT 'submission_unknown'");
+        this.db.exec("UPDATE turn_attempts SET submission_state = 'submitted' WHERE turn_id IS NOT NULL");
+      })();
+    }
     if (!existing.has("retry_count")) {
       this.db.exec("ALTER TABLE turn_attempts ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0");
     }
@@ -2501,6 +2528,7 @@ function mapTurnAttempt(row: TurnAttemptRow): TurnAttemptRecord {
     recoveredFromTurnId: row.recovered_from_turn_id ?? undefined,
     recoveryCount: row.recovery_count,
     retryCount: row.retry_count,
+    submissionState: row.submission_state,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

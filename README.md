@@ -14,6 +14,8 @@ Cards, task lists and Turn Preview show **Unverified** when execution cannot be 
 
 ## What You Can Do
 
+Recovery separates reattachment from resubmission. Only durably confirmed unsubmitted requests may retry automatically. Known active turns are reattached; ambiguous timeouts, disconnects and missing turn IDs are marked unverified without replay or timestamp-based adoption. Automatic queue dispatch pauses while unresolved, preserving queued messages; inspect execution records and send a new message to continue. Transient errors after submission no longer replay the original Prompt.
+
 - Use your existing local Codex or TraeX login from Feishu
 - Create, continue, switch, fork, and stop tasks
 - Reset the current conversation from any successfully completed progress card
@@ -471,7 +473,7 @@ File-change summaries display paths as plain text, preserving Windows separators
 
 ## Troubleshooting
 
-After a crash, an unfinished Codex rollout alone no longer means the task is running: unloaded threads also require a live writer process. Agent Bot confirms session resume before creating a new running card. Writer conflicts stop automatic recovery with an occupancy card; other unconfirmed recovery failures are retried every five seconds for a one-minute window, then marked interrupted with a notification. No external process is closed automatically. Already-confirmed live turns remain monitored, including during temporary connection outages, and are not subject to this recovery timeout.
+After a crash, Agent Bot checks recent attempts without replaying submitted work. Writer conflicts stop checks immediately; other unconfirmed checks stop after one minute and leave execution unverified. Already-confirmed live turns remain monitored, including during temporary connection outages. No external process is closed automatically.
 
 - **The bot does not respond:** run `agentbot server status` and check today's `~/.agent-bot/logs/agent-bot.YYYY-MM-DD.log`
 - **The Worker restarted after a Node crash:** check `~/.agent-bot/data/last-crash.json`, that day's `~/.agent-bot/logs/worker.stderr.YYYY-MM-DD.log`, and `~/.agent-bot/data/crash-reports/`

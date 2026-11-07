@@ -1225,18 +1225,17 @@ describe("StateStore runtime metadata", () => {
       }),
     ]);
 
-    second.prepareTurnAttemptRecovery("attempt_1", "turn_1");
+    expect(second.prepareTurnAttemptRecovery("attempt_1", "turn_1")).toBeUndefined();
     expect(second.getTurnAttempt("attempt_1")).toMatchObject({
-      turnId: undefined,
+      turnId: "turn_1",
       pendingTurnId: undefined,
-      recoveredFromTurnId: "turn_1",
-      recoveryCount: 1,
-      status: "recovering",
+      recoveryCount: 0,
+      status: "running",
+      submissionState: "submitted",
     });
-    second.bindTurnAttempt("session_1", "turn_2");
-    second.markTurnAttemptTerminal("turn_2", "completed");
+    second.markTurnAttemptTerminal("turn_1", "completed");
     expect(second.listIncompleteTurnAttempts()).toEqual([]);
-    expect(second.getTurnAttempt("attempt_1")).toMatchObject({ turnId: "turn_2", status: "completed" });
+    expect(second.getTurnAttempt("attempt_1")).toMatchObject({ turnId: "turn_1", status: "completed" });
   });
 
   test("persists user cancellation intent separately from crash-recoverable attempts", () => {
@@ -1309,7 +1308,8 @@ describe("StateStore runtime metadata", () => {
       store.bindMessageReaction(messageId, "session_retry", "turn_1");
     }
 
-    expect(store.prepareTurnAttemptRetry("attempt_retry", "turn_1")).toMatchObject({
+    expect(store.prepareTurnAttemptRetry("attempt_retry", "turn_1")).toBeUndefined();
+    expect(store.prepareTurnAttemptRetry("attempt_retry", "turn_1", true)).toMatchObject({
       turnId: undefined,
       recoveredFromTurnId: "turn_1",
       retryCount: 1,

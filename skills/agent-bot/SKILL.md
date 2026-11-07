@@ -257,7 +257,7 @@ Use `init --reset` only for an explicitly requested full reset. Without `--profi
 
 ## After Code Changes
 
-For tasks stuck after a Worker crash, inspect the recovery notice and any writer-conflict card before acting. Unconfirmed recovery retries stop after a one-minute window; a live writer conflict stops them immediately. An old unfinished rollout or a leftover lock file alone is not proof of a running task. Do not delete locks, edit task state, or close another Agent process automatically. Already-confirmed live turns remain monitored; ask the user before stopping them.
+For tasks stuck after a Worker crash, inspect the recovery notice and any writer-conflict card before acting. Unconfirmed recovery checks stop after a one-minute window; a live writer conflict stops them immediately. Only durably proven unsubmitted requests may retry. Submitted turns are reattached by exact turn ID, never replayed on disconnect or transient model failure. Ambiguous execution is unverified, not cancelled; automatic queue dispatch pauses without deleting queued messages. Inspect execution records before explicitly continuing with a new message. An old unfinished rollout or a leftover lock file alone is not proof of a running task. Do not delete locks, edit task state, or close another Agent process automatically. Already-confirmed live turns remain monitored; ask the user before stopping them.
 
 Run the relevant checks, then build:
 

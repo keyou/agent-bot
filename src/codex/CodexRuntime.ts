@@ -33,6 +33,7 @@ import type {
 import { appendGeneratedImageMarkdown } from "../utils/generatedImageMarkdown.js";
 import { normalizeTaskTitle } from "../utils/taskTitle.js";
 import { isResponseContinuationError } from "../runtime/responseErrors.js";
+import { TurnNotSubmittedError } from "../runtime/submissionErrors.js";
 import { AppServerRequestError } from "./AppServerConnection.js";
 import { workspaceSandboxFromConfig, workspaceSandboxFromResponse, type TurnSandboxPolicy, type WorkspaceSandboxPolicy } from "./AppServerPermissions.js";
 import { formatCodexError, mapCodexNotification } from "./CodexEventMapper.js";
@@ -309,8 +310,15 @@ export class CodexRuntime implements AgentRuntime {
 
   private async startTurnNow(sessionId: string, prompt: RuntimePrompt, responseContinuation = false): Promise<string> {
     const session = this.requireSession(sessionId);
-    const client = await this.client();
-    await this.ensureSessionResumed(session, client);
+    let { client, sandboxPolicy } = await (async () => {
+      try {
+        const client = await this.client();
+        await this.ensureSessionResumed(session, client);
+        return { client, sandboxPolicy: await this.turnSandboxPolicy(session, client) };
+      } catch (error) {
+        throw new TurnNotSubmittedError(error);
+      }
+    })();
     const start = async () => client.request<{ turn: { id: string } }>("turn/start", {
       threadId: session.remoteSessionId,
       input: responseContinuation ? [] : codexUserInput(prompt),
@@ -325,7 +333,7 @@ export class CodexRuntime implements AgentRuntime {
       } : {}),
       summary: "auto",
       approvalPolicy: session.permissionMode === "auto" ? "never" : "on-request",
-      sandboxPolicy: await this.turnSandboxPolicy(session, client),
+      sandboxPolicy,
     }, SESSION_REQUEST_TIMEOUT_MS);
     let response: { turn: { id: string } };
     try {
@@ -338,6 +346,7 @@ export class CodexRuntime implements AgentRuntime {
       );
       await this.resumeAppServerSession(session, client);
       session.needsResume = false;
+      sandboxPolicy = await this.turnSandboxPolicy(session, client);
       response = await start();
     }
     if (session.activeTurnId !== response.turn.id) {
