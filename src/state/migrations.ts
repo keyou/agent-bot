@@ -1,4 +1,12 @@
 export const migrations = [
+  `CREATE TABLE IF NOT EXISTS execution_provenance (
+    submission_id TEXT PRIMARY KEY, instruction_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+    local_session_id TEXT NOT NULL, turn_id TEXT, trigger TEXT NOT NULL, parent_source_turn_id TEXT,
+    scheduled_for INTEGER, submitted_at INTEGER NOT NULL, agent_name TEXT NOT NULL,
+    model_provider TEXT, model TEXT, reasoning_effort TEXT, permission_mode TEXT NOT NULL, cwd TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_execution_provenance_attempt ON execution_provenance(attempt_id);
+  CREATE INDEX IF NOT EXISTS idx_execution_provenance_turn ON execution_provenance(turn_id, local_session_id);`,
   `CREATE TABLE IF NOT EXISTS task_execution_control (
     local_session_id TEXT PRIMARY KEY,
     generation INTEGER NOT NULL DEFAULT 0

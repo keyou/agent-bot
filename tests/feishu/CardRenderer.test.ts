@@ -35,6 +35,19 @@ test("keeps historical detail loading failures separate from execution failures"
   expect(input.status).toBe("completed");
 });
 
+test("execution details show provenance without changing ordinary progress cards", () => {
+  const renderer = new CardRenderer();
+  const provenance = { submissionId: "submission", attemptId: "attempt", instructionId: "instruction", localSessionId: "task",
+    trigger: "plan_handoff" as const, parentSourceTurnId: "plan-turn", submittedAt: 1000,
+    settings: { agentName: "codex", modelProvider: "provider", model: "model", permissionMode: "confirm" as const, cwd: "/project" } };
+  const details = JSON.stringify(renderer.renderTurnDetails(state(), undefined, provenance));
+  expect(details).toContain("已批准方案续接");
+  expect(details).toContain("plan-turn");
+  expect(details).toContain("instruction");
+  expect(details).toContain("提交设置");
+  expect(JSON.stringify(renderer.renderTurn(state()))).not.toContain("执行来源");
+});
+
 test("source terminal management card retains reopen and close controls after the webpage is gone", () => {
   const renderer = new CardRenderer();
   const view = { contextKey: "chat_id:source", commandCardMessageId: "command", shellStarted: true, requestId: "recovery-id", terminalId: "original-id", approvalToken: "token", code: "123456", cwd: "/tmp",

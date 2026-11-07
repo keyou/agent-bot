@@ -13,6 +13,7 @@ import type {
   ToolState,
 } from "../runtime/types.js";
 import type { TurnActivity, TurnViewState, TurnViewStatus } from "../presentation/turnViewTypes.js";
+import type { ExecutionProvenance } from "../state/ExecutionProvenanceStore.js";
 import { visibleTurnActivities } from "../presentation/visibleTurnActivities.js";
 import { displayRuntimeError } from "../runtime/responseErrors.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
@@ -1345,11 +1346,25 @@ export class CardRenderer {
     );
   }
 
-  renderTurnDetails(state: TurnViewState, previewUrl?: string): Record<string, unknown> {
+  renderTurnDetails(state: TurnViewState, previewUrl?: string, provenance?: ExecutionProvenance): Record<string, unknown> {
     const title = state.taskTitle
       ? `任务执行详情：${truncateText(state.taskTitle.replace(/\s+/g, " ").trim(), 60)}`
       : "任务执行详情";
     const elements = [markdown(`Turn: \`${state.turnId}\``)];
+    if (provenance) {
+      const labels: Record<ExecutionProvenance["trigger"], string> = {
+        user: "用户消息", queue: "排队消息", schedule: "定时任务", recovery: "未提交请求恢复",
+        retry: "提交前重试", plan_handoff: "已批准方案续接", response_continuation: "模型空输入续接",
+      };
+      const settings = provenance.settings;
+      elements.push(markdown([
+        `**执行来源**：${labels[provenance.trigger]} · ${new Date(provenance.submittedAt).toLocaleString("zh-CN")}`,
+        `**原始指令**：${inlineCode(provenance.instructionId)}`,
+        provenance.parentSourceTurnId ? `**来源轮次**：${inlineCode(provenance.parentSourceTurnId)}` : undefined,
+        provenance.scheduledFor === undefined ? undefined : `**计划时间**：${new Date(provenance.scheduledFor).toLocaleString("zh-CN")}`,
+        `**提交设置**：${[settings.agentName, settings.modelProvider ?? "默认", settings.model ?? "默认", settings.reasoningEffort ?? "自动", permissionModeLabel(settings.permissionMode)].map(inlineCode).join(" / ")}`,
+      ].filter(Boolean).join("\n")));
+    }
     if (state.prompt) elements.push(markdown(`**Prompt**\n${truncateText(state.prompt, 1_000)}`));
     if (state.historyDetailError) {
       elements.push(markdown(`**历史执行详情读取失败**\n${truncateText(state.historyDetailError, 1_000)}\n请重新打开详情或 Preview 重试；本轮执行状态未改变。`));

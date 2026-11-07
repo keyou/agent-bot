@@ -6,6 +6,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { ScheduledTaskStore } from "../scheduling/ScheduledTaskStore.js";
 import { migrations } from "./migrations.js";
+import { ExecutionProvenanceStore } from "./ExecutionProvenanceStore.js";
 import type { UpdateCheckSchedule, UpdateNotice } from "../updates/types.js";
 import type { ConversationTurn, RuntimeExecutionSettings } from "../runtime/types.js";
 
@@ -294,6 +295,7 @@ export class StateStore {
   private readonly db: Database.Database;
   readonly previews: TurnPreviewJournal;
   readonly schedules: ScheduledTaskStore;
+  readonly provenance: ExecutionProvenanceStore;
 
   constructor(sqlitePath: string, onPreviewError?: (error: unknown) => void) {
     this.previews = new TurnPreviewJournal(path.join(path.dirname(sqlitePath), "turn-previews"), onPreviewError);
@@ -311,6 +313,7 @@ export class StateStore {
     this.ensureTurnAttemptColumns();
     this.ensureQueuedPromptColumns();
     this.schedules = new ScheduledTaskStore(this.db);
+    this.provenance = new ExecutionProvenanceStore(this.db);
     this.initializeContextSessionMappings();
     this.db.exec("DROP INDEX IF EXISTS idx_sessions_remote_session_id_unique");
     this.reconcileDuplicateRemoteSessions();

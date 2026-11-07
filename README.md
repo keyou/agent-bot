@@ -18,6 +18,8 @@ Recovery separates reattachment from resubmission. Only durably confirmed unsubm
 
 Stop persists its cancellation boundary before network operations. Pending preparation, retries and automatic continuations accepted before Stop cannot launch afterward, including after restart. An unsuccessful interrupt remains requested, not silently undone; termination is reported only when verified. Stop does not delete independent queued messages or future schedules. A new explicit instruction can start new work.
 
+`/turn <id or index>` details show the execution source, original instruction ID, dispatch time, optional parent Turn/planned time, and actual Agent/Provider/model/thinking/permission settings at submission. This metadata survives restart; ordinary progress cards are unchanged, and historical records without provenance are not guessed or backfilled.
+
 - Use your existing local Codex or TraeX login from Feishu
 - Create, continue, switch, fork, and stop tasks
 - Reset the current conversation from any successfully completed progress card

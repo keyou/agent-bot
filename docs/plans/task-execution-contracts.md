@@ -6,7 +6,7 @@ Implement six independently reviewable changes on `fix/task-execution-contracts`
 - [x] 2. Recover known execution without replaying ambiguous submissions. Durable dispatch boundary, exact turn matching and unknown queue guard; 873 focused tests and typecheck passed.
 - [x] 3. Persist Stop intent across automatic continuations and restarts. Durable generation checks, retained queues and late-ack interruption; focused tests and typecheck passed.
 - [x] 4. Represent uncertain execution explicitly and keep presentation consistent. Implemented before recovery as its dependency; 1040 focused tests and typecheck passed.
-- [ ] 5. Record minimal execution provenance and effective settings.
+- [x] 5. Record minimal execution provenance and effective settings. Persistent allowlisted metadata, logical instruction links and `/turn` details; 825 focused tests and typecheck passed.
 - [ ] 6. Add cross-module regression coverage for execution invariants.
 
 Preserve original history and thread IDs during settings changes. Preserve queued user instructions on Stop. Do not infer completion from final text alone. Use one progress card per turn and existing audit channels.

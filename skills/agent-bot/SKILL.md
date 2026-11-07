@@ -257,6 +257,8 @@ Use `init --reset` only for an explicitly requested full reset. Without `--profi
 
 ## After Code Changes
 
+Use `/turn <id or index>` execution details to explain why a recorded turn ran. Provenance includes trigger, logical instruction ID, optional parent/planned time and effective dispatch settings. It does not include Prompt bodies or credentials and is not reconstructed for old turns. Source `recovery` means confirmed unsubmitted preparation, not replay of submitted work.
+
 Stop durably invalidates preparation, retries and automatic continuations accepted before it. A failed interrupt never revokes that intent, including across restart; do not claim termination without confirmation. Independent queued messages and future schedules are retained. A new explicit user instruction can start new work. Do not send extra continuation prompts to defeat Stop.
 
 For tasks stuck after a Worker crash, inspect the recovery notice and any writer-conflict card before acting. Unconfirmed recovery checks stop after a one-minute window; a live writer conflict stops them immediately. Only durably proven unsubmitted requests may retry. Submitted turns are reattached by exact turn ID, never replayed on disconnect or transient model failure. Ambiguous execution is unverified, not cancelled; automatic queue dispatch pauses without deleting queued messages. Inspect execution records before explicitly continuing with a new message. An old unfinished rollout or a leftover lock file alone is not proof of a running task. Do not delete locks, edit task state, or close another Agent process automatically. Already-confirmed live turns remain monitored; ask the user before stopping them.

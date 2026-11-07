@@ -103,6 +103,7 @@ import {
   type TurnRuntimeOriginRecord,
 } from "../state/StateStore.js";
 import { SessionOperationQueue } from "./SessionOperationQueue.js";
+import type { ExecutionTrigger } from "../state/ExecutionProvenanceStore.js";
 import { createId } from "../utils/id.js";
 import { formatStorageSize } from "../utils/formatStorageSize.js";
 import { truncateMiddle, truncateText } from "../utils/markdown.js";
@@ -121,6 +122,9 @@ interface LoadedSession {
 }
 
 interface StartTurnOptions {
+  trigger?: ExecutionTrigger;
+  instructionId?: string;
+  parentSourceTurnId?: string;
   executionGeneration?: number;
   scheduleRunId?: string;
   attemptId?: string;
@@ -2985,6 +2989,7 @@ export class ProxySessionController {
       {
         attemptId: attempt.attemptId,
         executionGeneration: attempt.executionGeneration,
+        trigger: "recovery",
         messageId: attempt.messageId,
         displayPrompt: recoveryCardPrompt(attempt.promptText),
         preserveAttemptOnFailure: true,
@@ -4299,6 +4304,18 @@ export class ProxySessionController {
     let runtimeText = text;
     let cardPrompt = options.displayPrompt ?? text;
     let retriedStart = false;
+    const recordSubmission = (): void => {
+      const runtimeSession = loaded.runtime.getSession(loaded.record.localSessionId) ?? loaded.session;
+      const run = options.scheduleRunId ? this.store.schedules.getRun(options.scheduleRunId) : undefined;
+      this.store.provenance.recordSubmission({
+        attemptId, localSessionId: loaded.record.localSessionId,
+        instructionId: options.instructionId ?? options.messageId,
+        trigger: retriedStart ? "retry" : options.trigger ?? (options.scheduleRunId ? "schedule" : "user"),
+        parentSourceTurnId: options.parentSourceTurnId,
+        scheduledFor: run?.scheduledFor,
+        settings: runtimeSession,
+      });
+    };
     try {
       while (true) {
         let pendingTurnId: string | undefined;
@@ -4343,6 +4360,7 @@ export class ProxySessionController {
               throw new Error("模型续接恢复已取消。");
             }
             this.store.beginTurnAttemptSubmission(attemptId);
+            recordSubmission();
             turnId = await loaded.runtime.recoverResponseContinuation(loaded.record.localSessionId, options.responseContinuationTurnId, recovery.abort.signal);
           } else {
             if (options.scheduleRunId) {
@@ -4353,6 +4371,7 @@ export class ProxySessionController {
               this.store.schedules.saveRun({ ...run!, status: "submitting" });
             }
             this.store.beginTurnAttemptSubmission(attemptId);
+            recordSubmission();
             turnId = await loaded.runtime.startTurn(
               loaded.record.localSessionId,
               options.approvedPlanTurnId
@@ -4436,6 +4455,7 @@ export class ProxySessionController {
       if (retriedStart) this.llmRetryingSessions.delete(loaded.record.localSessionId);
     }
     const attempt = this.store.getTurnAttempt(attemptId);
+    this.store.provenance.bindLatestTurn(attemptId, turnId);
     if (this.store.executionGeneration(loaded.record.localSessionId) !== executionGeneration) {
       this.store.updateTurnAttempt(attemptId, { turnId, submissionState: "submitted", status: "cancelling" });
       try {
@@ -5140,6 +5160,7 @@ export class ProxySessionController {
       }
       if (event.type === "turn_started") {
         const attempt = this.store.bindTurnAttempt(event.sessionId, event.turnId);
+        if (attempt) this.store.provenance.bindLatestTurn(attempt.attemptId, event.turnId);
         const scheduledRun = attempt ? this.store.schedules.getRun(attempt.attemptId) : undefined;
         if (scheduledRun) this.store.schedules.saveRun({ ...scheduledRun, status: "running", turnId: event.turnId });
         if (attempt?.recoveredFromTurnId && attempt.recoveredFromTurnId !== event.turnId) {
@@ -5317,6 +5338,7 @@ export class ProxySessionController {
             undefined,
             { messageId: attempt.messageId, displayPrompt: "方案已确认，继续执行", approvedPlanTurnId: turnId,
               executionGeneration: attempt.executionGeneration,
+              trigger: "plan_handoff", parentSourceTurnId: turnId,
               ...(scheduledRun ? { attemptId: attempt.attemptId, scheduleRunId: attempt.attemptId } : {}) },
           );
         }
@@ -5414,6 +5436,7 @@ export class ProxySessionController {
         {
           attemptId: attempt.attemptId,
           executionGeneration: attempt.executionGeneration,
+          trigger: "response_continuation", parentSourceTurnId: event.turnId,
           messageId: attempt.messageId,
           displayPrompt: responseContinuation ? `恢复模型续接：${attempt.promptText}` : llmRetryCardPrompt(attempt.promptText, retryNumber),
           preserveAttemptOnFailure: true,
@@ -5541,6 +5564,7 @@ export class ProxySessionController {
         prompt.replyMessageId ? { messageId: prompt.replyMessageId, replyInThread: true } : undefined,
         prompt.localImagePaths,
         { messageId: prompt.messageId, displayPrompt: prompt.displayPrompt, executionGeneration,
+          trigger: scheduledRun ? "schedule" : "queue", instructionId: prompt.promptId,
           ...(scheduledRun ? { attemptId: prompt.promptId, scheduleRunId: prompt.promptId } : {}) },
       );
       if (prompt.messageId) await this.bindMessageReactionToTurn(prompt.messageId, sessionId, turnId);
@@ -7206,6 +7230,7 @@ export class ProxySessionController {
       && !this.store.getTurnPromptSummary(turnId)) {
       await this.outbound.sendInteractiveCard(contextKey, this.cardRenderer.renderTurnDetails(
         this.runningTurnSnapshot(current, turnId),
+        undefined, this.store.provenance.forTurn(turnId, current.localSessionId),
       ));
       return;
     }

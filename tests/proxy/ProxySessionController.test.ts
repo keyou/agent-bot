@@ -976,6 +976,9 @@ describe("scheduled prompt integration", () => {
     await vi.waitFor(() => expect(f.store.schedules.getRun(run.id)).toMatchObject({ status: "running", turnId: "implementation" }));
     expect(f.store.schedules.runs(f.job.id)).toHaveLength(1);
     expect(f.store.getTurnAttempt(run.id)).toMatchObject({ status: "running", turnId: "implementation" });
+    expect(f.store.provenance.forTurn("implementation", f.id)).toMatchObject({
+      trigger: "plan_handoff", instructionId: run.id, parentSourceTurnId: "turn_1", scheduledFor: run.scheduledFor,
+    });
     expect(vi.mocked(f.outbound.sendText).mock.calls.filter(([, text]) => text === "scheduled prompt")).toHaveLength(1);
   });
 
@@ -1925,6 +1928,9 @@ describe("ProxySessionController", () => {
       const failed = { type: "turn_failed" as const, sessionId: session.localSessionId, turnId: "turn_1", message: error };
       for (const listener of f.listeners) { listener(failed); listener(failed); }
       await vi.waitFor(() => expect(f.store.getTurnAttempt(attemptId)).toMatchObject({ turnId: "continued", retryCount: 1, status: "running" }));
+      expect(f.store.provenance.forTurn("continued", session.localSessionId)).toMatchObject({
+        instructionId: "m-finish release", trigger: "response_continuation", parentSourceTurnId: "turn_1",
+      });
       expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
       expect(f.runtime.recoverResponseContinuation).toHaveBeenCalledExactlyOnceWith(session.localSessionId, "turn_1", expect.any(AbortSignal));
       expect(f.presenter.startPendingTurn).toHaveBeenLastCalledWith(session.localSessionId, "chat_id:c1", expect.any(String),
@@ -2054,6 +2060,9 @@ describe("ProxySessionController", () => {
       status: "running",
       turnId: "turn_1",
     });
+    const records = store.provenance.listForAttempt(store.findIncompleteTurnAttemptForSession(session.localSessionId)!.attemptId);
+    expect(records.map((entry) => entry.trigger)).toEqual(["user", "retry", "retry", "retry"]);
+    expect(new Set(records.map((entry) => entry.instructionId)).size).toBe(1);
   });
 
   test("keeps a disconnected submitted turn unverified without replay", async () => {
@@ -13340,6 +13349,7 @@ describe("deferred Provider settings", () => {
     expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
     await f.controller.onMessage(message("continue explicitly"));
     expect(f.runtime.startTurn).toHaveBeenCalledTimes(2);
+    expect(f.store.provenance.forTurn("retry-turn", f.id)?.settings.modelProvider).toBe("azure");
     expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
   });
 

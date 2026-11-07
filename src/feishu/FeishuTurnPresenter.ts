@@ -31,6 +31,7 @@ interface TurnDeliveryRecord {
 }
 
 export interface TurnPresentationStore {
+  provenance?: Pick<import("../state/ExecutionProvenanceStore.js").ExecutionProvenanceStore, "forTurn">;
   previews?: TurnPreviewJournal;
   saveTurnSnapshot(turnId: string, localSessionId: string, snapshot: unknown, contextKey?: string): void;
   promotePendingTurn(
@@ -644,6 +645,7 @@ export class FeishuTurnPresenter {
     return this.renderer.renderTurnDetails(
       normalizeTurnCardMarkdown(state, this.options.localFileUrl),
       this.turnPreviewUrl(state),
+      this.store.provenance?.forTurn(state.turnId, state.sessionId),
     );
   }
 
