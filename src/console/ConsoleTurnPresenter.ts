@@ -61,6 +61,8 @@ export class ConsoleTurnPresenter implements TurnPresenter {
       await this.outbound.sendMarkdown(contextKey, event.finalResponse || "(completed without text)");
     } else if (event.type === "turn_failed") {
       await this.outbound.sendText(contextKey, `${this.agentLabel(event.sessionId)} failed: ${event.message}`);
+    } else if (event.type === "turn_status_unknown") {
+      await this.outbound.sendText(contextKey, `${this.agentLabel(event.sessionId)} execution unverified: ${event.message}`);
     } else if (event.type === "turn_cancelled") {
       await this.outbound.sendText(contextKey, `${this.agentLabel(event.sessionId)} stopped.`);
     }

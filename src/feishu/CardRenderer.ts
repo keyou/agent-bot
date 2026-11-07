@@ -1782,6 +1782,7 @@ function renderTurnElements(
   if (state.fileSummary.length > 0) elements.push(fileSummaryPanel(state));
 
   if (state.approval) elements.push(...renderApprovalElements(state, state.approval));
+  if (state.statusMessage) elements.push(markdown(codeBlock(state.statusMessage, 2_000)));
   if (state.error) elements.push(markdown(codeBlock(displayRuntimeError(state.error), 2_000)));
   const showAssistantText = state.assistantText && assistantTextMode === "always";
   if (showAssistantText) {
@@ -1822,6 +1823,7 @@ function renderGroupedTurnElements(
   if (state.fileSummary.length > 0) elements.push(fileSummaryPanel(state));
 
   if (state.approval) elements.push(...renderApprovalElements(state, state.approval));
+  if (state.statusMessage) elements.push(markdown(codeBlock(state.statusMessage, 2_000)));
   if (state.error) elements.push(markdown(codeBlock(displayRuntimeError(state.error), 2_000)));
   const showAssistantText = state.assistantText && assistantTextMode === "always";
   if (showAssistantText) {
@@ -1911,6 +1913,7 @@ function escapeApprovalText(value: string): string {
 }
 
 function emptyTurnText(status: TurnViewStatus, agentLabel?: string): string {
+  if (status === "unknown") return "执行状态待核实，未自动重发。";
   const label = agentLabel?.trim().replace(/[\r\n]+/g, " ") || "Agent";
   if (status === "starting") return `正在连接 ${label}…`;
   if (status === "completed") return "本轮已完成。";
@@ -2849,6 +2852,7 @@ function persistedTaskStatus(sessionStatus: string, lastTurnStatus?: string): st
 }
 
 function turnTitle(status: TurnViewStatus, prompt?: string): string {
+  if (status === "unknown") return `待核实${prompt ? `：${truncateTurnPrompt(prompt)}` : ""}`;
   const reactionEmoji = status === "completed"
     ? "✅"
     : status === "failed"
@@ -2879,6 +2883,7 @@ function truncateTurnPrompt(prompt?: string): string {
 }
 
 function turnTemplate(status: TurnViewStatus): string {
+  if (status === "unknown") return "orange";
   if (status === "completed") return "green";
   if (status === "failed") return "red";
   if (status === "cancelled") return "grey";

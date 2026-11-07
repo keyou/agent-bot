@@ -23,6 +23,15 @@ function state(tool?: Partial<ToolState>): TurnViewState {
 }
 
 describe("Turn Preview", () => {
+  test("shows unverified execution without an elapsed timer or a false completion", () => {
+    const unknown = reduceTurnEvent(state(), { type: "turn_status_unknown", sessionId: "session", turnId: "turn", message: "lost <connection>" });
+    const view = renderTurnPreviewSnapshot(unknown);
+    expect(view.statusLabel).toBe("待核实");
+    expect(view.terminal).toBe(false);
+    expect(view.metadata).not.toContain("data-live-elapsed");
+    expect(view.content).toContain("lost &lt;connection&gt;");
+    expect(view.content).not.toContain("正在等待 Agent 返回进度");
+  });
   test.each(["zh", "en"] as const)("deduplicates terminal errors in %s snapshots and removes the live SSE warning", (language) => {
     const message = JSON.stringify({ type: "error", status: 400, error: {
       message: "Persisted response <script> cannot be replayed.",

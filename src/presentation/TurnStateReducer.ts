@@ -4,6 +4,7 @@ import type { MessageReplyTarget } from "../feishu/types.js";
 import { formatStorageSize } from "../utils/formatStorageSize.js";
 import type { FileSummary, TurnActivity, TurnReasoningItem, TurnViewState } from "./turnViewTypes.js";
 import { turnReasoningItems } from "./turnReasoning.js";
+import { canApplyTurnEvent } from "./turnStatus.js";
 
 const MAX_TEXT = 6_000;
 const MAX_COMPLETED_TOOLS = 20;
@@ -60,6 +61,7 @@ export function hydrateTurnViewState(summary: TurnViewState, details: RemoteTurn
       summary.agentLabel, summary.model, summary.promptImagePaths, summary.modelProvider),
     historyDetail: "full",
     historyDetailError: undefined,
+    statusMessage: undefined,
   };
   let hasPrompt = false;
   const identity = { sessionId: state.sessionId, turnId: state.turnId };
@@ -107,7 +109,7 @@ export function hydrateTurnViewState(summary: TurnViewState, details: RemoteTurn
 }
 
 export function reduceTurnEvent(state: TurnViewState, event: AgentEvent, complete = false): TurnViewState {
-  if (event.sessionId !== state.sessionId || event.turnId !== state.turnId) return state;
+  if (!canApplyTurnEvent(state, event)) return state;
   const next = reduceEvent(state, event);
   if (!complete) return next;
   if (event.type === "turn_completed") next.finalResponse = event.finalResponse;
@@ -344,6 +346,8 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
       return {
         ...state,
         status: "completed",
+        statusMessage: undefined,
+        error: undefined,
         activeTool: undefined,
         approval: undefined,
         completedAt: state.startedAt + durationMs,
@@ -360,6 +364,7 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
       return {
         ...state,
         status: "cancelled",
+        statusMessage: undefined,
         activeTool: undefined,
         approval: undefined,
         completedAt,
@@ -371,6 +376,7 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
       return {
         ...state,
         status: "failed",
+        statusMessage: undefined,
         activeTool: undefined,
         approval: undefined,
         completedAt,
@@ -378,6 +384,19 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
         error: event.message,
       };
     }
+    case "turn_status_unknown":
+      return {
+        ...state,
+        status: "unknown",
+        statusMessage: event.message,
+        activeTool: undefined,
+        approval: undefined,
+        progressText: undefined,
+        contextCompactionStatus: undefined,
+        completedAt: undefined,
+        durationMs: undefined,
+        error: undefined,
+      };
   }
 }
 
@@ -389,7 +408,7 @@ export function continueTurnView(state: TurnViewState, turnId: string, startedAt
   return { ...state, turnId, previewTurnId: state.previewTurnId ?? state.turnId,
     continuedFromTurnId: state.turnId, continuedToTurnId: undefined, segmentStartedAt: startedAt,
     status: "running", completedAt: undefined, durationMs: undefined, finalResponse: undefined,
-    error: undefined, approval: undefined, activeTool: undefined, assistantText: "", progressText: undefined };
+    error: undefined, statusMessage: undefined, approval: undefined, activeTool: undefined, assistantText: "", progressText: undefined };
 }
 
 function approvalHistoryText(request: ApprovalRequest, decision?: ApprovalDecision, automatic = false): string {

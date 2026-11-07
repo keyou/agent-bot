@@ -756,7 +756,7 @@ describe("CodexRuntime", () => {
     await expect(runtime.release({ force: true })).resolves.toEqual({ status: "released" });
     expect(release).toHaveBeenCalledOnce();
     expect(events).toContainEqual({
-      type: "turn_failed",
+      type: "turn_cancelled",
       sessionId: "release-local",
       turnId: "turn_1",
       message: "Task interrupted because Agent Bot released the App Server.",
@@ -1967,7 +1967,7 @@ describe("CodexRuntime", () => {
     await expect(pending).resolves.toEqual({ decision: "acceptForSession" });
   });
 
-  test("fails an active turn on App Server exit and resumes the thread before the next turn", async () => {
+  test("marks execution unknown on App Server exit and resumes before the next explicit turn", async () => {
     const client = new FakeAppServerClient();
     let disconnect: ((error: Error) => void) | undefined;
     const runtime = new CodexRuntime({
@@ -1984,7 +1984,8 @@ describe("CodexRuntime", () => {
     await runtime.startTurn("s1", "first");
 
     disconnect?.(new Error("process exited"));
-    expect(events).toContainEqual(expect.objectContaining({ type: "turn_failed", message: expect.stringContaining("process exited") }));
+    expect(events).toContainEqual(expect.objectContaining({ type: "turn_status_unknown", message: expect.stringContaining("process exited") }));
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
     expect(runtime.getSession("s1")?.activeTurnId).toBeUndefined();
 
     await runtime.startTurn("s1", "second");

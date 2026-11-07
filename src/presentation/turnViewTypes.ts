@@ -6,6 +6,7 @@ export type TurnViewStatus =
   | "running"
   | "tool_running"
   | "waiting_for_approval"
+  | "unknown"
   | "completed"
   | "cancelled"
   | "failed";
@@ -52,6 +53,8 @@ export interface TurnViewState {
   projectCwd?: string;
   replyTarget?: MessageReplyTarget;
   status: TurnViewStatus;
+  /** Execution uncertainty, independent of transport connectivity and final delivery. */
+  statusMessage?: string;
   startedAt: number;
   completedAt?: number;
   durationMs?: number;

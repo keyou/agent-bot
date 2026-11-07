@@ -1696,7 +1696,7 @@ export class CodexRuntime implements AgentRuntime {
         session.activeTurnStartedAt = undefined;
         session.messagePhases.clear();
         this.emit({
-          type: "turn_failed",
+          type: "turn_status_unknown",
           sessionId: session.localSessionId,
           turnId: activeTurnId,
           message: "The App Server no longer reports this execution in the thread history.",
@@ -1907,7 +1907,7 @@ export class CodexRuntime implements AgentRuntime {
       session.activeTurnStartedAt = undefined;
       session.generatedImagePaths = [];
       this.emit({
-        type: "turn_failed",
+        type: intentionalRelease ? "turn_cancelled" : "turn_status_unknown",
         sessionId: session.localSessionId,
         turnId,
         message: intentionalRelease

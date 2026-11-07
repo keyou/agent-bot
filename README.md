@@ -10,6 +10,8 @@ Use local Codex, TraeX, and compatible ACP agents through Feishu.
 
 Agent Bot runs on your computer and connects a Feishu bot to your local coding agents. Send a message to start working; the bot updates a progress card while the agent runs and sends the final answer as Markdown.
 
+Cards, task lists and Turn Preview show **Unverified** when execution cannot be confirmed. Connection loss is not a failed or completed task; a later verified result updates the same card. Preview connectivity and final-message delivery are tracked separately from execution.
+
 ## What You Can Do
 
 - Use your existing local Codex or TraeX login from Feishu

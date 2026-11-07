@@ -113,6 +113,7 @@ export type AgentEvent =
   | { type: "approval_resolved"; sessionId: string; turnId: string; requestId: string; decision: ApprovalDecision; automatic?: boolean }
   | { type: "turn_completed"; sessionId: string; turnId: string; finalResponse: string; durationMs?: number; approvedPlan?: boolean }
   | { type: "turn_cancelled"; sessionId: string; turnId: string }
+  | { type: "turn_status_unknown"; sessionId: string; turnId: string; message: string }
   | { type: "turn_failed"; sessionId: string; turnId: string; message: string };
 
 export interface SessionMetadataUpdatedEvent {

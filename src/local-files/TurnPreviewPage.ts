@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { approvalActivityId } from "../presentation/TurnStateReducer.js";
+import { isSettledTurnStatus } from "../presentation/turnStatus.js";
 import path from "node:path";
 import { enableDiagramFences, DIAGRAM_PREVIEW_CLIENT_SCRIPT, DIAGRAM_PREVIEW_CSS } from "./DiagramPreview.js";
 import MarkdownIt from "markdown-it";
@@ -70,6 +71,7 @@ const PREVIEW_LABELS = {
       running: "正在处理",
       tool_running: "正在处理",
       waiting_for_approval: "等待确认",
+      unknown: "待核实",
       completed: "已完成",
       cancelled: "已停止",
       failed: "执行失败",
@@ -114,6 +116,7 @@ const PREVIEW_LABELS = {
       running: "Processing",
       tool_running: "Processing",
       waiting_for_approval: "Waiting for approval",
+      unknown: "Unverified",
       completed: "Completed",
       cancelled: "Stopped",
       failed: "Failed",
@@ -656,7 +659,7 @@ export function renderTurnPreviewSnapshot(
   const renderText = (value: string): string => renderMarkdown(value, state.projectCwd, localFileUrl, language);
   const timeline = renderTimeline({ ...state, activities: visibleTurnActivities(state) }, renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd, options.deferDetails);
   const terminal = isTerminal(state.status);
-  const waitingForProgress = !terminal && !state.finalResponse && !state.assistantText
+  const waitingForProgress = !isSettledTurnStatus(state.status) && !state.finalResponse && !state.assistantText
     && !state.error && !state.approval && state.status !== "waiting_for_approval"
     && state.plan.length === 0 && state.fileSummary.length === 0;
   const timelineContent = timeline || (waitingForProgress
@@ -675,11 +678,12 @@ export function renderTurnPreviewSnapshot(
     `<section class="timeline" data-preview-key="timeline"${timelineContent ? "" : " hidden"}>${timelineContent}</section>`,
     state.fileSummary.length > 0 ? renderFileSummary(state, language, resolveFileUrl, options.deferDetails) : "",
     state.approval ? renderApprovalNotice(state.approval, renderText, language) : "",
+    state.statusMessage ? `<section class="notice" data-preview-key="execution-status">${escapeHtml(state.statusMessage)}</section>` : "",
     state.error ? `<section class="result error-result" data-preview-key="error"><h2>${escapeHtml(labels.error)}</h2><pre>${escapeHtml(displayRuntimeError(state.error))}</pre></section>` : "",
     state.finalResponse
       ? renderFinalAnswer(state.finalResponse, state.turnId, renderText, language)
       : state.assistantText
-        ? `<section class="result" data-preview-key="result"><h2>${escapeHtml(labels.generating)}</h2><div class="markdown">${renderText(state.assistantText)}</div></section>`
+        ? `<section class="result" data-preview-key="result"><h2>${escapeHtml(state.status === "unknown" ? labels.result : labels.generating)}</h2><div class="markdown">${renderText(state.assistantText)}</div></section>`
         : "",
   ].filter(Boolean).join("");
   return {
@@ -1211,7 +1215,7 @@ function renderMetadata(state: TurnViewState, language: TurnPreviewLanguage): st
   const completedAt = state.completedAt ?? (isTerminal(state.status) && state.durationMs !== undefined
     ? state.startedAt + state.durationMs
     : undefined);
-  const elapsed = `<span>${escapeHtml(labels.elapsed)}<strong${isTerminal(state.status) ? "" : ` data-live-elapsed data-started-at="${state.startedAt}"`}>${completedAt === undefined && isTerminal(state.status) ? escapeHtml(labels.unknown) : formatDuration((completedAt ?? Date.now()) - state.startedAt)}</strong></span>`;
+  const elapsed = `<span>${escapeHtml(labels.elapsed)}<strong${isSettledTurnStatus(state.status) ? "" : ` data-live-elapsed data-started-at="${state.startedAt}"`}>${completedAt === undefined && isSettledTurnStatus(state.status) ? escapeHtml(labels.unknown) : formatDuration((completedAt ?? Date.now()) - state.startedAt)}</strong></span>`;
   const fields = [
     elapsed,
     state.modelProvider?.trim() ? `<span title="Provider">${escapeHtml(state.modelProvider.trim())}</span>` : "",
@@ -1315,7 +1319,7 @@ h2 span { margin-left: 6px; color: var(--muted); font-size: 12px; font-weight: 4
 .status { display: inline-flex; align-items: center; gap: 8px; }
 .status::before { content: "·"; color: var(--muted); }
 .status.starting, .status.running, .status.tool_running, .tool-state.running { color: var(--accent); }
-.status.waiting_for_approval { color: #926a08; }
+.status.waiting_for_approval, .status.unknown { color: #926a08; }
 .status.completed, .tool-state.completed { color: var(--success); }
 .status.cancelled { color: var(--muted); }
 .status.failed, .tool-state.failed { color: var(--danger); }

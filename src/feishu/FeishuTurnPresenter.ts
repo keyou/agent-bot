@@ -9,6 +9,7 @@ import {
 } from "../presentation/TurnStateReducer.js";
 import { splitMarkdown } from "../presentation/splitMarkdown.js";
 import type { TurnViewState } from "../presentation/turnViewTypes.js";
+import { canApplyTurnEvent, isSettledTurnStatus, isTerminalTurnStatus } from "../presentation/turnStatus.js";
 import { CardRenderer } from "./CardRenderer.js";
 import { CardUpdateScheduler } from "./CardUpdateScheduler.js";
 import { normalizeFeishuMarkdown, type LocalFileUrlResolver } from "./FeishuMarkdown.js";
@@ -250,7 +251,7 @@ export class FeishuTurnPresenter {
     message: string,
   ): Promise<void> {
     const snapshot = this.store.getTurnSnapshot(turnId);
-    if (!isTurnViewState(snapshot) || snapshot.sessionId !== sessionId || isTerminalViewStatus(snapshot.status)) return;
+    if (!isTurnViewState(snapshot) || snapshot.sessionId !== sessionId || isTerminalTurnStatus(snapshot.status)) return;
     const completedAt = Date.now();
     const state: TurnViewState = {
       ...snapshot,
@@ -326,12 +327,15 @@ export class FeishuTurnPresenter {
 
   async onEvent(event: AgentEvent): Promise<void> {
     let existing = this.entries.get(event.turnId);
-    if (!existing) {
-      const saved = this.store.getTurnSnapshot(event.turnId);
-      if (isTurnViewState(saved) && saved.continuedToTurnId) return;
+    const saved = existing?.state ?? this.store.getTurnSnapshot(event.turnId);
+    if (isTurnViewState(saved)) {
+      if (saved.sessionId !== event.sessionId || saved.continuedToTurnId) return;
+      // Repeated terminal events may retry delivery, but must not rewrite the result.
+      if (!canApplyTurnEvent(saved, event) && !(isTerminalEvent(event) && isTerminalTurnStatus(saved.status))) return;
     }
     let eventApplied = false;
     if (event.type === "turn_completed" && event.approvedPlan) {
+      if (isTurnViewState(saved) && isSettledTurnStatus(saved.status)) return;
       const entry = existing ?? this.createEntry({ type: "progress", sessionId: event.sessionId,
         turnId: event.turnId, activityId: "plan-handoff", text: "方案已确认，继续执行" });
       if (!entry || entry.continuing) return;
@@ -345,7 +349,7 @@ export class FeishuTurnPresenter {
       await entry.scheduler?.flush(entry.state);
       return;
     }
-    if (!existing && event.type === "turn_started") {
+    if (!existing && !isTurnViewState(saved) && event.type === "turn_started") {
       const pending = this.pendingEntries.get(event.sessionId);
       if (pending?.continuing) {
         const previous = pending.state;
@@ -412,16 +416,25 @@ export class FeishuTurnPresenter {
 
     if (existing && !eventApplied) {
       event = presentationEvent(event, entry.state);
-      this.store.previews?.seed(entry.state);
-      this.store.previews?.event(event, entry.state.previewTurnId);
-      const previousStatus = entry.state.status;
-      entry.state = this.cardState(reduceTurnEvent(entry.state, event));
-      if (isTerminalViewStatus(previousStatus) && !event.type.startsWith("turn_")) entry.state.status = previousStatus;
-      this.persist(event.turnId, event.sessionId, entry.state, entry.contextKey, true);
+      if (canApplyTurnEvent(entry.state, event)) {
+        this.store.previews?.seed(entry.state);
+        this.store.previews?.event(event, entry.state.previewTurnId);
+        entry.state = this.cardState(reduceTurnEvent(entry.state, event));
+        this.persist(event.turnId, event.sessionId, entry.state, entry.contextKey, true);
+      }
     }
 
     await entry.initializing;
     if (!entry.scheduler) return;
+
+    if (event.type === "turn_status_unknown" && entry.state.status === "unknown") {
+      if (this.pendingEntries.get(event.sessionId) === entry) this.pendingEntries.delete(event.sessionId);
+      entry.continuing = false;
+      this.stopElapsedUpdates(entry);
+      if (!entry.historySnapshot) await entry.scheduler.flush(entry.state);
+      await this.syncThinkingCardReaction(entry);
+      return;
+    }
 
     if (isTerminalEvent(event)) {
       if (this.pendingEntries.get(event.sessionId) === entry) this.pendingEntries.delete(event.sessionId);
@@ -528,13 +541,13 @@ export class FeishuTurnPresenter {
 
   private persist(turnId: string, sessionId: string, state: TurnViewState, contextKey?: string, event = false): void {
     if (!this.store.previews) { this.store.saveTurnSnapshot(turnId, sessionId, state, contextKey); return; }
-    if (!event || isTerminalViewStatus(state.status)) this.store.previews.state(state);
+    if (!event || isSettledTurnStatus(state.status)) this.store.previews.state(state);
     const compact = compactTurnView(state);
     this.dirty.set(turnId, { state: compact, contextKey });
-    if (!event || isTerminalViewStatus(state.status) || state.status === "waiting_for_approval") {
+    if (!event || isSettledTurnStatus(state.status) || state.status === "waiting_for_approval") {
       this.store.previews.flush(state.previewTurnId ?? turnId, true);
       this.flushPersistence();
-      if (isTerminalViewStatus(state.status)) this.store.previews.release(state.previewTurnId ?? turnId);
+      if (isSettledTurnStatus(state.status)) this.store.previews.release(state.previewTurnId ?? turnId);
     } else if (!this.persistTimer) {
       this.persistTimer = setTimeout(() => {
         try { this.flushPersistence(); } catch (error) { this.options.onError?.(error); }
@@ -575,7 +588,7 @@ export class FeishuTurnPresenter {
         );
     this.store.previews?.seed(initial);
     event = presentationEvent(event, initial);
-    this.store.previews?.event(event, initial.previewTurnId);
+    if (canApplyTurnEvent(initial, event)) this.store.previews?.event(event, initial.previewTurnId);
     const state = this.cardState(reduceTurnEvent(initial, event));
     const entry = { contextKey, state, initializing: Promise.resolve() } as TurnEntry;
     this.entries.set(event.turnId, entry);
@@ -670,10 +683,10 @@ export class FeishuTurnPresenter {
   }
 
   private startElapsedUpdates(entry: TurnEntry): void {
-    if (entry.elapsedTimer || isTerminalViewStatus(entry.state.status)) return;
+    if (entry.elapsedTimer || isSettledTurnStatus(entry.state.status)) return;
     const intervalMs = Math.max(1, this.options.elapsedUpdateIntervalMs ?? DEFAULT_ELAPSED_UPDATE_INTERVAL_MS);
     entry.elapsedTimer = setInterval(() => {
-      if (isTerminalViewStatus(entry.state.status)) {
+      if (isSettledTurnStatus(entry.state.status)) {
         this.stopElapsedUpdates(entry);
         return;
       }
@@ -863,12 +876,8 @@ function isTerminalEvent(event: AgentEvent): boolean {
   return event.type === "turn_completed" || event.type === "turn_cancelled" || event.type === "turn_failed";
 }
 
-function isTerminalViewStatus(status: TurnViewState["status"]): boolean {
-  return status === "completed" || status === "cancelled" || status === "failed";
-}
-
 function thinkingCardReactionForStatus(status: TurnViewState["status"]): string | undefined {
-  if (status === "completed") return undefined;
+  if (status === "completed" || status === "unknown") return undefined;
   if (status === "failed") return THINKING_CARD_FAILED_REACTION;
   if (status === "cancelled") return THINKING_CARD_CANCELLED_REACTION;
   return THINKING_CARD_RUNNING_REACTION;

@@ -675,6 +675,68 @@ function fixture(
   };
 }
 
+describe("runtime event state consistency", () => {
+  test.each(["turn_completed", "turn_cancelled", "turn_failed"] as const)(
+    "keeps the current task head when an older %s event arrives", async (type) => {
+      const f = fixture();
+      await f.controller.onMessage(message("first instruction"));
+      const task = f.store.listSessions("chat_id:c1")[0]!;
+      const sessionId = task.localSessionId;
+      f.store.updateRuntimeSession(sessionId, { lastTurnId: "newer-turn", lastTurnStatus: "running" });
+      f.sessions.get(sessionId)!.activeTurnId = "newer-turn";
+      const event: RuntimeEvent = type === "turn_completed"
+        ? { type, sessionId, turnId: "turn_1", finalResponse: "old result" }
+        : type === "turn_failed" ? { type, sessionId, turnId: "turn_1", message: "old failure" }
+          : { type, sessionId, turnId: "turn_1" };
+      for (const listener of f.listeners) listener(event);
+      await vi.waitFor(() => expect(f.presenter.onEvent).toHaveBeenCalledWith(event));
+      expect(f.store.getSession(sessionId)).toMatchObject({
+        status: "running", lastTurnId: "newer-turn", lastTurnStatus: "running",
+      });
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("ignores an old turn start and cannot revive a completed current turn", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("first instruction"));
+    const sessionId = f.store.listSessions("chat_id:c1")[0]!.localSessionId;
+    f.store.updateRuntimeSession(sessionId, { lastTurnId: "newer-turn", lastTurnStatus: "completed" });
+    f.store.updateSession(sessionId, { status: "ready" });
+    f.sessions.get(sessionId)!.activeTurnId = undefined;
+    vi.mocked(f.presenter.onEvent).mockClear();
+    for (const turnId of ["turn_1", "newer-turn"]) {
+      for (const listener of f.listeners) listener({ type: "turn_started", sessionId, turnId, startedAt: 1 });
+    }
+    await Promise.resolve();
+    expect(f.presenter.onEvent).not.toHaveBeenCalled();
+    expect(f.store.getSession(sessionId)).toMatchObject({
+      status: "ready", lastTurnId: "newer-turn", lastTurnStatus: "completed",
+    });
+  });
+
+  test("keeps unknown execution distinct from failure until an authoritative result arrives", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("verify my work"));
+    const sessionId = f.store.listSessions("chat_id:c1")[0]!.localSessionId;
+    f.sessions.get(sessionId)!.activeTurnId = undefined;
+    Object.assign(f.remoteSessions[0]!, { status: "not_loaded", lastTurnId: "older-turn", lastTurnStatus: "completed" });
+    const unknown = { type: "turn_status_unknown", sessionId, turnId: "turn_1", message: "connection lost" } as const;
+    for (const listener of f.listeners) listener(unknown);
+    await vi.waitFor(() => expect(f.presenter.onEvent).toHaveBeenCalledWith(unknown));
+    expect(f.store.getSession(sessionId)).toMatchObject({ status: "ready", lastTurnId: "turn_1", lastTurnStatus: "unknown" });
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    await f.controller.onMessage(message("/status"));
+    expect(JSON.stringify(vi.mocked(f.outbound.sendInteractiveCard).mock.calls.at(-1)?.[1])).toContain("待核实");
+    await f.controller.onMessage(message("/sessions"));
+    expect(JSON.stringify(vi.mocked(f.outbound.sendInteractiveCard).mock.calls.at(-1)?.[1])).toContain("待核实");
+    const completed = { type: "turn_completed", sessionId, turnId: "turn_1", finalResponse: "verified result" } as const;
+    for (const listener of f.listeners) listener(completed);
+    await vi.waitFor(() => expect(f.presenter.onEvent).toHaveBeenCalledWith(completed));
+    expect(f.store.getSession(sessionId)).toMatchObject({ status: "ready", lastTurnId: "turn_1", lastTurnStatus: "completed" });
+  });
+});
+
 describe("scheduled prompt integration", () => {
   async function scheduledFixture() {
     const f = fixture();
@@ -7464,8 +7526,8 @@ describe("ProxySessionController", () => {
     expect(outbound.deleteReaction).toHaveBeenCalledWith("m-long task", "reaction_on_it");
   });
 
-  test("does not apply a stale cancelled reaction after the same turn is active again", async () => {
-    const { controller, store, outbound, listeners, presenter } = fixture();
+  test("does not revive a cancelled turn from a delayed start notification", async () => {
+    const { controller, store, outbound, listeners, presenter, sessions } = fixture();
     (outbound.addReaction as ReturnType<typeof vi.fn>).mockResolvedValue("reaction_on_it");
     let releaseCancelledPresentation!: () => void;
     const cancelledPresentation = new Promise<void>((resolve) => { releaseCancelledPresentation = resolve; });
@@ -7475,6 +7537,7 @@ describe("ProxySessionController", () => {
 
     await controller.onMessage(message("keep running"));
     const session = store.listSessions("chat_id:c1")[0]!;
+    sessions.get(session.localSessionId)!.activeTurnId = undefined;
     for (const listener of listeners) {
       listener({ type: "turn_cancelled", sessionId: session.localSessionId, turnId: "turn_1" });
     }
@@ -7492,9 +7555,9 @@ describe("ProxySessionController", () => {
     }
     releaseCancelledPresentation();
 
-    await vi.waitFor(() => expect(store.getSession(session.localSessionId)?.lastTurnStatus).toBe("running"));
-    expect(store.getMessageReaction("m-keep running")).toMatchObject({ status: "pending", emojiType: "OnIt" });
-    expect(outbound.addReaction).not.toHaveBeenCalledWith("m-keep running", "CrossMark");
+    await vi.waitFor(() => expect(store.getMessageReaction("m-keep running")?.status).toBe("cancelled"));
+    expect(store.getSession(session.localSessionId)?.lastTurnStatus).toBe("cancelled");
+    expect(outbound.addReaction).toHaveBeenCalledWith("m-keep running", "CrossMark");
   });
 
   test.each([false, true])("retains appended image paths for Preview after steering (reconciled: %s)", async (reconciled) => {

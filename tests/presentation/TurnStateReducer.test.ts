@@ -20,6 +20,24 @@ function event(type: AgentEvent["type"], fields: Record<string, unknown>): Agent
 }
 
 describe("TurnStateReducer", () => {
+  test.each([false, true])("keeps terminal adjudication monotonic in full=%s projections", (full) => {
+    const initial = createTurnViewState("s1", "turn_1", 1000);
+    for (const type of ["turn_completed", "turn_cancelled", "turn_failed"] as const) {
+      const settled = reduceTurnEvent(initial, event(type, { finalResponse: "Answer", message: "Failure", durationMs: 2000 }), full);
+      for (const stale of [
+        event("turn_started", { startedAt: 9000 }),
+        event("progress", { text: "Old progress" }),
+        event("tool_started", { tool: tool("stale", "Old tool", "running") }),
+        event("approval_requested", { request: { id: "stale", title: "Old approval", options: [] } }),
+        event("turn_cancelled", {}),
+        event("turn_failed", { message: "Conflicting failure" }),
+      ]) expect(reduceTurnEvent(settled, stale, full)).toBe(settled);
+      const completed = reduceTurnEvent(settled, event("turn_completed", { finalResponse: "Authoritative answer" }), full);
+      if (type === "turn_completed") expect(completed).toBe(settled);
+      else expect(completed).toMatchObject({ status: "completed", finalResponse: "Authoritative answer" });
+    }
+  });
+
 
   test.each(["completed", "failed", "cancelled"] as const)("reconstructs %s history without inventing tool timing or truncating full output", (status) => {
     const initial = { ...createTurnViewState("s1", "t1", 1), historyDetail: "summary" as const, historyDetailError: "old failure" };

@@ -46,6 +46,18 @@ function createFixture(delivered = false, renderer?: CardRenderer) {
 }
 
 describe("FeishuTurnPresenter", () => {
+  test("keeps one card for unknown execution and delivers a later authoritative answer once", async () => {
+    const { presenter, outbound } = createFixture();
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.onEvent({ type: "turn_status_unknown", sessionId: "s1", turnId: "turn_1", message: "Connection lost; check execution." });
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1))).toContain("待核实");
+    expect(outbound.sendMarkdown).not.toHaveBeenCalled();
+    await presenter.onEvent(completed("verified answer"));
+    await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+    await presenter.onEvent(completed("verified answer"));
+    expect(outbound.sendInteractiveCard).toHaveBeenCalledOnce();
+    expect(outbound.sendMarkdown).toHaveBeenCalledOnce();
+  });
   test("keeps approval and implementation on one card and one complete preview journal", async () => {
     const { outbound } = createFixture();
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agentbot-plan-card-"));

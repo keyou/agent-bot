@@ -5000,6 +5000,20 @@ export class ProxySessionController {
   }
 
   private async handleRuntimeEvent(event: RuntimeEvent): Promise<void> {
+    if (event.type === "turn_started" || event.type === "turn_completed" || event.type === "turn_cancelled"
+      || event.type === "turn_failed" || event.type === "turn_status_unknown") {
+      const current = this.store.getSession(event.sessionId);
+      if (event.type === "turn_started" && current?.status === "closed") return;
+      const saved = turnViewSnapshot(this.store.getTurnSnapshot(event.turnId));
+      const knownStatus = saved?.status ?? (current?.lastTurnId === event.turnId ? current.lastTurnStatus : undefined);
+      const terminalStatus = event.type === "turn_completed" ? "completed"
+        : event.type === "turn_cancelled" ? "cancelled" : event.type === "turn_failed" ? "failed" : undefined;
+      if (knownStatus && ["completed", "cancelled", "failed"].includes(knownStatus)
+        && (event.type === "turn_started" || event.type === "turn_status_unknown"
+          || (terminalStatus && terminalStatus !== knownStatus && terminalStatus !== "completed"))) return;
+      if (event.type === "turn_started" && current?.lastTurnId && current.lastTurnId !== event.turnId
+        && (saved || this.store.getTurnRuntimeOrigin(event.turnId))) return;
+    }
     if ("turnId" in event) {
       const recoveryAttempt = this.recoveryRetryStartedAt.size > 0
         ? this.store.findIncompleteTurnAttemptByTurnId(event.turnId) : undefined;
@@ -5088,10 +5102,23 @@ export class ProxySessionController {
         event.turnId,
         event.type === "turn_completed" ? "completed" : event.type === "turn_cancelled" ? "cancelled" : "failed",
       );
-      this.store.updateRuntimeSession(event.sessionId, {
-        lastTurnId: event.turnId,
-        lastTurnStatus: event.type === "turn_completed" ? "completed" : event.type === "turn_cancelled" ? "cancelled" : "failed",
-      });
+      const current = this.store.getSession(event.sessionId);
+      if (!current?.lastTurnId || current.lastTurnId === event.turnId) {
+        this.store.updateRuntimeSession(event.sessionId, {
+          lastTurnId: event.turnId,
+          lastTurnStatus: event.type === "turn_completed" ? "completed" : event.type === "turn_cancelled" ? "cancelled" : "failed",
+        });
+      }
+    } else if (event.type === "turn_status_unknown") {
+      const pending = this.store.findIncompleteTurnAttemptForSession(event.sessionId);
+      const attempt = this.store.findIncompleteTurnAttemptByTurnId(event.turnId);
+      if (attempt) this.store.updateTurnAttempt(attempt.attemptId, { status: "unknown" });
+      const current = this.store.getSession(event.sessionId);
+      if (!current?.lastTurnId || current.lastTurnId === event.turnId || pending?.pendingTurnId === event.turnId) {
+        this.store.updateRuntimeSession(event.sessionId, { lastTurnId: event.turnId, lastTurnStatus: "unknown" });
+        const active = current && this.runtimes.forAgent(current.agentName).getSession(event.sessionId)?.activeTurnId;
+        if (current?.status !== "closed" && !active) this.store.updateSession(event.sessionId, { status: "ready" });
+      }
     }
 
     const enrichedEvent: RuntimeEvent = event.type === "context_compaction"
@@ -5135,7 +5162,7 @@ export class ProxySessionController {
       const activeTurnId = latest
         ? this.runtimes.forAgent(latest.agentName).getSession(event.sessionId)?.activeTurnId
         : undefined;
-      if (latest?.lastTurnId === event.turnId && !activeTurnId) {
+      if (latest?.lastTurnId === event.turnId && latest.status !== "closed" && !activeTurnId) {
         this.store.updateSession(event.sessionId, { status: event.type === "turn_failed" ? "failed" : "ready" });
         await this.applyPendingProviderWhenIdle(event.sessionId);
         await this.scheduleNextQueuedPrompt(event.sessionId);
@@ -7639,7 +7666,7 @@ export class ProxySessionController {
         projectActions,
         cardEntry: {
           reference: entry.reference,
-          summary: `${offset + index + 1}. ${marker}${title} · ${entry.agentName}`,
+          summary: `${offset + index + 1}. ${marker}${title} · ${entry.agentName}${entry.status === "待核实" ? " · 待核实" : ""}`,
           detailLines: [
             `**最新 Prompt**：${cardText(lastUserPrompt)}`,
             `<font color='grey'>最近更新：${cardText(entry.updatedLabel)}</font>`,
@@ -8240,11 +8267,11 @@ export class ProxySessionController {
       queued = this.store.countQueuedPrompts(current.localSessionId);
       snapshot = turnViewSnapshot(current.lastTurnId ? this.store.getTurnSnapshot(current.lastTurnId) : undefined);
       const waitingForApproval = snapshot?.turnId === current.lastTurnId && snapshot?.status === "waiting_for_approval";
-      const statusLabel = waitingForApproval ? "等待确认"
+      const statusLabel = current.lastTurnStatus === "unknown" ? "待核实" : waitingForApproval ? "等待确认"
         : remoteActive && remote && localCurrent && !isBotOwnedActiveTurn(localCurrent, remote)
           ? "外部执行中"
           : sessionStatusLabel(current.status, activeTurnId);
-      const resultLabel = waitingForApproval ? "等待确认" : remoteActive
+      const resultLabel = current.lastTurnStatus === "unknown" ? "待核实" : waitingForApproval ? "等待确认" : remoteActive
         ? "执行中"
         : remoteTurnStatusLabel(remote?.lastTurnStatus ?? current.lastTurnStatus);
       taskLines.push(
@@ -9314,7 +9341,9 @@ function mergeTaskList(
     const local = localByRemoteId.get(agentRemoteKey(agentName, remote.id));
     if (local) representedLocalIds.add(local.localSessionId);
     const active = remote.status === "active" || remote.lastTurnStatus === "inProgress";
-    const status = remote.status === "active" || remote.lastTurnStatus === "inProgress"
+    const status = local?.lastTurnStatus === "unknown"
+      && (!remote.lastTurnStatus || remote.lastTurnId !== local.lastTurnId) ? "待核实"
+      : remote.status === "active" || remote.lastTurnStatus === "inProgress"
       ? local && isBotOwnedActiveTurn(local, remote) ? "执行中" : "外部执行中"
       : remoteSessionStatusLabel(remote.status);
     const recencyAt = remote.recencyAt ?? remote.updatedAt;
@@ -9346,7 +9375,7 @@ function mergeTaskList(
       agentName: local.agentName,
       title: local.title ?? "未命名任务",
       cwd: local.cwd,
-      status: sessionStatusLabel(local.status),
+      status: local.lastTurnStatus === "unknown" ? "待核实" : sessionStatusLabel(local.status),
       active: local.status === "running",
       current: local.localSessionId === currentLocalSessionId,
       lastUserPrompt: latestLocalUserPrompts.get(local.localSessionId),
@@ -9551,6 +9580,7 @@ function remoteTurnStatusLabel(status?: string): string {
     failed: "失败",
     running: "执行中",
     cancelled: "已停止",
+    unknown: "待核实",
   };
   return status ? labels[status] ?? status : "尚无执行记录";
 }
@@ -9567,6 +9597,7 @@ function turnViewStatusLabel(status: TurnViewState["status"]): string {
     running: "执行中",
     tool_running: "工具执行中",
     waiting_for_approval: "等待确认",
+    unknown: "待核实",
     completed: "已完成",
     cancelled: "已停止",
     failed: "失败",
@@ -9670,6 +9701,8 @@ function mapRemoteTurnStatus(status?: RemoteSessionSummary["lastTurnStatus"]): s
 
 function mergeRemoteTaskStatus(record: SessionRecord, remote?: RemoteSessionSummary): SessionRecord {
   if (!remote) return record;
+  if (record.lastTurnStatus === "unknown"
+    && (!remote.lastTurnStatus || remote.lastTurnId !== record.lastTurnId)) return record;
   const remoteTurnStatus = mapRemoteTurnStatus(remote.lastTurnStatus);
   const createdAt = remote.createdAt === undefined
     ? record.createdAt

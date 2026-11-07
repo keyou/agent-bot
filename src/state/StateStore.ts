@@ -174,7 +174,8 @@ export type TurnAttemptStatus =
   | "completed"
   | "failed"
   | "cancelled"
-  | "interrupted";
+  | "interrupted"
+  | "unknown";
 
 export interface TurnAttemptRecord {
   attemptId: string;
