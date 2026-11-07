@@ -9,7 +9,8 @@ import type {
   ThreadWriterProcess,
   ThreadWriterProcessController,
 } from "../../src/codex/ThreadWriterProcess.js";
-import type { AppConfig } from "../../src/config/schema.js";
+import type { AgentExecutionDefaults, AppConfig } from "../../src/config/schema.js";
+import * as agentExecutionDefaultsStore from "../../src/config/AgentExecutionDefaultsStore.js";
 import { generateGroupAvatarPng, resolveGroupAvatarProjectName } from "../../src/feishu/GroupAvatarGenerator.js";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
 import { FeishuTurnPresenter } from "../../src/feishu/FeishuTurnPresenter.js";
@@ -599,7 +600,7 @@ function fixture(
   const showUpdates = vi.fn(async () => undefined);
   const selectUpdate = vi.fn(async () => undefined);
   const rememberFeishuUserOpenId = vi.fn(async () => undefined);
-  const persistAgentExecutionDefaults = vi.fn(async () => undefined);
+  const persistAgentExecutionDefaults = vi.spyOn(agentExecutionDefaultsStore, "writeAgentExecutionDefaults");
   const shellCommandExecutor = vi.fn(async () => ({
     stdout: "README.md\nsrc\ntests\n",
     stderr: "",
@@ -631,7 +632,6 @@ function fixture(
       showUpdates,
       selectUpdate,
       rememberFeishuUserOpenId,
-      persistAgentExecutionDefaults,
     },
     shellCommandExecutor,
     windowsDriveLister,
@@ -11729,7 +11729,7 @@ describe("ProxySessionController", () => {
       value: { action: "settings_provider_select", sessionId: id, contextKey: "chat_id:c1", provider: "azure" } });
     expect(store.getSession(id)).toMatchObject({ localSessionId: id, remoteSessionId: "replacement", modelProvider: "azure" });
     expect(store.getUserContext("chat_id:c1")?.currentSessionId).toBe(id);
-    expect(persistAgentExecutionDefaults).toHaveBeenCalled();
+    expect(persistAgentExecutionDefaults).not.toHaveBeenCalled();
     expect(presenter.updateSessionModel).toHaveBeenCalledWith(id, original.model, "azure");
     await controller.onMessage(message("first message after switching"));
     expect(runtime.startTurn).toHaveBeenLastCalledWith(id, "first message after switching");
@@ -11754,15 +11754,14 @@ describe("ProxySessionController", () => {
     expect(persistAgentExecutionDefaults).not.toHaveBeenCalled();
   });
 
-  test.each(["defaults", "database"])("keeps the old empty-task binding when replacement persistence fails: %s", async (failure) => {
-    const { controller, runtime, store, config, persistAgentExecutionDefaults } = fixture();
+  test("keeps the old empty-task binding when task persistence fails", async () => {
+    const { controller, runtime, store, config } = fixture();
     await controller.onMessage(message("/new"));
     const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
     const original = runtime.getSession(id)!;
     vi.mocked(runtime.setExecutionSettings!).mockImplementationOnce(async (_id, settings, persist) => {
       const candidate = { ...original, ...settings, remoteSessionId: "replacement" };
-      if (failure === "defaults") persistAgentExecutionDefaults.mockRejectedValueOnce(new Error("defaults unavailable"));
-      else vi.spyOn(store, "updateRuntimeSession").mockImplementationOnce(() => { throw new Error("database unavailable"); });
+      vi.spyOn(store, "updateRuntimeSession").mockImplementationOnce(() => { throw new Error("database unavailable"); });
       await persist?.(candidate, { emptyRemoteSessionId: original.remoteSessionId });
       Object.assign(original, candidate);
       return original;
@@ -12003,19 +12002,20 @@ describe("ProxySessionController", () => {
     expect(persistAgentExecutionDefaults).not.toHaveBeenCalled();
   });
 
-  test("does not change task settings when saving Provider defaults fails", async () => {
+  test("can change task settings without writing a read-only Agent config", async () => {
     const { controller, runtime, store, config, presenter, persistAgentExecutionDefaults } = fixture();
     await controller.onMessage(message("/new"));
     const id = store.getUserContext("chat_id:c1")!.currentSessionId!;
     const original = store.getSession(id)!;
     const defaults = config.agents.codex?.defaults;
     vi.mocked(presenter.updateSessionModel).mockClear();
-    persistAgentExecutionDefaults.mockRejectedValueOnce(new Error("config is read-only"));
-    await expect(controller.controlTaskSettings(id, "provider", "azure")).rejects.toThrow("config is read-only");
-    expect(store.getSession(id)).toEqual(original);
-    expect(runtime.getSession(id)?.modelProvider).toBe(original.modelProvider);
+    persistAgentExecutionDefaults.mockImplementation(() => { throw new Error("config is read-only"); });
+    await controller.controlTaskSettings(id, "provider", "azure");
+    expect(store.getSession(id)).toMatchObject({ remoteSessionId: original.remoteSessionId, modelProvider: "azure" });
+    expect(runtime.getSession(id)?.modelProvider).toBe("azure");
     expect(config.agents.codex?.defaults).toEqual(defaults);
-    expect(presenter.updateSessionModel).not.toHaveBeenCalled();
+    expect(persistAgentExecutionDefaults).not.toHaveBeenCalled();
+    expect(presenter.updateSessionModel).toHaveBeenCalledWith(id, original.model, "azure");
   });
 
   test.each(["model-card", "model-cli", "provider-card", "provider-cli"])(
@@ -12222,18 +12222,8 @@ describe("ProxySessionController", () => {
       reasoningEffort: "xhigh",
       permissionMode: "confirm",
     });
-    expect(persistAgentExecutionDefaults).toHaveBeenLastCalledWith("codex", {
-      modelProvider: "azure",
-      model: "gpt-next",
-      reasoningEffort: "xhigh",
-      permissionMode: "confirm",
-    });
-    expect(config.agents.codex!.defaults).toEqual({
-      modelProvider: "azure",
-      model: "gpt-next",
-      reasoningEffort: "xhigh",
-      permissionMode: "confirm",
-    });
+    expect(persistAgentExecutionDefaults).not.toHaveBeenCalled();
+    expect(config.agents.codex!.defaults).toBeUndefined();
     card = (outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
     expect(JSON.stringify(card)).toContain("已切换为执行前确认模式");
   });
@@ -12314,7 +12304,7 @@ describe("ProxySessionController", () => {
     const updated = (outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
     const serialized = JSON.stringify(updated);
     expect(serialized).toContain("思考强度已切换为 `xhigh`");
-    expect(serialized).toContain("已保存为 `codex` Agent 的默认设置");
+    expect(serialized).toContain("只影响当前任务");
     expect(serialized).toContain('"tag":"markdown","content":"Thinking"');
     expect(serialized).toContain("✅ 当前");
     expect(serialized).toContain('"effort":"medium"');
@@ -12953,6 +12943,107 @@ describe("ProxySessionController", () => {
   });
 });
 
+describe("task setting isolation", () => {
+  const changes = [
+    { setting: "provider", value: "azure", action: { action: "settings_provider_select", provider: "azure" }, expected: { modelProvider: "azure" } },
+    { setting: "model", value: "gpt-next", action: { action: "settings_model_select", model: "gpt-next" }, expected: { model: "gpt-next", reasoningEffort: "medium" } },
+    { setting: "thinking", value: "low", action: { action: "settings_thinking_select", model: "gpt-test", effort: "low" }, expected: { reasoningEffort: "low" } },
+    { setting: "permissions", value: "confirm", action: { action: "settings_permission_select", permissionMode: "confirm" }, expected: { permissionMode: "confirm" } },
+  ] as const;
+
+  describe.each(["absent", "partial", "complete"] as const)("with %s Agent defaults", (defaultsKind) => {
+    test.each(changes.flatMap((change) => ["cli", "card"].map((entry) => ({ ...change, entry }))))(
+      "$entry $setting changes only the selected task, not unrelated tasks or config",
+      async ({ setting, value, action, expected, entry }) => {
+        const f = fixture();
+        const defaults: AgentExecutionDefaults | undefined = defaultsKind === "absent" ? undefined : defaultsKind === "partial"
+          ? { model: "gpt-test" }
+          : { modelProvider: "openai", model: "gpt-test", reasoningEffort: "high", permissionMode: "auto" as const };
+        if (defaults) f.config.agents.codex!.defaults = Object.freeze(defaults);
+        const originalConfig = structuredClone(f.config);
+        await f.controller.onMessage({ ...message("/new Existing unrelated"), contextKey: "chat_id:other" });
+        const otherId = f.store.getUserContext("chat_id:other")!.currentSessionId!;
+        const otherRecord = f.store.getSession(otherId);
+        const otherRuntime = { ...f.runtime.getSession(otherId)! };
+        await f.controller.onMessage(message("/new Selected"));
+        const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+        f.store.updateRuntimeSession(id, { lastTurnId: "history", lastTurnStatus: "completed" });
+        f.store.saveTurnSnapshot("history", id, { sessionId: id, turnId: "history", status: "completed", prompt: "Keep this history", startedAt: 1, completedAt: 2 }, "chat_id:c1");
+        const original = f.store.getSession(id)!;
+        const history = f.store.getTurnSnapshot("history");
+        const binding = f.store.getUserContext("chat_id:c1");
+        vi.mocked(f.runtime.createSession).mockClear();
+        vi.mocked(f.outbound.sendText).mockClear();
+        if (entry === "cli") await f.controller.controlTaskSettings(id, setting, value);
+        else await f.controller.onCardAction({ actionId: "select-setting", contextKey: "chat_id:c1", messageId: "settings-card", value: { ...action, sessionId: id } });
+
+        const identity = { localSessionId: id, remoteSessionId: original.remoteSessionId, lastTurnId: "history", lastTurnStatus: "completed" };
+        expect(f.store.getSession(id)).toMatchObject({ ...identity, ...expected });
+        expect(f.runtime.getSession(id)).toMatchObject(expected);
+        expect(f.store.getTurnSnapshot("history")).toEqual(history);
+        expect(f.store.getUserContext("chat_id:c1")).toEqual(binding);
+        expect(f.runtime.createSession).not.toHaveBeenCalled();
+        expect(f.runtime.forkSession).not.toHaveBeenCalled();
+        expect(f.runtime.startTurn).not.toHaveBeenCalled();
+        expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+        expect(f.store.getSession(otherId)).toEqual(otherRecord);
+        expect(f.runtime.getSession(otherId)).toEqual(otherRuntime);
+        expect(f.persistAgentExecutionDefaults).not.toHaveBeenCalled();
+        expect(f.config).toEqual(originalConfig);
+        expect(f.config.agents.codex!.defaults).toBe(defaults);
+        const notices = JSON.stringify(entry === "cli" ? vi.mocked(f.outbound.sendText).mock.calls : vi.mocked(f.outbound.updateInteractiveCard).mock.calls);
+        expect(notices).toContain("只影响当前任务");
+        expect(notices).not.toContain("Agent 的默认设置");
+
+        f.sessions.delete(id);
+        await f.controller.controlTaskSettings(id);
+        expect(f.runtime.getSession(id)).toMatchObject({ ...identity, ...expected });
+        await f.controller.onMessage({ ...message("/new Fresh unrelated"), contextKey: "chat_id:fresh" });
+        expect(f.runtime.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+          modelProvider: defaults?.modelProvider, model: defaults?.model, reasoningEffort: defaults?.reasoningEffort, permissionMode: defaults?.permissionMode ?? "auto",
+        }));
+        const freshId = f.store.getUserContext("chat_id:fresh")!.currentSessionId!;
+        expect(f.store.getSession(freshId)).toMatchObject({ modelProvider: "openai", model: "gpt-test", reasoningEffort: "high", permissionMode: "auto" });
+      },
+    );
+  });
+  test.each(["new", "newgroup", "fork", "forkgroup"])("/%s still inherits changed task settings instead of configured defaults", async (command) => {
+    const f = fixture();
+    const defaults = { modelProvider: "openai", model: "gpt-test", reasoningEffort: "high", permissionMode: "auto" as const };
+    f.config.agents.codex!.defaults = { ...defaults };
+    await f.controller.onMessage(message(`/new --dir "${path.dirname(f.config.storage.sqlitePath)}"`));
+    await f.controller.onMessage(message("source work"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    f.runtime.getSession(id)!.activeTurnId = undefined;
+    Object.assign(f.remoteSessions[0]!, { status: "idle", lastTurnId: "turn_1", lastTurnStatus: "completed" });
+    for (const listener of f.listeners) listener({ type: "turn_completed", sessionId: id, turnId: "turn_1", finalResponse: "source done" });
+    await vi.waitFor(() => expect(f.store.getSession(id)?.lastTurnStatus).toBe("completed"));
+    const history = f.store.getTurnSnapshot("turn_1");
+    await f.controller.controlTaskSettings(id, "provider", "azure");
+    await f.controller.controlTaskSettings(id, "model", "gpt-next");
+    await f.controller.controlTaskSettings(id, "thinking", "xhigh");
+    await f.controller.controlTaskSettings(id, "permissions", "confirm");
+    const settings = { modelProvider: "azure", model: "gpt-next", reasoningEffort: "xhigh", permissionMode: "confirm" };
+    expect(f.runtime.createSession).toHaveBeenCalledOnce();
+    expect(f.runtime.forkSession).not.toHaveBeenCalled();
+    const source = f.store.getSession(id)!;
+    await f.controller.onMessage({ ...message(command === "fork" ? "/fork" : `/${command} Inherited`), userId: "ou_user" });
+    const inheritedContext = command.endsWith("group") ? "chat_id:oc_new_group" : "chat_id:c1";
+    const inheritedId = f.store.getUserContext(inheritedContext)!.currentSessionId!;
+    expect(inheritedId).not.toBe(id);
+    expect(f.store.getSession(inheritedId)).toMatchObject(settings);
+    expect(command.startsWith("fork") ? f.runtime.forkSession : f.runtime.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      ...settings, cwd: source.cwd,
+      ...(command.startsWith("fork") ? { remoteSessionId: source.remoteSessionId, lastTurnId: "turn_1" } : {}),
+    }));
+    expect(f.store.getSession(id)).toMatchObject({ remoteSessionId: source.remoteSessionId, lastTurnId: "turn_1", ...settings });
+    expect(f.store.getTurnSnapshot("turn_1")).toEqual(history);
+    expect(f.config.agents.codex!.defaults).toEqual(defaults);
+    expect(f.persistAgentExecutionDefaults).not.toHaveBeenCalled();
+    expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+  });
+});
+
 describe("deferred Provider settings", () => {
   async function runningFixture() {
     const f = fixture();
@@ -12993,11 +13084,15 @@ describe("deferred Provider settings", () => {
     await vi.waitFor(() => expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce());
     await vi.waitFor(() => expect(f.store.getPendingProviderSettings(f.id)).toBeUndefined());
     expect(f.store.getSession(f.id)).toMatchObject({ modelProvider: "azure", model: "gpt-next" });
+    expect(f.config.agents.codex?.defaults).toEqual(defaults);
+    expect(f.persistAgentExecutionDefaults).not.toHaveBeenCalled();
     expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
   });
 
   test("model tab follows the draft Provider, edits stay pending, and queued turns use the latest settings", async () => {
     const f = await runningFixture();
+    const defaults = { modelProvider: "openai", model: "gpt-test", reasoningEffort: "high", permissionMode: "auto" as const };
+    f.config.agents.codex!.defaults = { ...defaults };
     const models = await f.runtime.listModels();
     vi.mocked(f.runtime.listModels).mockResolvedValue(models);
     await f.action({ action: "settings_provider_select", provider: "azure" });
@@ -13018,6 +13113,8 @@ describe("deferred Provider settings", () => {
     await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(2));
     expect(f.runtime.setExecutionSettings).toHaveBeenCalledOnce();
     expect(f.store.countQueuedPrompts(f.id)).toBe(0);
+    expect(f.config.agents.codex!.defaults).toEqual(defaults);
+    expect(f.persistAgentExecutionDefaults).not.toHaveBeenCalled();
   });
 
   test("CLI reports actual and pending settings separately and the last Provider selection wins", async () => {
@@ -13351,13 +13448,13 @@ describe("deferred Provider settings", () => {
     expect(f.runtime.startTurn).toHaveBeenCalledOnce();
     expect(f.store.getSession(id)).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "azure" });
     expect(f.runtime.getSession(id)).toMatchObject({ remoteSessionId: "thr_1", modelProvider: "azure" });
-    expect(f.config.agents.codex?.defaults?.modelProvider).toBe("azure");
+    expect(f.config.agents.codex?.defaults).toBeUndefined();
     expect(f.store.getPendingProviderSettings(id)).toBeUndefined();
     expect(f.runtime.createSession).toHaveBeenCalledOnce();
     expect(f.runtime.forkSession).not.toHaveBeenCalled();
   });
 
-  test.each(["provider", "model", "thinking", "permissions"] as const)("ordinary hydration queued behind %s persistence uses the newly saved settings", async (setting) => {
+  test.each(["provider", "model", "thinking", "permissions"] as const)("ordinary hydration queued behind a %s change uses the newly saved task settings", async (setting) => {
     const f = fixture();
     await f.controller.onMessage(message("/new"));
     const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
@@ -13368,18 +13465,35 @@ describe("deferred Provider settings", () => {
       return session;
     });
     await f.controller.controlTaskSettings(id);
-    let releaseDefaults!: () => void;
-    f.persistAgentExecutionDefaults.mockImplementationOnce(() => new Promise((resolve) => {
-      releaseDefaults = () => resolve(undefined);
-    }));
+    let releaseSettings!: () => void;
+    const waitForSettings = () => new Promise<void>((resolve) => { releaseSettings = resolve; });
+    if (setting === "provider") {
+      const apply = f.runtime.setExecutionSettings!;
+      vi.mocked(apply).mockImplementationOnce(async (...args) => {
+        await waitForSettings();
+        return apply(...args);
+      });
+    } else if (setting === "model") {
+      vi.mocked(f.runtime.setModel).mockImplementationOnce(async (id, model) => {
+        await waitForSettings();
+        f.runtime.getSession(id)!.model = model;
+      });
+    } else if (setting === "thinking") {
+      vi.mocked(f.runtime.setReasoningEffort).mockImplementationOnce(async (id, effort) => {
+        await waitForSettings();
+        f.runtime.getSession(id)!.reasoningEffort = effort;
+      });
+    } else {
+      vi.mocked(f.runtime.setPermissionMode).mockImplementationOnce(waitForSettings);
+    }
     const value = { provider: "azure", model: "gpt-next", thinking: "low", permissions: "confirm" }[setting];
     const change = f.controller.controlTaskSettings(id, setting, value);
-    await vi.waitFor(() => expect(releaseDefaults).toBeTypeOf("function"));
+    await vi.waitFor(() => expect(releaseSettings).toBeTypeOf("function"));
     const prompt = f.controller.onMessage(message("wait for settings persistence"));
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(f.runtime.resumeSession).not.toHaveBeenCalled();
     expect(f.runtime.startTurn).not.toHaveBeenCalled();
-    releaseDefaults();
+    releaseSettings();
     await change;
     await prompt;
     const expected = {
@@ -13388,7 +13502,8 @@ describe("deferred Provider settings", () => {
     }[setting];
     expect(f.store.getSession(id)).toMatchObject({ remoteSessionId: "thr_1", ...expected });
     expect(f.runtime.getSession(id)).toMatchObject({ remoteSessionId: "thr_1", ...expected });
-    expect(f.config.agents.codex?.defaults).toMatchObject(expected);
+    expect(f.config.agents.codex?.defaults).toBeUndefined();
+    expect(f.persistAgentExecutionDefaults).not.toHaveBeenCalled();
     if (setting === "provider") expect(f.runtime.resumeSession).not.toHaveBeenCalled();
     else expect(f.runtime.resumeSession).toHaveBeenCalledWith(expect.objectContaining(expected));
     expect(f.runtime.startTurn).toHaveBeenCalledOnce();
@@ -13440,31 +13555,35 @@ describe("deferred Provider settings", () => {
     expect(f.store.getSession(id)?.remoteSessionId).toBe("thr_1");
   });
 
-  test("a failed Provider defaults transaction cannot overwrite another task's successful defaults", async () => {
+  test("a failed Provider transaction neither blocks another task's settings nor changes Agent defaults", async () => {
     const f = fixture();
+    const defaults = { model: "gpt-test", reasoningEffort: "high" };
+    f.config.agents.codex!.defaults = defaults;
     await f.controller.onMessage(message("/new"));
     const firstId = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
     await f.controller.onMessage({ ...message("/new"), messageId: "second-task" });
     const secondId = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
     expect(secondId).not.toBe(firstId);
-    let releaseDefaults!: () => void;
-    f.persistAgentExecutionDefaults.mockImplementationOnce(() => new Promise((resolve) => { releaseDefaults = () => resolve(undefined); }));
+    let releaseSettings!: () => void;
+    vi.mocked(f.runtime.setExecutionSettings!).mockImplementationOnce(async (id, settings, persist) => {
+      await new Promise<void>((resolve) => { releaseSettings = resolve; });
+      const candidate = { ...f.runtime.getSession(id)!, ...settings };
+      await persist?.(candidate);
+      return candidate;
+    });
     const update = f.store.updateRuntimeSession.bind(f.store);
     vi.spyOn(f.store, "updateRuntimeSession").mockImplementation((id, patch) => {
       if (id === firstId && patch.modelProvider === "azure") throw new Error("state commit failed");
       return update(id, patch);
     });
     const first = expect(f.controller.controlTaskSettings(firstId, "provider", "azure")).rejects.toThrow("state commit failed");
-    await vi.waitFor(() => expect(releaseDefaults).toBeTypeOf("function"));
-    const second = f.controller.controlTaskSettings(secondId, "model", "gpt-next");
-    await vi.waitFor(() => expect(f.runtime.setModel).toHaveBeenCalled());
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(f.persistAgentExecutionDefaults).toHaveBeenCalledOnce();
-    releaseDefaults();
+    await vi.waitFor(() => expect(releaseSettings).toBeTypeOf("function"));
+    await f.controller.controlTaskSettings(secondId, "model", "gpt-next");
+    expect(f.store.getSession(secondId)?.model).toBe("gpt-next");
+    releaseSettings();
     await first;
-    await second;
-    expect(f.persistAgentExecutionDefaults).toHaveBeenLastCalledWith("codex", expect.objectContaining({ modelProvider: "openai", model: "gpt-next" }));
-    expect(f.config.agents.codex?.defaults).toMatchObject({ modelProvider: "openai", model: "gpt-next" });
+    expect(f.persistAgentExecutionDefaults).not.toHaveBeenCalled();
+    expect(f.config.agents.codex?.defaults).toEqual(defaults);
     expect(f.store.getSession(firstId)?.modelProvider).toBe("openai");
     expect(f.store.getSession(secondId)?.model).toBe("gpt-next");
   });

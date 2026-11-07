@@ -532,10 +532,6 @@ export interface ProxyLifecycle {
   showUpdates?(contextKey: string, userId?: string): Promise<void>;
   selectUpdate?(action: CardAction, replyTarget?: MessageReplyTarget): Promise<void>;
   rememberFeishuUserOpenId?(userOpenId: string): Promise<void> | void;
-  persistAgentExecutionDefaults?(
-    agentName: string,
-    defaults: AgentExecutionDefaults,
-  ): Promise<void> | void;
 }
 
 export type ShellCommandExecutor = (
@@ -564,7 +560,6 @@ export class ProxySessionController {
   private readonly settingsOperations = new SessionOperationQueue();
   // Loads may run inside settingsOperations; never acquire that queue while hydrating.
   private readonly sessionHydrationOperations = new SessionOperationQueue();
-  private readonly agentDefaultsOperations = new SessionOperationQueue();
   private readonly sessionResets = new Map<string, Promise<void>>();
   private readonly resetHistoryOperations = new Map<string, string>();
   private readonly remoteTurnHistoryRefreshes = new Map<string, number>();
@@ -6139,7 +6134,7 @@ export class ProxySessionController {
       `模型 ${cardCode(session.model ?? settings.model)}`,
       `思考强度 ${cardCode(session.reasoningEffort ?? settings.effort)}`,
       `权限 ${cardCode(session.permissionMode)}`,
-      `并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`,
+      "只影响当前任务，从下一次请求生效。",
     ].join("，");
     if (options.updateMessageId) {
       await this.openExecutionSettingsNow(contextKey, "provider", {
@@ -6160,7 +6155,7 @@ export class ProxySessionController {
     if (!loaded.runtime.setExecutionSettings) throw new Error("当前运行时不支持 Provider 设置。");
     loaded.session = loaded.runtime.getSession(loaded.record.localSessionId) ?? loaded.session;
     const remoteSessionId = loaded.session.remoteSessionId;
-    const persist = (candidate: RuntimeSession, replacement?: RuntimeSettingsReplacement): Promise<void> => this.agentDefaultsOperations.run(loaded.record.agentName, async () => {
+    const persist = async (candidate: RuntimeSession, replacement?: RuntimeSettingsReplacement): Promise<void> => {
       if (candidate.remoteSessionId !== remoteSessionId) {
         const saved = this.store.getSession(loaded.record.localSessionId);
         if (replacement?.emptyRemoteSessionId !== remoteSessionId || !saved || saved.remoteSessionId !== remoteSessionId
@@ -6172,23 +6167,14 @@ export class ProxySessionController {
         }
       }
       assertProviderSettingsApplied(candidate, settings);
-      const agent = this.ensureAgent(loaded.record.agentName);
-      const previousDefaults = agent.defaults;
-      await this.persistAgentExecutionDefaultsNow(loaded.record.localSessionId, candidate);
-      try {
-        this.store.updateRuntimeSession(loaded.record.localSessionId, {
-          remoteSessionId: candidate.remoteSessionId,
-          modelProvider: candidate.modelProvider,
-          model: candidate.model,
-          reasoningEffort: candidate.reasoningEffort,
-          permissionMode: candidate.permissionMode,
-        });
-      } catch (error) {
-        await this.lifecycle?.persistAgentExecutionDefaults?.(loaded.record.agentName, previousDefaults ?? {});
-        agent.defaults = previousDefaults;
-        throw error;
-      }
-    });
+      this.store.updateRuntimeSession(loaded.record.localSessionId, {
+        remoteSessionId: candidate.remoteSessionId,
+        modelProvider: candidate.modelProvider,
+        model: candidate.model,
+        reasoningEffort: candidate.reasoningEffort,
+        permissionMode: candidate.permissionMode,
+      });
+    };
     const session = await loaded.runtime.setExecutionSettings(loaded.record.localSessionId, settings, persist);
     loaded.record = this.store.getSession(loaded.record.localSessionId) ?? loaded.record;
     this.settingsOnlySessions.delete(loaded.record.localSessionId);
@@ -6411,7 +6397,6 @@ export class ProxySessionController {
       }
       this.store.updateRuntimeSession(loaded.record.localSessionId, { model, reasoningEffort: nextEffort });
       this.outbound.updateSessionModel(loaded.record.localSessionId, model, loaded.session.modelProvider);
-      await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
     });
     const effortMessage = nextEffort && nextEffort !== currentEffort
       ? `，思考强度已自动调整为 ${nextEffort}`
@@ -6420,13 +6405,13 @@ export class ProxySessionController {
       await this.openExecutionSettingsNow(contextKey, "model", {
         sessionId: loaded.record.localSessionId,
         updateMessageId: options.updateMessageId,
-        notice: `模型已切换为 ${cardCode(model)}${effortMessage}，并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`,
+        notice: `模型已切换为 ${cardCode(model)}${effortMessage}，只影响当前任务，从下一次请求生效。`,
       });
       return;
     }
     await this.outbound.sendText(
       contextKey,
-      `模型已切换为 ${model}${effortMessage}，并已保存为 ${loaded.record.agentName} Agent 的默认设置，从下一次请求生效。`,
+      `模型已切换为 ${model}${effortMessage}，只影响当前任务，从下一次请求生效。`,
     );
   }
 
@@ -6867,19 +6852,18 @@ export class ProxySessionController {
     await this.sessionHydrationOperations.run(loaded.record.localSessionId, async () => {
       await loaded.runtime.setReasoningEffort(loaded.record.localSessionId, effort);
       this.store.updateRuntimeSession(loaded.record.localSessionId, { reasoningEffort: effort });
-      await this.persistAgentExecutionDefaults(loaded.record.localSessionId);
     });
     if (options.updateMessageId) {
       await this.openExecutionSettingsNow(contextKey, "thinking", {
         sessionId: loaded.record.localSessionId,
         updateMessageId: options.updateMessageId,
-        notice: `思考强度已切换为 ${cardCode(effort)}，并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`,
+        notice: `思考强度已切换为 ${cardCode(effort)}，只影响当前任务，从下一次请求生效。`,
       });
       return;
     }
     await this.outbound.sendText(
       contextKey,
-      `思考强度已切换为 ${effort}，并已保存为 ${loaded.record.agentName} Agent 的默认设置，从下一次请求生效。`,
+      `思考强度已切换为 ${effort}，只影响当前任务，从下一次请求生效。`,
     );
   }
 
@@ -6911,23 +6895,22 @@ export class ProxySessionController {
       loaded.session = loaded.runtime.getSession(record.localSessionId) ?? loaded.session;
       loaded.session.permissionMode = mode;
       this.store.updateRuntimeSession(record.localSessionId, { permissionMode: mode });
-      await this.persistAgentExecutionDefaults(record.localSessionId);
     });
     if (options.updateMessageId) {
       await this.openExecutionSettingsNow(contextKey, "permission", {
         sessionId: loaded.record.localSessionId,
         updateMessageId: options.updateMessageId,
         notice: mode === "auto"
-          ? `已切换为自动执行模式，并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`
-          : `已切换为执行前确认模式，并已保存为 ${cardCode(loaded.record.agentName)} Agent 的默认设置，从下一次请求生效。`,
+          ? "已切换为自动执行模式，只影响当前任务，从下一次请求生效。"
+          : "已切换为执行前确认模式，只影响当前任务，从下一次请求生效。",
       });
       return;
     }
     await this.outbound.sendText(
       contextKey,
       mode === "auto"
-        ? `已切换为自动执行模式，并已保存为 ${loaded.record.agentName} Agent 的默认设置。`
-        : `已切换为执行前确认模式，并已保存为 ${loaded.record.agentName} Agent 的默认设置。`,
+        ? "已切换为自动执行模式，只影响当前任务，从下一次请求生效。"
+        : "已切换为执行前确认模式，只影响当前任务，从下一次请求生效。",
     );
   }
 
@@ -8530,28 +8513,6 @@ export class ProxySessionController {
     const agent = this.config.agents[agentName];
     if (!agent) throw new Error(`未知 agent：${agentName}`);
     return agent;
-  }
-
-  private async persistAgentExecutionDefaults(localSessionId: string, candidate?: RuntimeSession): Promise<void> {
-    const record = this.store.getSession(localSessionId);
-    if (!record) throw new Error(`找不到任务：${localSessionId}`);
-    return this.agentDefaultsOperations.run(record.agentName, () => this.persistAgentExecutionDefaultsNow(localSessionId, candidate));
-  }
-
-  private async persistAgentExecutionDefaultsNow(localSessionId: string, candidate?: RuntimeSession): Promise<void> {
-    const record = this.store.getSession(localSessionId);
-    if (!record) throw new Error(`找不到任务：${localSessionId}`);
-    const session = candidate ?? record;
-    const agent = this.ensureAgent(session.agentName);
-    const observed: AgentExecutionDefaults = {
-      ...(session.modelProvider?.trim() ? { modelProvider: session.modelProvider } : {}),
-      ...(session.model?.trim() ? { model: session.model } : {}),
-      ...(session.reasoningEffort?.trim() ? { reasoningEffort: session.reasoningEffort } : {}),
-      ...(session.permissionMode ? { permissionMode: session.permissionMode } : {}),
-    };
-    const defaults = { ...(agent.defaults ?? {}), ...observed };
-    await this.lifecycle?.persistAgentExecutionDefaults?.(session.agentName, defaults);
-    agent.defaults = defaults;
   }
 
   private agentLabel(agentName: string): string {

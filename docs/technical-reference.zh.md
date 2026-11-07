@@ -361,11 +361,11 @@ Fork 从未绑定过 Agent Bot 的任务前，Agent Bot 会先读取不含 Turns
 
 ## App Server Provider 设置
 
-Provider 会与模型、思考强度和权限模式一起保存在任务中；每个 Agent 还可以在 `agents.<name>.defaults` 下分别保存这些默认值。新任务先读取所选 Agent 的默认值，再由显式设置或同 Agent 任务继承值覆盖。Agent Bot 会通过 `thread/start`、`thread/resume` 和 `thread/fork` 传递最终设置，并把运行时返回的实际值保存到任务。
+Provider 会与模型、思考强度和权限模式一起保存在任务中；每个 Agent 还可以在 `agents.<name>.defaults` 下显式配置这些默认值。新任务先读取所选 Agent 配置的默认值，再由显式设置或同 Agent 任务继承值覆盖。Agent Bot 会通过 `thread/start`、`thread/resume` 和 `thread/fork` 传递最终设置，并把运行时返回的实际值保存到任务。
 
 每次 `turn/start` 还会同时传递 `approvalPolicy` 和 `sandboxPolicy`：`auto` 对应 `never` + `dangerFullAccess`，`confirm` 对应 `on-request` + `workspaceWrite`。权限切换从下一轮生效，无需重启共享 App Server、恢复或分支任务；`turn/steer` 不携带这些覆盖参数。工作区策略优先取会话生命周期响应；缺失时按当前 cwd 懒加载一次 `config/read` 并按会话缓存，保留额外可写目录、网络访问和临时目录排除配置，不读取历史。配置无效或不可用时不启动新轮次；沙箱策略被拒绝时不会去掉限制后重试。
 
-`/provider`、`/model`、`/thinking` 和 `/permissions` 打开同一张 Card 2.0 运行设置卡片，并激活对应的 tab。四个命令都拒绝参数，tab 切换和设置修改只通过卡片回调完成。Provider 选项来自 App Server 的 `config/read`；对于 Codex，即使隐式内置的 `openai` 没有出现在显式 `model_providers` 配置中，Agent Bot 也会保留该选项。内置 OpenAI Provider 使用 App Server 的 `model/list`；显式配置的自定义 Provider 会在接口可用时使用 `GET <base_url>/models`，并携带其 `query_params`、`http_headers`、`env_http_headers` 和已配置的 Bearer 凭据，凭据只在 Agent Bot 内部使用，不会进入卡片或模型记录。切换 Provider 时，如果目标模型目录包含原模型则继续使用；否则依次选择标记的默认模型和返回列表中的第一个模型。自定义接口只返回模型 ID 时，会按同名模型合并 App Server 目录中的思考强度元数据。模型发现不可用时，Agent Bot 会把当前或已配置模型作为唯一候选，因此不会因缺少 `/models` 而阻止切换；保存前仍由 Codex 返回的实际 Provider 和模型完成校验。每次成功修改 Provider、模型、思考强度或权限后，Agent Bot 都会更新当前任务，把完整生效设置原子写入该 Agent 在 `config.yaml` 中的默认值，就地刷新卡片，并从下一次请求生效；对应 CLI 任务设置命令使用相同的持久化路径。
+`/provider`、`/model`、`/thinking` 和 `/permissions` 打开同一张 Card 2.0 运行设置卡片，并激活对应的 tab。四个命令都拒绝参数，tab 切换和设置修改只通过卡片回调完成。Provider 选项来自 App Server 的 `config/read`；对于 Codex，即使隐式内置的 `openai` 没有出现在显式 `model_providers` 配置中，Agent Bot 也会保留该选项。内置 OpenAI Provider 使用 App Server 的 `model/list`；显式配置的自定义 Provider 会在接口可用时使用 `GET <base_url>/models`，并携带其 `query_params`、`http_headers`、`env_http_headers` 和已配置的 Bearer 凭据，凭据只在 Agent Bot 内部使用，不会进入卡片或模型记录。切换 Provider 时，如果目标模型目录包含原模型则继续使用；否则依次选择标记的默认模型和返回列表中的第一个模型。自定义接口只返回模型 ID 时，会按同名模型合并 App Server 目录中的思考强度元数据。模型发现不可用时，Agent Bot 会把当前或已配置模型作为唯一候选，因此不会因缺少 `/models` 而阻止切换；保存前仍由 Codex 返回的实际 Provider 和模型完成校验。每次成功修改 Provider、模型、思考强度或权限后，Agent Bot 只更新并持久化当前任务，就地刷新卡片，并从下一次请求生效；对应 CLI 任务设置命令使用相同的任务级持久化路径。两种入口都不写入 `config.yaml`，也不修改内存中的 Agent 默认值，缺省或不完整的默认值同样保持原样。显式配置默认值、新任务及分支的源任务设置继承规则不变。
 
 Agent Bot 内部保留本地路由键以关联飞书卡片和投递状态，但对用户展示所属 App Server 的任务 ID。没有明确用户操作时，不会续写、steer、停止或分支其他客户端正在运行的 Agent 工作。
 
@@ -381,13 +381,13 @@ Agent Bot 内部保留本地路由键以关联飞书卡片和投递状态，但�
 
 ### 保留历史的 Provider 切换
 
-已有历史的任务切换只使用现有线程 ID，不隐式调用 thread/start、thread/fork，不改写历史、不制造轮次。确认没有继承历史或 Goal 的空任务可使用 thread/start 创建指定 Provider/模型的底层线程，保存前再次读取元信息和一条 Turn 摘要验证。运行时向持久化回调传递被替换的空线程 ID；控制器独立核对已保存 ID、本地任务标识，以及不存在提交尝试、最后轮次和 Fork 来源后，原子保存新远端 ID 和运行设置。创建或持久化失败只释放候选线程订阅并保留原会话，成功后再释放原空线程订阅。设置专用加载不依赖旧 Provider 的恢复成功，但执行前仍必须验证恢复结果。thread/unsubscribe 是订阅操作，不代表已卸载，也不能据此断言其他客户端占用；notSubscribed 按幂等结果处理，超时必须恢复验证而非报告成功。失败回退在同一线程验证原 Provider/模型，原本缺省或不完整的 Agent 默认值通过替换 YAML 已知字段恢复，不把失败目标重新合并进去。异步持久化期间断线会保留下一次请求前重新验证的标记。切设置不会偷偷发送模型 Prompt 测连，配置成功不等于端点认证或服务可用。
+已有历史的任务切换只使用现有线程 ID，不隐式调用 thread/start、thread/fork，不改写历史、不制造轮次。确认没有继承历史或 Goal 的空任务可使用 thread/start 创建指定 Provider/模型的底层线程，保存前再次读取元信息和一条 Turn 摘要验证。运行时向持久化回调传递被替换的空线程 ID；控制器独立核对已保存 ID、本地任务标识，以及不存在提交尝试、最后轮次和 Fork 来源后，原子保存新远端 ID 和运行设置。创建或持久化失败只释放候选线程订阅并保留原会话，成功后再释放原空线程订阅。设置专用加载不依赖旧 Provider 的恢复成功，但执行前仍必须验证恢复结果。thread/unsubscribe 是订阅操作，不代表已卸载，也不能据此断言其他客户端占用；notSubscribed 按幂等结果处理，超时必须恢复验证而非报告成功。失败回退在同一线程验证原 Provider/模型，不写入或回退 Agent 默认值。异步持久化期间断线会保留下一次请求前重新验证的标记。切设置不会偷偷发送模型 Prompt 测连，配置成功不等于端点认证或服务可用。
 
 Codex 要求 0.162.1 或更新版本。进程管理器仅在 Codex 启动参数末尾追加 `-c thread_unload_delay_secs=0`，不修改全局 Codex 配置，也不向 TraeX 传递此参数。设置切换先确认目标任务没有活动轮次，再取消该线程订阅，每 100 毫秒轮询 `thread/read` 元数据，最多等待 10 秒，直到同一 ID 确认 `notLoaded`，才调用 `thread/resume` 应用并验证新 Provider 和模型。取消订阅的响应或其他线程的关闭通知均不能代替实际卸载确认。失败的 `systemError` 线程也使用相同流程；不再重启共享进程、扫描全部任务或要求其他任务空闲。若卸载失败且尚未请求目标恢复，直接重新订阅并验证原设置；若已请求目标恢复或持久化失败，回退前仍先卸载目标线程。继续保留同 ID 校验及回退无法确认时阻止执行的保护。
 
 ### Provider 延迟切换
 
-`pending_provider_settings` 按任务保存目标 Provider、模型、思考强度、权限和通知路由，与实际 session 字段分离。设置修改和轮次启动按任务串行，覆盖多个会话绑定同一任务的情况。卡片使用目标 Provider 的模型列表并标注待生效，模型和思考强度回调携带 Provider ID，避免旧卡误操作。终态事件和启动恢复应用待生效设置，每次启动新轮次前也会检查。切换失败回退原 Provider/模型，运行时通过结构化错误报告回退结果。只有确认回退成功且运行时、持久化设置都与原设置一致时，才清除待生效选择、恢复卡片并显示警告，排队及新 Prompt 继续使用原设置。回退失败或无法确认时保留选择和排队 Prompt 等待手动恢复；归档清理待生效设置。仅在运行时确认实际 Provider/模型后才保存 Agent 默认值。
+`pending_provider_settings` 按任务保存目标 Provider、模型、思考强度、权限和通知路由，与实际 session 字段分离。设置修改和轮次启动按任务串行，覆盖多个会话绑定同一任务的情况。卡片使用目标 Provider 的模型列表并标注待生效，模型和思考强度回调携带 Provider ID，避免旧卡误操作。终态事件和启动恢复应用待生效设置，每次启动新轮次前也会检查。切换失败回退原 Provider/模型，运行时通过结构化错误报告回退结果。只有确认回退成功且运行时、持久化设置都与原设置一致时，才清除待生效选择、恢复卡片并显示警告，排队及新 Prompt 继续使用原设置。回退失败或无法确认时保留选择和排队 Prompt 等待手动恢复；归档清理待生效设置。仅在运行时确认实际 Provider/模型后才保存生效的任务设置；待生效和已应用的修改都不会改变 Agent 默认值。
 
 ### Responses 续接恢复
 

@@ -9,7 +9,6 @@ import { controlEndpoint, type ControlRequest, type ControlResponse } from "./cl
 import { readPackageVersion } from "./cli/packageVersion.js";
 import { loadConfig } from "./config/loadConfig.js";
 import { persistFeishuUserOpenIdIfMissing } from "./config/FeishuUserOpenIdStore.js";
-import { writeAgentExecutionDefaults } from "./config/AgentExecutionDefaultsStore.js";
 import {
   agentBotHome,
   defaultConfigPath,
@@ -309,10 +308,6 @@ const controller = new ProxySessionController(config, store, runtimes, outbound,
       { status: persisted.status },
       "Stored the default Lark user Open ID from the first private chat message.",
     );
-  },
-  persistAgentExecutionDefaults: (agentName, defaults) => {
-    const changed = writeAgentExecutionDefaults(activeConfigPath, agentName, defaults);
-    logger.info({ agentName, changed }, "Stored Agent execution defaults.");
   },
 }, undefined, undefined, shellCommandJobs);
 loadTurnDetails = (turnId) => controller.loadTurnDetails(turnId);
