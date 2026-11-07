@@ -25,7 +25,7 @@ Stop persists its cancellation boundary before network operations. Pending prepa
 - Reset the current conversation from any successfully completed progress card
 - Collaborate with text, images, files, quoted messages, merged-forwarded chat records, group chats, and topics
 - Queue follow-up Prompts or add instructions while a task is running
-- Automatically retry temporary model-service failures
+- Automatically retry proven pre-submission transient failures
 - Continue existing work after Agent Bot restarts
 - Run through the local Console UI without Feishu
 

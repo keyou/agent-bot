@@ -982,6 +982,38 @@ describe("scheduled prompt integration", () => {
     expect(vi.mocked(f.outbound.sendText).mock.calls.filter(([, text]) => text === "scheduled prompt")).toHaveLength(1);
   });
 
+  test("a scheduled request stopped before submission can return to its queue without duplicate attempts", async () => {
+    const f = await scheduledFixture();
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    let release!: () => void;
+    vi.mocked(f.presenter.startPendingTurn).mockReturnValueOnce(new Promise<string>((resolve) => { release = () => resolve("pending_schedule"); }));
+    const draining = f.controller.drainScheduledPrompts(f.id);
+    await vi.waitFor(() => expect(f.presenter.startPendingTurn).toHaveBeenCalled());
+    await f.controller.controlStopTask(f.id);
+    release();
+    await draining;
+    expect(f.store.schedules.getRun(run.id)?.status).toBe("queued");
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    await f.controller.drainScheduledPrompts(f.id);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.store.getTurnAttempt(run.id)).toMatchObject({ status: "running", executionGeneration: 1 });
+  });
+
+  test("an ambiguous scheduled plan handoff stays unverified instead of being relabeled failed", async () => {
+    const f = await scheduledFixture();
+    const run = f.store.schedules.dispatch(f.job, Date.now(), Date.now(), { manual: true })!;
+    await f.controller.drainScheduledPrompts(f.id);
+    f.sessions.get(f.id)!.activeTurnId = undefined;
+    Object.assign(f.remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
+    vi.mocked(f.presenter.startPendingTurn).mockResolvedValue("pending_handoff");
+    vi.mocked(f.runtime.startTurn).mockRejectedValueOnce(new Error("turn/start response lost"));
+    for (const listener of f.listeners) listener({ type: "turn_completed", sessionId: f.id, turnId: "turn_1", finalResponse: "", approvedPlan: true });
+    await vi.waitFor(() => expect(f.store.schedules.getRun(run.id)?.status).toBe("unknown"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.store.getTurnAttempt(run.id)?.status).toBe("unknown");
+    expect(f.store.getSession(f.id)?.lastTurnStatus).toBe("unknown");
+  });
+
   test("form submission keeps the chosen target even if the current task changed", async () => {
     const f = await scheduledFixture();
     await f.controller.onMessage({ ...message("/new Replacement current"), messageId: "replacement-task" });
@@ -1101,6 +1133,102 @@ function recoveryFixture(status: "active" | "not_loaded" = "active") {
   remoteSessions.push({ id, cwd: process.cwd(), source: "agent-bot", status, lastTurnId: "old-turn", lastTurnStatus: status === "active" ? "inProgress" : "interrupted" });
   return { ...value, remoteId: id };
 }
+
+describe("execution contract integration", () => {
+  function integrationFixture() {
+    const f = fixture();
+    const actual = new FeishuTurnPresenter(f.outbound, f.store, undefined, { criticalGapMs: 0 });
+    vi.mocked(f.presenter.registerSession).mockImplementation(actual.registerSession.bind(actual));
+    vi.mocked(f.presenter.updateSessionModel).mockImplementation(actual.updateSessionModel.bind(actual));
+    vi.mocked(f.presenter.startPendingTurn).mockImplementation(actual.startPendingTurn.bind(actual));
+    vi.mocked(f.presenter.failPendingTurn).mockImplementation(actual.failPendingTurn.bind(actual));
+    vi.mocked(f.presenter.onEvent).mockImplementation(actual.onEvent.bind(actual));
+    return { ...f, actual };
+  }
+
+  test("disconnect and late completion agree across task, card, Preview and delivery ledger", async () => {
+    const f = integrationFixture();
+    await f.controller.onMessage(message("one instruction"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    const cardId = f.store.getTurnDelivery("turn_1")!.progressMessageId;
+    f.runtime.getSession(id)!.activeTurnId = undefined;
+    for (const listener of f.listeners) listener({ type: "turn_status_unknown", sessionId: id, turnId: "turn_1", message: "connection lost" });
+    await vi.waitFor(() => expect(f.store.getTurnSnapshot("turn_1")).toMatchObject({ status: "unknown" }));
+    expect(f.store.getSession(id)?.lastTurnStatus).toBe("unknown");
+    expect(f.store.previews.load("turn_1")?.status).toBe("unknown");
+    expect(f.store.getTurnDelivery("turn_1")?.finalDelivered).not.toBe(true);
+    expect(f.outbound.sendMarkdown).not.toHaveBeenCalled();
+    for (const listener of f.listeners) listener({ type: "turn_started", sessionId: id, turnId: "turn_1", startedAt: 1 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.store.getSession(id)?.lastTurnStatus).toBe("unknown");
+    expect(f.store.previews.load("turn_1")?.status).toBe("unknown");
+    const completed = { type: "turn_completed" as const, sessionId: id, turnId: "turn_1", finalResponse: "verified result" };
+    for (const listener of f.listeners) listener(completed);
+    await vi.waitFor(() => expect(f.store.getTurnDelivery("turn_1")?.finalDelivered).toBe(true));
+    for (const listener of f.listeners) {
+      listener(completed);
+      listener({ type: "turn_started", sessionId: id, turnId: "turn_1", startedAt: 1 });
+      listener({ type: "turn_failed", sessionId: id, turnId: "turn_1", message: "late old failure" });
+    }
+    await f.actual.flushAll();
+    expect(f.store.getSession(id)?.lastTurnStatus).toBe("completed");
+    expect(f.store.getTurnSnapshot("turn_1")).toMatchObject({ status: "completed", finalResponse: "verified result" });
+    expect(f.store.previews.load("turn_1")).toMatchObject({ status: "completed", finalResponse: "verified result" });
+    expect(f.store.getTurnDelivery("turn_1")?.progressMessageId).toBe(cardId);
+    expect(f.outbound.sendInteractiveCard).toHaveBeenCalledTimes(1);
+    expect(f.outbound.sendMarkdown).toHaveBeenCalledTimes(1);
+    expect(f.store.provenance.forTurn("turn_1", id)?.instructionId).toBe("m-one instruction");
+  });
+
+  test("an older completion cannot replace the newer task head or its Preview", async () => {
+    const f = integrationFixture();
+    await f.controller.onMessage(message("old work"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    f.runtime.getSession(id)!.activeTurnId = undefined;
+    for (const listener of f.listeners) listener({ type: "turn_status_unknown", sessionId: id, turnId: "turn_1", message: "lost connection" });
+    await vi.waitFor(() => expect(f.store.getTurnSnapshot("turn_1")).toMatchObject({ status: "unknown" }));
+    Object.assign(f.remoteSessions[0]!, { status: "idle", lastTurnStatus: "failed" });
+    vi.mocked(f.runtime.startTurn).mockImplementationOnce(async () => {
+      f.runtime.getSession(id)!.activeTurnId = "turn_2";
+      for (const listener of f.listeners) listener({ type: "turn_started", sessionId: id, turnId: "turn_2", startedAt: Date.now() });
+      return "turn_2";
+    });
+    await f.controller.onMessage(message("new explicit work"));
+    for (const listener of f.listeners) listener({ type: "turn_completed", sessionId: id, turnId: "turn_1", finalResponse: "old result" });
+    await vi.waitFor(() => expect(f.store.getTurnDelivery("turn_1")?.finalDelivered).toBe(true));
+    expect(f.store.getSession(id)).toMatchObject({ lastTurnId: "turn_2", lastTurnStatus: "running" });
+    expect(f.store.previews.load("turn_2")?.status).toBe("running");
+    f.runtime.getSession(id)!.activeTurnId = undefined;
+    for (const listener of f.listeners) listener({ type: "turn_completed", sessionId: id, turnId: "turn_2", finalResponse: "new result" });
+    await vi.waitFor(() => expect(f.store.getTurnDelivery("turn_2")?.finalDelivered).toBe(true));
+    expect(f.outbound.sendMarkdown).toHaveBeenCalledTimes(2);
+  });
+
+  test("Stop during card preparation leaves a cancelled Preview and no provenance submission", async () => {
+    const f = integrationFixture();
+    await f.controller.onMessage(message("/new --dir ."));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    let release!: () => void;
+    let pendingId: string | undefined;
+    vi.mocked(f.presenter.startPendingTurn).mockImplementationOnce(async (...args) => {
+      pendingId = await f.actual.startPendingTurn(...args);
+      await new Promise<void>((resolve) => { release = resolve; });
+      return pendingId;
+    });
+    const sending = f.controller.onMessage(message("stop before dispatch"));
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    await f.controller.controlStopTask(id);
+    release();
+    await sending;
+    await f.actual.flushAll();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.getTurnSnapshot(pendingId!)).toMatchObject({ status: "cancelled" });
+    expect(f.store.provenance.forTurn(pendingId!, id)).toBeUndefined();
+    await f.controller.recoverInterruptedTasks();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.listIncompleteTurnAttempts()).toEqual([]);
+  });
+});
 
 describe("crash recovery", () => {
   test("ends recovery and shows the writer conflict without claiming a new running card or closing processes", async () => {
@@ -1688,6 +1816,36 @@ describe("ProxySessionController", () => {
     expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
     expect(f.store.executionGeneration(id)).toBe(1);
     expect(f.store.hasUnknownTurnAttemptForSession(id)).toBe(true);
+  });
+
+  test("a live persisted cancellation is not backfilled as a fresh recoverable attempt", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("original cancellable work"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    await f.controller.controlStopTask(id);
+    await f.controller.recoverInterruptedTasks();
+    expect(f.store.listIncompleteTurnAttempts()).toEqual([]);
+    expect(f.store.listCancellationRequestedTurnAttempts()).toHaveLength(1);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+  });
+
+  test("a delayed Stop acknowledgement never interrupts a newer explicit instruction", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("/new --dir ."));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    let release!: () => void;
+    vi.mocked(f.outbound.sendText).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return "ack";
+    });
+    const stopping = f.controller.controlStopTask(id);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    await f.controller.onMessage(message("new explicit instruction after Stop"));
+    release();
+    await stopping;
+    expect(f.runtime.interruptRemoteTurn).not.toHaveBeenCalled();
+    expect(f.runtime.cancelTurn).not.toHaveBeenCalled();
+    expect(f.store.findIncompleteTurnAttemptForSession(id)).toMatchObject({ status: "running", executionGeneration: 1 });
   });
 
   test("a turn acknowledged after Stop receives an interrupt instead of escaping cancellation", async () => {

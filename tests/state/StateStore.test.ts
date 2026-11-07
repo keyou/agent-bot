@@ -18,6 +18,35 @@ afterEach(() => {
 });
 
 describe("StateStore runtime metadata", () => {
+  test("legacy submission records migrate conservatively and new stop boundaries survive reopen", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-legacy-submission-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "state.sqlite");
+    const legacy = new Database(file);
+    legacy.exec(`CREATE TABLE turn_attempts (
+      attempt_id TEXT PRIMARY KEY, local_session_id TEXT NOT NULL, context_key TEXT NOT NULL,
+      prompt_text TEXT NOT NULL, local_image_paths_json TEXT NOT NULL DEFAULT '[]', message_id TEXT,
+      reply_message_id TEXT, pending_turn_id TEXT, turn_id TEXT, recovered_from_turn_id TEXT,
+      recovery_count INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    INSERT INTO turn_attempts(attempt_id, local_session_id, context_key, prompt_text, status, created_at, updated_at)
+      VALUES ('legacy', 'task', 'chat', 'private prompt', 'accepted', '2026-11-07', '2026-11-07');`);
+    legacy.close();
+    const store = new StateStore(file);
+    stores.push(store);
+    expect(store.getTurnAttempt("legacy")).toMatchObject({ submissionState: "submission_unknown", executionGeneration: 0 });
+    expect(store.prepareTurnAttemptRecovery("legacy")).toBeUndefined();
+    expect(() => store.beginTurnAttemptSubmission("legacy")).toThrow();
+    store.createTurnAttempt({ attemptId: "new", localSessionId: "task", contextKey: "chat", promptText: "new work" });
+    store.requestSessionExecutionStop("task");
+    const reopened = new StateStore(file);
+    stores.push(reopened);
+    expect(reopened.executionGeneration("task")).toBe(1);
+    expect(() => reopened.beginTurnAttemptSubmission("new")).toThrow();
+    expect(reopened.provenance.latestForAttempt("legacy")).toBeUndefined();
+  });
+
   test("remembers even failed turn attempts when checking whether a task is pristine", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-empty-task-"));
     tempDirectories.push(directory);

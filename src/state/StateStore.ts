@@ -684,8 +684,18 @@ export class StateStore {
         this.db.prepare("DELETE FROM queued_prompts WHERE prompt_id = ?").run(row.prompt_id);
         if (!this.schedules.claimStart(row.prompt_id)) continue;
         if (this.schedules.getRun(row.prompt_id)) {
-          this.createTurnAttempt({ attemptId: row.prompt_id, localSessionId, contextKey: row.context_key,
-            promptText: row.prompt_text, replyMessageId: row.reply_message_id ?? undefined });
+          const existing = this.getTurnAttempt(row.prompt_id);
+          if (existing) {
+            if (existing.submissionState !== "not_submitted" || existing.turnId) {
+              this.schedules.finish(row.prompt_id, "unknown", "存在无法安全重发的提交记录，未自动派发。");
+              continue;
+            }
+            this.updateTurnAttempt(row.prompt_id, { status: "accepted", pendingTurnId: null,
+              executionGeneration: this.executionGeneration(localSessionId) });
+          } else {
+            this.createTurnAttempt({ attemptId: row.prompt_id, localSessionId, contextKey: row.context_key,
+              promptText: row.prompt_text, replyMessageId: row.reply_message_id ?? undefined });
+          }
         }
         return mapQueuedPrompt(row);
       }
@@ -892,15 +902,23 @@ export class StateStore {
       .get(localSessionId));
   }
 
-  beginTurnAttemptSubmission(attemptId: string): void {
-    const result = this.db.prepare(`
-      UPDATE turn_attempts SET submission_state = 'submission_unknown', updated_at = ?
-      WHERE attempt_id = ? AND submission_state = 'not_submitted'
-        AND status IN ('accepted', 'recovering') AND turn_id IS NULL
-        AND execution_generation = COALESCE((SELECT generation FROM task_execution_control
-          WHERE local_session_id = turn_attempts.local_session_id), 0)
-    `).run(new Date().toISOString(), attemptId);
-    if (result.changes !== 1) throw new Error("Prompt submission is not provably safe; automatic replay refused.");
+  hasCancellationRequestedForSession(localSessionId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM turn_attempts WHERE local_session_id = ? AND status = 'cancelling' LIMIT 1")
+      .get(localSessionId));
+  }
+
+  beginTurnAttemptSubmission(attemptId: string, recordProvenance?: () => void): void {
+    this.db.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE turn_attempts SET submission_state = 'submission_unknown', updated_at = ?
+        WHERE attempt_id = ? AND submission_state = 'not_submitted'
+          AND status IN ('accepted', 'recovering') AND turn_id IS NULL
+          AND execution_generation = COALESCE((SELECT generation FROM task_execution_control
+            WHERE local_session_id = turn_attempts.local_session_id), 0)
+      `).run(new Date().toISOString(), attemptId);
+      if (result.changes !== 1) throw new Error("Prompt submission is not provably safe; automatic replay refused.");
+      recordProvenance?.();
+    })();
   }
 
   executionGeneration(localSessionId: string): number {

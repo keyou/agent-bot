@@ -50,3 +50,15 @@ test("continuations inherit logical instruction identity, while independent queu
   expect(queued.instructionId).toBe("queued-message");
   expect(queued.scheduledFor).toBeUndefined();
 });
+
+test("provenance and submission boundary are atomic, and cancellation cannot be bypassed", () => {
+  const { store } = fixture();
+  store.createTurnAttempt({ attemptId: "attempt", localSessionId: "task", contextKey: "chat", promptText: "private" });
+  const record = () => store.provenance.recordSubmission({ attemptId: "attempt", localSessionId: "task", trigger: "user", settings });
+  expect(() => store.beginTurnAttemptSubmission("attempt", () => { record(); throw new Error("write failed"); })).toThrow("write failed");
+  expect(store.getTurnAttempt("attempt")?.submissionState).toBe("not_submitted");
+  expect(store.provenance.listForAttempt("attempt")).toEqual([]);
+  store.requestSessionExecutionStop("task");
+  expect(() => store.beginTurnAttemptSubmission("attempt", record)).toThrow();
+  expect(store.provenance.listForAttempt("attempt")).toEqual([]);
+});

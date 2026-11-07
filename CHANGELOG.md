@@ -6,6 +6,13 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Keep Provider/model/thinking/permission changes scoped to the selected task without changing Agent defaults or conversation history.
+- Persist submission boundaries: reattach known turns, retry only proven unsubmitted requests, and show uncertain execution as unverified without replaying old instructions.
+- Persist Stop across preparation, retries, continuations and restarts; retain independent queued messages and verify termination instead of assuming an interrupt succeeded.
+- Keep cards, task status and Preview consistent across disconnects and late events, without duplicating final replies.
+- Record minimal execution provenance and effective dispatch settings in `/turn` details; preserve logical instruction identity across authorized continuations.
+- Add cross-module regression tests for settings isolation, ambiguous requests, cancellation races, scheduling, migrations, Preview and delivery deduplication.
+
 ## [0.1.25-alpha.1] - 2026-11-05
 
 - 修复状态卡片将最终回答中的本地图片路径误当成飞书图片 key 导致发送失败：本地及外部任务的结果、执行详情复用图片上传缓存，覆盖发送、话题回复和刷新；缺失或上传失败时降级为文字，不改变普通工具日志。
