@@ -6,3 +6,10 @@ export class TurnNotSubmittedError extends Error {
     this.name = "TurnNotSubmittedError";
   }
 }
+
+export class TurnStoppedBeforeSubmissionError extends TurnNotSubmittedError {
+  constructor() {
+    super(new Error("本次执行已停止，未提交请求。"));
+    this.name = "TurnStoppedBeforeSubmissionError";
+  }
+}

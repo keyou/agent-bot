@@ -4,7 +4,7 @@ Implement six independently reviewable changes on `fix/task-execution-contracts`
 
 - [x] 1. Keep task execution settings separate from Agent defaults. Commit `2729ce3`; 757 focused tests and typecheck passed.
 - [x] 2. Recover known execution without replaying ambiguous submissions. Durable dispatch boundary, exact turn matching and unknown queue guard; 873 focused tests and typecheck passed.
-- [ ] 3. Persist Stop intent across automatic continuations and restarts.
+- [x] 3. Persist Stop intent across automatic continuations and restarts. Durable generation checks, retained queues and late-ack interruption; focused tests and typecheck passed.
 - [x] 4. Represent uncertain execution explicitly and keep presentation consistent. Implemented before recovery as its dependency; 1040 focused tests and typecheck passed.
 - [ ] 5. Record minimal execution provenance and effective settings.
 - [ ] 6. Add cross-module regression coverage for execution invariants.

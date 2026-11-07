@@ -1259,8 +1259,13 @@ describe("StateStore runtime metadata", () => {
     expect(store.listCancellationRequestedTurnAttempts()).toEqual([
       expect.objectContaining({ attemptId: "attempt_cancel", status: "cancelling" }),
     ]);
-    store.restoreTurnAttemptAfterCancellationFailure(previous!);
-    expect(store.getTurnAttempt("attempt_cancel")?.status).toBe("running");
+    store.requestSessionExecutionStop("session_cancel");
+    expect(store.getTurnAttempt("attempt_cancel")?.status).toBe("cancelling");
+    const reopened = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(reopened);
+    expect(reopened.executionGeneration("session_cancel")).toBe(1);
+    expect(reopened.prepareTurnAttemptRecovery("attempt_cancel")).toBeUndefined();
+    expect(() => reopened.beginTurnAttemptSubmission("attempt_cancel")).toThrow("automatic replay refused");
   });
 
   test("refreshes unfinished turn activity while throttling frequent persistence writes", () => {

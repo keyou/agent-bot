@@ -16,6 +16,8 @@ Cards, task lists and Turn Preview show **Unverified** when execution cannot be 
 
 Recovery separates reattachment from resubmission. Only durably confirmed unsubmitted requests may retry automatically. Known active turns are reattached; ambiguous timeouts, disconnects and missing turn IDs are marked unverified without replay or timestamp-based adoption. Automatic queue dispatch pauses while unresolved, preserving queued messages; inspect execution records and send a new message to continue. Transient errors after submission no longer replay the original Prompt.
 
+Stop persists its cancellation boundary before network operations. Pending preparation, retries and automatic continuations accepted before Stop cannot launch afterward, including after restart. An unsuccessful interrupt remains requested, not silently undone; termination is reported only when verified. Stop does not delete independent queued messages or future schedules. A new explicit instruction can start new work.
+
 - Use your existing local Codex or TraeX login from Feishu
 - Create, continue, switch, fork, and stop tasks
 - Reset the current conversation from any successfully completed progress card

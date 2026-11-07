@@ -63,7 +63,7 @@ import { createTurnViewState, hydrateTurnViewState } from "../presentation/TurnS
 import { buildTurnGraphRows } from "../presentation/turnGraph.js";
 import type { AgentRuntimeRegistry } from "../runtime/AgentRuntimeRegistry.js";
 import { displayRuntimeError, isResponseContinuationError } from "../runtime/responseErrors.js";
-import { TurnNotSubmittedError } from "../runtime/submissionErrors.js";
+import { TurnNotSubmittedError, TurnStoppedBeforeSubmissionError } from "../runtime/submissionErrors.js";
 import type {
   AgentRuntime,
   ApprovalDecision,
@@ -121,6 +121,7 @@ interface LoadedSession {
 }
 
 interface StartTurnOptions {
+  executionGeneration?: number;
   scheduleRunId?: string;
   attemptId?: string;
   messageId?: string;
@@ -1257,7 +1258,6 @@ export class ProxySessionController {
           );
         } else if (kind === "session_stop") {
           const sessionId = String(scopedAction.value.sessionId ?? "");
-          await this.outbound.sendText(contextKey, STOP_TASK_STARTED_MESSAGE);
           await this.stopSessionReference(contextKey, sessionId);
           if (scopedAction.value.cardView === "status") await this.refreshStatusCardFromAction(scopedAction, sessionId);
           else if (scopedAction.value.cardView !== "safe_restart") {
@@ -2489,6 +2489,10 @@ export class ProxySessionController {
     for (const attempt of this.store.listCancellationRequestedTurnAttempts()) {
       const session = this.store.getSession(attempt.localSessionId);
       if (!attempt.turnId) {
+        if (attempt.submissionState !== "not_submitted") {
+          await this.markAttemptUnknown(attempt, "停止意图已保存，但提交结果未知；未自动重发。请核实远端执行状态。");
+          continue;
+        }
         this.store.updateTurnAttempt(attempt.attemptId, { status: "cancelled" });
         if (session?.status === "starting" || session?.status === "running") {
           this.store.updateSession(session.localSessionId, { status: "ready" });
@@ -2507,12 +2511,20 @@ export class ProxySessionController {
         );
       }
       try {
-        await this.handleRuntimeEvent({
-          type: "turn_cancelled",
-          sessionId: attempt.localSessionId,
-          turnId: attempt.turnId,
-        });
+        if (!session?.remoteSessionId) throw new Error("Missing remote session for cancellation verification.");
+        const runtime = this.runtimes.forAgent(session.agentName);
+        const remote = await runtime.readRemoteSession?.(session.remoteSessionId);
+        if (!remote || remote.lastTurnId !== attempt.turnId) throw new Error("Original turn status is unverified.");
+        if (isRemoteSessionActive(remote)) {
+          if (!runtime.interruptRemoteTurn) throw new Error("Remote interruption is unavailable.");
+          await runtime.interruptRemoteTurn(session.remoteSessionId, attempt.turnId);
+          await this.loadSession(session);
+        } else if (["completed", "failed", "interrupted"].includes(remote.lastTurnStatus ?? "")) {
+          await this.loadSession(session);
+          await runtime.synchronizeSession(session.localSessionId);
+        } else throw new Error("Original turn termination is unverified.");
       } catch (error) {
+        await this.markAttemptUnknown(attempt, "停止意图已保存，但尚不能确认原轮次已结束。未自动续跑，请核实执行记录。");
         this.logger.warn(
           { error, attemptId: attempt.attemptId, turnId: attempt.turnId },
           "Failed to finish a persisted user-requested turn cancellation.",
@@ -2681,6 +2693,11 @@ export class ProxySessionController {
 
   private async recoverTurnAttempt(attempt: TurnAttemptRecord, announce = true): Promise<void> {
     if (this.recoveryClosed) return;
+    if (attempt.executionGeneration !== this.store.executionGeneration(attempt.localSessionId)) {
+      if (attempt.submissionState === "not_submitted") this.store.updateTurnAttempt(attempt.attemptId, { status: "cancelled" });
+      else await this.markAttemptUnknown(attempt, "停止意图已保存，原执行结果待核实，未自动续跑。");
+      return;
+    }
     const session = this.store.getSession(attempt.localSessionId);
     if (!session || session.status === "closed") {
       this.store.updateTurnAttempt(attempt.attemptId, { status: "interrupted" });
@@ -2967,6 +2984,7 @@ export class ProxySessionController {
       attempt.localImagePaths,
       {
         attemptId: attempt.attemptId,
+        executionGeneration: attempt.executionGeneration,
         messageId: attempt.messageId,
         displayPrompt: recoveryCardPrompt(attempt.promptText),
         preserveAttemptOnFailure: true,
@@ -3025,6 +3043,7 @@ export class ProxySessionController {
     localImagePaths?: string[],
     displayPrompt?: string,
   ): Promise<void> {
+    const executionGeneration = this.store.executionGeneration(record.localSessionId);
     if (this.llmRetryingSessions.has(record.localSessionId) || this.planHandoffs.has(record.localSessionId)) {
       const queued = this.persistQueuedPrompt(record.localSessionId, contextKey, text, {
         localImagePaths,
@@ -3083,6 +3102,7 @@ export class ProxySessionController {
         this.logger.warn({ error, sessionId: record.localSessionId }, "Failed to synchronize session before prompt.");
       }
     }
+    this.assertExecutionGeneration(record.localSessionId, executionGeneration);
     this.store.acknowledgeUnknownTurnAttempts(record.localSessionId);
     const activeTurnId = loaded.session.activeTurnId;
     if (activeTurnId) {
@@ -3113,12 +3133,13 @@ export class ProxySessionController {
           this.logger.warn({ error: syncError, sessionId: record.localSessionId }, "Failed to synchronize after steering failure.");
         }
         if (!current?.activeTurnId) {
-          const turnId = await this.startTurn(loaded, text, replyTarget, localImagePaths, { messageId, displayPrompt });
+          const turnId = await this.startTurn(loaded, text, replyTarget, localImagePaths, { messageId, displayPrompt, executionGeneration });
           if (messageId) await this.bindMessageReactionToTurn(messageId, record.localSessionId, turnId);
           return;
         }
         if (current.activeTurnId !== activeTurnId) {
           try {
+            this.assertExecutionGeneration(record.localSessionId, executionGeneration);
             await loaded.runtime.steerTurn(
               record.localSessionId,
               current.activeTurnId,
@@ -3152,7 +3173,7 @@ export class ProxySessionController {
         return;
       }
     }
-    const turnId = await this.startTurn(loaded, text, replyTarget, localImagePaths, { messageId, displayPrompt });
+    const turnId = await this.startTurn(loaded, text, replyTarget, localImagePaths, { messageId, displayPrompt, executionGeneration });
     if (messageId) await this.bindMessageReactionToTurn(messageId, record.localSessionId, turnId);
   }
 
@@ -4211,6 +4232,9 @@ export class ProxySessionController {
     loaded: LoadedSession, text: string, replyTarget?: MessageReplyTarget,
     localImagePaths?: string[], options: StartTurnOptions = {},
   ): Promise<string> {
+    options = { ...options, executionGeneration: options.executionGeneration
+      ?? (options.attemptId ? this.store.getTurnAttempt(options.attemptId)?.executionGeneration : undefined)
+      ?? this.store.executionGeneration(loaded.record.localSessionId) };
     return this.settingsOperations.run(loaded.record.localSessionId, async () => {
       if (options.responseContinuationTurnId) {
         const current = this.store.getSession(loaded.record.localSessionId);
@@ -4243,6 +4267,10 @@ export class ProxySessionController {
     localImagePaths?: string[],
     options: StartTurnOptions = {},
   ): Promise<string> {
+    const executionGeneration = options.executionGeneration
+      ?? (options.attemptId ? this.store.getTurnAttempt(options.attemptId)?.executionGeneration : undefined)
+      ?? this.store.executionGeneration(loaded.record.localSessionId);
+    this.assertExecutionGeneration(loaded.record.localSessionId, executionGeneration);
     const currentRecord = this.store.getSession(loaded.record.localSessionId);
     const title = currentRecord?.title ?? normalizeTaskTitle(options.displayPrompt ?? text);
     if (!currentRecord?.title && title) this.store.updateRuntimeSession(loaded.record.localSessionId, { title });
@@ -4250,6 +4278,7 @@ export class ProxySessionController {
     const attemptId = options.attemptId ?? createId("attempt");
     if (options.attemptId) {
       this.store.updateTurnAttempt(attemptId, {
+        executionGeneration,
         messageId: options.messageId ?? undefined,
         replyMessageId: replyTarget?.messageId ?? undefined,
         status: "recovering",
@@ -4263,6 +4292,7 @@ export class ProxySessionController {
         localImagePaths,
         messageId: options.messageId,
         replyMessageId: replyTarget?.messageId,
+        executionGeneration,
       });
     }
     let turnId: string;
@@ -4301,6 +4331,7 @@ export class ProxySessionController {
         this.store.updateTurnAttempt(attemptId, { pendingTurnId: pendingTurnId ?? null });
 
         try {
+          this.assertExecutionGeneration(loaded.record.localSessionId, executionGeneration);
           if (options.approvedPlanTurnId && (this.planHandoffs.get(loaded.record.localSessionId) !== options.approvedPlanTurnId
             || this.sessionResets.has(loaded.record.localSessionId))) {
             throw new Error("方案执行已取消。");
@@ -4333,6 +4364,11 @@ export class ProxySessionController {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           let attempt = this.store.getTurnAttempt(attemptId);
+          if (error instanceof TurnStoppedBeforeSubmissionError) {
+            this.store.updateTurnAttempt(attemptId, { status: "cancelled" });
+            if (pendingTurnId) await this.outbound.onEvent({ type: "turn_cancelled", sessionId: loaded.record.localSessionId, turnId: pendingTurnId });
+            throw error;
+          }
           if (attempt?.status === "unknown") throw error;
           if (attempt?.turnId && attempt.turnId !== options.approvedPlanTurnId) {
             turnId = attempt.turnId;
@@ -4342,6 +4378,11 @@ export class ProxySessionController {
           if (error instanceof TurnNotSubmittedError && attempt && !attempt.turnId) {
             this.store.updateTurnAttempt(attemptId, { submissionState: "not_submitted" });
             attempt = this.store.getTurnAttempt(attemptId);
+          }
+          if (attempt?.status === "cancelling") {
+            if (attempt.submissionState === "not_submitted") this.store.updateTurnAttempt(attemptId, { status: "cancelled" });
+            else await this.markAttemptUnknown(attempt, "停止意图已保存，但请求结果未知。未自动重发，请核实执行记录。");
+            throw error;
           }
           if (attempt?.submissionState === "submission_unknown") {
             await this.markAttemptUnknown(attempt, "请求已发出，但无法确认执行结果；未自动重发。请核实后发送消息继续。");
@@ -4395,6 +4436,16 @@ export class ProxySessionController {
       if (retriedStart) this.llmRetryingSessions.delete(loaded.record.localSessionId);
     }
     const attempt = this.store.getTurnAttempt(attemptId);
+    if (this.store.executionGeneration(loaded.record.localSessionId) !== executionGeneration) {
+      this.store.updateTurnAttempt(attemptId, { turnId, submissionState: "submitted", status: "cancelling" });
+      try {
+        await loaded.runtime.cancelTurn(loaded.record.localSessionId, turnId);
+      } catch (error) {
+        await this.markAttemptUnknown(this.store.getTurnAttempt(attemptId)!, "停止请求已保存，但无法确认刚启动轮次已停止。请核实执行记录。");
+        throw error;
+      }
+      return turnId;
+    }
     this.store.updateTurnAttempt(attemptId, {
       pendingTurnId: null,
       turnId,
@@ -4418,6 +4469,10 @@ export class ProxySessionController {
     return turnId;
   }
 
+  private assertExecutionGeneration(sessionId: string, generation: number): void {
+    if (this.store.executionGeneration(sessionId) !== generation) throw new TurnStoppedBeforeSubmissionError();
+  }
+
   private async createSession(
     contextKey: string,
     agentName: string,
@@ -4438,6 +4493,7 @@ export class ProxySessionController {
       ? createProjectlessWorkspace({ prompt: initialTitle }).cwd
       : path.resolve(cwd ?? this.config.defaults.cwd);
     const record = this.store.createSession({ localSessionId, contextKey, agentName, cwd: sessionCwd, status: "starting" });
+    const executionGeneration = this.store.executionGeneration(localSessionId);
     if (initialTitle || resolvedExecutionSettings.modelProvider || resolvedExecutionSettings.model
       || resolvedExecutionSettings.reasoningEffort || resolvedExecutionSettings.permissionMode) {
       this.store.updateRuntimeSession(localSessionId, {
@@ -4476,6 +4532,7 @@ export class ProxySessionController {
       this.persistRuntimeSession(record, session, session.activeTurnId ? "running" : "ready");
       this.outbound.updateSessionModel(localSessionId, session.model, session.modelProvider);
       const saved = this.store.getSession(localSessionId) ?? record;
+      if (prepareTurn) this.assertExecutionGeneration(localSessionId, executionGeneration);
       if (announce) {
         const task = initialTitle ? `${initialTitle}（${session.remoteSessionId}）` : session.remoteSessionId;
         await this.outbound.sendText(contextKey, `已创建 ${agent.title} 任务：${task}`);
@@ -5259,6 +5316,7 @@ export class ProxySessionController {
             attempt.replyMessageId ? { messageId: attempt.replyMessageId, replyInThread: true } : undefined,
             undefined,
             { messageId: attempt.messageId, displayPrompt: "方案已确认，继续执行", approvedPlanTurnId: turnId,
+              executionGeneration: attempt.executionGeneration,
               ...(scheduledRun ? { attemptId: attempt.attemptId, scheduleRunId: attempt.attemptId } : {}) },
           );
         }
@@ -5272,10 +5330,12 @@ export class ProxySessionController {
         this.store.audit(attempt.contextKey, "approved_plan_continued", { sessionId, turnId, nextTurnId });
       });
     } catch (error) {
-      failed = true;
-      this.logger.error({ error, sessionId, turnId }, "Failed to continue an approved plan.");
-      await this.outbound.sendText(attempt.contextKey,
-        "方案已确认，但后续执行启动失败：" + runtimeErrorMessage(error) + "。请发送消息继续。");
+      failed = !(error instanceof TurnStoppedBeforeSubmissionError);
+      if (failed) {
+        this.logger.error({ error, sessionId, turnId }, "Failed to continue an approved plan.");
+        await this.outbound.sendText(attempt.contextKey,
+          "方案已确认，但后续执行启动失败：" + runtimeErrorMessage(error) + "。请发送消息继续。");
+      }
     } finally {
       if (this.planHandoffs.get(sessionId) === turnId) this.planHandoffs.delete(sessionId);
       if (!continued) {
@@ -5353,6 +5413,7 @@ export class ProxySessionController {
         responseContinuation ? undefined : attempt.localImagePaths,
         {
           attemptId: attempt.attemptId,
+          executionGeneration: attempt.executionGeneration,
           messageId: attempt.messageId,
           displayPrompt: responseContinuation ? `恢复模型续接：${attempt.promptText}` : llmRetryCardPrompt(attempt.promptText, retryNumber),
           preserveAttemptOnFailure: true,
@@ -5428,8 +5489,10 @@ export class ProxySessionController {
   }
 
   private async startNextQueuedPromptIfIdleNow(sessionId: string): Promise<void> {
+    const executionGeneration = this.store.executionGeneration(sessionId);
     if (this.planHandoffs.has(sessionId) || this.sessionResets.has(sessionId)) return;
     if (this.store.hasUnknownTurnAttemptForSession(sessionId)) return;
+    if (this.store.listCancellationRequestedTurnAttempts().some((attempt) => attempt.localSessionId === sessionId)) return;
     if (this.store.countQueuedPrompts(sessionId) === 0) return;
     const queuedHead = this.store.peekQueuedPrompt(sessionId);
     if (queuedHead && this.store.schedules.getRun(queuedHead.promptId)
@@ -5447,6 +5510,7 @@ export class ProxySessionController {
 
       await this.applyPendingProviderSettings(loaded);
       if (this.store.getPendingProviderSettings(sessionId)) return;
+      this.assertExecutionGeneration(sessionId, executionGeneration);
       prompt = this.store.takeNextQueuedPrompt(sessionId);
       if (!prompt) return;
       const scheduledRun = this.store.schedules.getRun(prompt.promptId);
@@ -5476,11 +5540,23 @@ export class ProxySessionController {
         prompt.text,
         prompt.replyMessageId ? { messageId: prompt.replyMessageId, replyInThread: true } : undefined,
         prompt.localImagePaths,
-        { messageId: prompt.messageId, displayPrompt: prompt.displayPrompt,
+        { messageId: prompt.messageId, displayPrompt: prompt.displayPrompt, executionGeneration,
           ...(scheduledRun ? { attemptId: prompt.promptId, scheduleRunId: prompt.promptId } : {}) },
       );
       if (prompt.messageId) await this.bindMessageReactionToTurn(prompt.messageId, sessionId, turnId);
     } catch (error) {
+      if (error instanceof TurnStoppedBeforeSubmissionError) {
+        if (prompt) {
+          this.store.enqueuePrompt(prompt);
+          const run = this.store.schedules.getRun(prompt.promptId);
+          if (run) {
+            this.store.schedules.saveRun({ ...run, status: "queued" });
+            this.store.updateTurnAttempt(run.id, { status: "accepted", executionGeneration: this.store.executionGeneration(sessionId) });
+          }
+          await this.refreshPromptQueueCards(sessionId);
+        }
+        return;
+      }
       if (prompt) {
         const run = this.store.schedules.getRun(prompt.promptId);
         if (run && ["dispatching", "submitting"].includes(run.status)) {
@@ -5666,14 +5742,15 @@ export class ProxySessionController {
 
   private async cancel(contextKey: string): Promise<void> {
     const record = this.requireCurrentSession(contextKey);
-    await this.outbound.sendText(contextKey, STOP_TASK_STARTED_MESSAGE);
     await this.cancelSession(record);
   }
 
   private async cancelSession(record: SessionRecord): Promise<void> {
+    this.store.requestSessionExecutionStop(record.localSessionId);
     this.responseContinuations.get(record.localSessionId)?.abort.abort();
     this.responseContinuations.delete(record.localSessionId);
     this.planHandoffs.delete(record.localSessionId);
+    await this.outbound.sendText(record.contextKey, STOP_TASK_STARTED_MESSAGE);
     const runtime = this.runtimes.forAgent(record.agentName);
     if (runtime.kind === "codex" && record.remoteSessionId && runtime.interruptRemoteTurn) {
       if (runtime.getGoal && runtime.setGoal) {
@@ -5705,14 +5782,15 @@ export class ProxySessionController {
         }
       }
       if (!turnId) {
+        this.finishUnsubmittedStops(record.localSessionId);
         await this.outbound.sendText(record.contextKey, "当前没有正在执行的任务。");
         return;
       }
-      const cancellationAttempt = this.store.requestTurnAttemptCancellation(turnId);
+      this.store.requestTurnAttemptCancellation(turnId);
       try {
         await runtime.interruptRemoteTurn(record.remoteSessionId, turnId);
       } catch (error) {
-        if (cancellationAttempt) this.store.restoreTurnAttemptAfterCancellationFailure(cancellationAttempt);
+        // Keep the durable stop intent even when the interrupt response is lost.
         throw error;
       }
       this.store.audit(record.contextKey, "turn_interrupt_sent", {
@@ -5727,15 +5805,24 @@ export class ProxySessionController {
     const loaded = await this.loadSession(record);
     const turnId = loaded.session.activeTurnId;
     if (!turnId) {
+      this.finishUnsubmittedStops(record.localSessionId);
       await this.outbound.sendText(record.contextKey, "当前没有正在执行的任务。");
       return;
     }
-    const cancellationAttempt = this.store.requestTurnAttemptCancellation(turnId);
+    this.store.requestTurnAttemptCancellation(turnId);
     try {
       await loaded.runtime.cancelTurn(record.localSessionId, turnId);
     } catch (error) {
-      if (cancellationAttempt) this.store.restoreTurnAttemptAfterCancellationFailure(cancellationAttempt);
+      // Keep the durable stop intent even when the interrupt response is lost.
       throw error;
+    }
+  }
+
+  private finishUnsubmittedStops(sessionId: string): void {
+    for (const attempt of this.store.listCancellationRequestedTurnAttempts()) {
+      if (attempt.localSessionId === sessionId && attempt.submissionState === "not_submitted") {
+        this.store.updateTurnAttempt(attempt.attemptId, { status: "cancelled" });
+      }
     }
   }
 

@@ -1,4 +1,8 @@
 export const migrations = [
+  `CREATE TABLE IF NOT EXISTS task_execution_control (
+    local_session_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0
+  );`,
   `
   CREATE TABLE IF NOT EXISTS user_contexts (
     context_key TEXT PRIMARY KEY,

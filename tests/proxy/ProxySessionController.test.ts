@@ -1597,7 +1597,7 @@ describe("ProxySessionController", () => {
     });
   });
 
-  test("finishes a persisted user-requested cancellation without recovering the task", async () => {
+  test("does not claim an unverified persisted cancellation succeeded or recover the task", async () => {
     const { controller, runtime, presenter, store } = fixture();
     store.getOrCreateUserContext("chat_id:c1", "codex");
     store.createSession({
@@ -1626,16 +1626,85 @@ describe("ProxySessionController", () => {
     await controller.recoverInterruptedTasks();
 
     expect(runtime.startTurn).not.toHaveBeenCalled();
-    expect(presenter.onEvent).toHaveBeenCalledWith({
-      type: "turn_cancelled",
+    expect(presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: "turn_status_unknown",
       sessionId: "session_user_cancelled",
       turnId: "turn_user_cancelled",
-    });
-    expect(store.getTurnAttempt("attempt_user_cancelled")?.status).toBe("cancelled");
+    }));
+    expect(store.getTurnAttempt("attempt_user_cancelled")?.status).toBe("unknown");
     expect(store.getSession("session_user_cancelled")).toMatchObject({
       status: "ready",
-      lastTurnStatus: "cancelled",
+      lastTurnStatus: "unknown",
     });
+  });
+
+  test("Stop during pending-card preparation prevents submission and survives recovery", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("/new --dir ."));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    let release!: () => void;
+    const barrier = new Promise<string>((resolve) => { release = () => resolve("pending_stop"); });
+    vi.mocked(f.presenter.startPendingTurn).mockReturnValueOnce(barrier);
+    const sending = f.controller.onMessage(message("must not be dispatched"));
+    await vi.waitFor(() => expect(f.presenter.startPendingTurn).toHaveBeenCalled());
+    await f.controller.controlStopTask(id);
+    release();
+    await sending;
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.executionGeneration(id)).toBe(1);
+    await f.controller.recoverInterruptedTasks();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    await f.controller.onMessage(message("new explicit instruction"));
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+  });
+
+  test("Stop during a queued prompt card preserves the independent queued request", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("/new --dir ."));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    f.store.enqueuePrompt({ promptId: "queued", localSessionId: id, contextKey: "chat_id:c1", text: "independent" });
+    let release!: () => void;
+    vi.mocked(f.presenter.startPendingTurn).mockReturnValueOnce(new Promise<string>((resolve) => { release = () => resolve("pending_queue"); }));
+    const draining = f.controller.drainScheduledPrompts(id);
+    await vi.waitFor(() => expect(f.presenter.startPendingTurn).toHaveBeenCalled());
+    await f.controller.controlStopTask(id);
+    release();
+    await draining;
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.store.listQueuedPrompts(id)).toMatchObject([{ promptId: "queued", text: "independent" }]);
+  });
+
+  test("an interrupt failure preserves Stop across restart without replay", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("work"));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    vi.mocked(f.runtime.interruptRemoteTurn!).mockRejectedValue(new Error("interrupt response lost"));
+    await expect(f.controller.controlStopTask(id)).rejects.toThrow("interrupt response lost");
+    expect(f.store.listCancellationRequestedTurnAttempts()).toHaveLength(1);
+    await f.controller.recoverInterruptedTasks();
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.store.executionGeneration(id)).toBe(1);
+    expect(f.store.hasUnknownTurnAttemptForSession(id)).toBe(true);
+  });
+
+  test("a turn acknowledged after Stop receives an interrupt instead of escaping cancellation", async () => {
+    const f = fixture();
+    await f.controller.onMessage(message("/new --dir ."));
+    const id = f.store.getUserContext("chat_id:c1")!.currentSessionId!;
+    let release!: () => void;
+    vi.mocked(f.runtime.startTurn).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      f.runtime.getSession(id)!.activeTurnId = "late_ack";
+      return "late_ack";
+    });
+    const sending = f.controller.onMessage(message("delayed start"));
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    await f.controller.controlStopTask(id);
+    release();
+    await sending;
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.runtime.cancelTurn).toHaveBeenCalledWith(id, "late_ack");
+    expect(f.store.listCancellationRequestedTurnAttempts()).toMatchObject([{ turnId: "late_ack" }]);
   });
 
   test("reconciles a remotely completed turn after restart without starting it again", async () => {
@@ -7520,7 +7589,7 @@ describe("ProxySessionController", () => {
     expect(store.getTurnAttempt(attemptId)?.status).toBe("cancelling");
   });
 
-  test("restores a recoverable attempt when a user interrupt request fails", async () => {
+  test("retains durable cancellation intent when a user interrupt request fails", async () => {
     const { controller, runtime, store } = fixture();
     await controller.onMessage(message("keep working if stop fails"));
     const sessionId = store.getUserContext("chat_id:c1")!.currentSessionId!;
@@ -7531,7 +7600,7 @@ describe("ProxySessionController", () => {
 
     await controller.onMessage(message("/stop"));
 
-    expect(store.getTurnAttempt(attemptId)?.status).toBe("running");
+    expect(store.getTurnAttempt(attemptId)?.status).toBe("cancelling");
   });
 
   test("reads a missing local turn from the current Codex task before interrupting", async () => {
@@ -10335,8 +10404,8 @@ describe("ProxySessionController", () => {
     sessions.get(task.localSessionId)!.activeTurnId = undefined;
     Object.assign(remoteSessions[0]!, { status: "idle", lastTurnStatus: "completed" });
     let finishCard: (() => void) | undefined;
-    vi.mocked(presenter.startPendingTurn).mockImplementationOnce(() => new Promise<undefined>((resolve) => {
-      finishCard = () => resolve(undefined);
+    vi.mocked(presenter.startPendingTurn).mockImplementationOnce(() => new Promise<string>((resolve) => {
+      finishCard = () => resolve("pending_stopped_plan");
     }));
     for (const listener of listeners) listener({
       type: "turn_completed", sessionId: task.localSessionId, turnId: "turn_1", finalResponse: "", approvedPlan: true,
@@ -10344,7 +10413,9 @@ describe("ProxySessionController", () => {
     await vi.waitFor(() => expect(finishCard).toBeDefined());
     await controller.onMessage(message("/stop"));
     finishCard!();
-    await vi.waitFor(() => expect(presenter.failPendingTurn).toHaveBeenCalled());
+    await vi.waitFor(() => expect(presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: "turn_cancelled", turnId: "pending_stopped_plan",
+    })));
     expect(runtime.startTurn).toHaveBeenCalledTimes(1);
   });
 

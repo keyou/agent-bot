@@ -194,6 +194,7 @@ export interface TurnAttemptRecord {
   retryCount: number;
   status: TurnAttemptStatus;
   submissionState: TurnSubmissionState;
+  executionGeneration: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -270,6 +271,7 @@ interface QueuedPromptRow {
 }
 
 interface TurnAttemptRow {
+  execution_generation: number;
   attempt_id: string;
   local_session_id: string;
   context_key: string;
@@ -604,8 +606,9 @@ export class StateStore {
     localImagePaths?: string[];
     messageId?: string;
     replyMessageId?: string;
+    createdAt?: string;
   }): QueuedPromptRecord {
-    const createdAt = new Date().toISOString();
+    const createdAt = input.createdAt ?? new Date().toISOString();
     this.db.prepare(`
       INSERT INTO queued_prompts (
         prompt_id, local_session_id, context_key, prompt_text, display_prompt, local_image_paths_json,
@@ -715,6 +718,7 @@ export class StateStore {
     recoveryCount?: number;
     retryCount?: number;
     submissionState?: TurnSubmissionState;
+    executionGeneration?: number;
     status?: Extract<TurnAttemptStatus, "accepted" | "running" | "recovering">;
     createdAt?: string;
     updatedAt?: string;
@@ -726,8 +730,8 @@ export class StateStore {
       INSERT INTO turn_attempts (
         attempt_id, local_session_id, context_key, prompt_text, local_image_paths_json,
         message_id, reply_message_id, pending_turn_id, turn_id, recovered_from_turn_id,
-        recovery_count, retry_count, submission_state, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        recovery_count, retry_count, submission_state, status, created_at, updated_at, execution_generation
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.attemptId,
       input.localSessionId,
@@ -745,6 +749,7 @@ export class StateStore {
       status,
       createdAt,
       updatedAt,
+      input.executionGeneration ?? this.executionGeneration(input.localSessionId),
     );
     return this.getTurnAttempt(input.attemptId)!;
   }
@@ -800,6 +805,7 @@ export class StateStore {
       recoveryCount: number;
       retryCount: number;
       submissionState: TurnSubmissionState;
+      executionGeneration: number;
       status: TurnAttemptStatus;
     }>,
   ): void {
@@ -810,7 +816,7 @@ export class StateStore {
     this.db.prepare(`
       UPDATE turn_attempts
       SET message_id = ?, reply_message_id = ?, pending_turn_id = ?, turn_id = ?,
-          recovered_from_turn_id = ?, recovery_count = ?, retry_count = ?, submission_state = ?, status = ?, updated_at = ?
+          recovered_from_turn_id = ?, recovery_count = ?, retry_count = ?, submission_state = ?, execution_generation = ?, status = ?, updated_at = ?
       WHERE attempt_id = ?
     `).run(
       value(patch.messageId, existing.messageId),
@@ -821,6 +827,7 @@ export class StateStore {
       patch.recoveryCount ?? existing.recoveryCount,
       patch.retryCount ?? existing.retryCount,
       patch.submissionState ?? (patch.turnId ? "submitted" : existing.submissionState),
+      patch.executionGeneration ?? existing.executionGeneration,
       patch.status ?? existing.status,
       new Date().toISOString(),
       attemptId,
@@ -865,12 +872,6 @@ export class StateStore {
     return existing;
   }
 
-  restoreTurnAttemptAfterCancellationFailure(attempt: TurnAttemptRecord): void {
-    const current = this.getTurnAttempt(attempt.attemptId);
-    if (current?.status !== "cancelling") return;
-    this.updateTurnAttempt(attempt.attemptId, { status: attempt.status });
-  }
-
   touchTurnAttempt(turnId: string, activityAt = new Date()): void {
     const timestamp = activityAt.toISOString();
     const throttleCutoff = new Date(activityAt.getTime() - 15_000).toISOString();
@@ -893,8 +894,27 @@ export class StateStore {
       UPDATE turn_attempts SET submission_state = 'submission_unknown', updated_at = ?
       WHERE attempt_id = ? AND submission_state = 'not_submitted'
         AND status IN ('accepted', 'recovering') AND turn_id IS NULL
+        AND execution_generation = COALESCE((SELECT generation FROM task_execution_control
+          WHERE local_session_id = turn_attempts.local_session_id), 0)
     `).run(new Date().toISOString(), attemptId);
     if (result.changes !== 1) throw new Error("Prompt submission is not provably safe; automatic replay refused.");
+  }
+
+  executionGeneration(localSessionId: string): number {
+    const row = this.db.prepare("SELECT generation FROM task_execution_control WHERE local_session_id = ?")
+      .get(localSessionId) as { generation: number } | undefined;
+    return row?.generation ?? 0;
+  }
+
+  requestSessionExecutionStop(localSessionId: string): void {
+    this.db.transaction(() => {
+      this.db.prepare(`INSERT INTO task_execution_control (local_session_id, generation) VALUES (?, 1)
+        ON CONFLICT(local_session_id) DO UPDATE SET generation = generation + 1`).run(localSessionId);
+      this.db.prepare(`UPDATE turn_attempts SET status = 'cancelling', updated_at = ?
+        WHERE local_session_id = ? AND status IN ('accepted', 'running', 'recovering', 'unknown')
+          AND attempt_id NOT IN (SELECT prompt_id FROM queued_prompts)`)
+        .run(new Date().toISOString(), localSessionId);
+    })();
   }
 
   prepareUnstartedTurnAttemptRetry(attemptId: string): TurnAttemptRecord | undefined {
@@ -2391,6 +2411,9 @@ export class StateStore {
     if (!existing.has("retry_count")) {
       this.db.exec("ALTER TABLE turn_attempts ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0");
     }
+    if (!existing.has("execution_generation")) {
+      this.db.exec("ALTER TABLE turn_attempts ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   private ensureQueuedPromptColumns(): void {
@@ -2529,6 +2552,7 @@ function mapTurnAttempt(row: TurnAttemptRow): TurnAttemptRecord {
     recoveryCount: row.recovery_count,
     retryCount: row.retry_count,
     submissionState: row.submission_state,
+    executionGeneration: row.execution_generation,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
