@@ -13117,7 +13117,7 @@ describe("ProxySessionController", () => {
     expect(store.getOrCreateUserContext("chat_id:c1", "codex").currentSessionId).toBe(task.localSessionId);
   });
 
-  test.each(["local", "external"] as const)("marks %s task results and execution details for local-image rendering without taking over", async (kind) => {
+  test.each(["local", "external"] as const)("preserves %s task image Markdown for shared outbound processing without taking over", async (kind) => {
     const { controller, outbound, remoteSessions, runtime, store, sessions } = fixture();
     let target = "external_images";
     if (kind === "local") {
@@ -13137,11 +13137,12 @@ describe("ProxySessionController", () => {
     await controller.onMessage(message(`/status ${target}`));
     const card = vi.mocked(outbound.sendInteractiveCard).mock.calls.at(-1)?.[1] as { body: { elements: Array<Record<string, unknown>> } };
     expect(card.body.elements).toContainEqual(expect.objectContaining({
-      tag: "markdown", content: expect.stringContaining("![截图](C:/outputs/result.jpg)"), __acp_local_markdown_images: true,
+      tag: "markdown", content: expect.stringContaining("![截图](C:/outputs/result.jpg)"),
     }));
     expect(card.body.elements.find((element) => element.element_id === "status_execution_details")).toMatchObject({
-      elements: [expect.objectContaining({ tag: "markdown", __acp_local_markdown_images: true })],
+      elements: [expect.objectContaining({ tag: "markdown", content: expect.stringContaining("![步骤截图](C:/outputs/step.jpg)") })],
     });
+    expect(JSON.stringify(card)).not.toContain("__acp_local_markdown_images");
     expect(runtime.startTurn).not.toHaveBeenCalled();
     expect(runtime.resumeSession).not.toHaveBeenCalled();
     if (kind === "external") expect(store.findSessionByRemoteSessionId(target)).toBeUndefined();

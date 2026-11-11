@@ -5,7 +5,7 @@ import type { Logger } from "pino";
 import { defaultSqlitePath } from "../config/paths.js";
 import type { AppConfig } from "../config/schema.js";
 import { normalizeFeishuMarkdown } from "./FeishuMarkdown.js";
-import { LOCAL_CARD_IMAGE_PATH, LOCAL_CARD_MARKDOWN_IMAGES } from "./LocalCardImage.js";
+import { LOCAL_CARD_IMAGE_PATH } from "./LocalCardImage.js";
 import { renderMarkdownWithLocalImages } from "./LocalImageMarkdown.js";
 import { splitFinalResponseBranding } from "./FinalResponseBranding.js";
 import {
@@ -337,7 +337,7 @@ export class FeishuMessageClient implements FeishuOutbound {
 
   async sendMarkdown(contextKey: string, markdown: string, idempotencyKey?: string): Promise<string | undefined> {
     const normalizedMarkdown = normalizeFeishuMarkdown(markdown);
-    const elements = await this.renderFinalAnswerElements(normalizedMarkdown);
+    const elements = this.renderFinalAnswerElements(normalizedMarkdown);
     return this.sendMessage(
       contextKey,
       "interactive",
@@ -352,7 +352,7 @@ export class FeishuMessageClient implements FeishuOutbound {
     card: Record<string, unknown>,
     idempotencyKey?: string,
   ): Promise<string | undefined> {
-    return this.sendMessage(contextKey, "interactive", await this.prepareInteractiveCard(card), idempotencyKey);
+    return this.sendMessage(contextKey, "interactive", card, idempotencyKey);
   }
 
   async replyText(
@@ -380,7 +380,7 @@ export class FeishuMessageClient implements FeishuOutbound {
     idempotencyKey?: string,
   ): Promise<string | undefined> {
     const normalizedMarkdown = normalizeFeishuMarkdown(markdown);
-    const elements = await this.renderFinalAnswerElements(normalizedMarkdown);
+    const elements = this.renderFinalAnswerElements(normalizedMarkdown);
     return this.replyMessage(
       contextKey,
       target,
@@ -401,20 +401,14 @@ export class FeishuMessageClient implements FeishuOutbound {
       contextKey,
       target,
       "interactive",
-      await this.prepareInteractiveCard(card),
+      card,
       idempotencyKey,
     );
   }
 
-  private async renderFinalAnswerElements(markdown: string): Promise<Array<Record<string, unknown>>> {
+  private renderFinalAnswerElements(markdown: string): Array<Record<string, unknown>> {
     const { content, branding } = splitFinalResponseBranding(markdown);
-    const elements = content
-      ? await renderMarkdownWithLocalImages(
-        content,
-        (filePath) => this.uploadImageCached(filePath),
-        (error, filePath) => this.logger.warn({ error, filePath }, "Failed to upload local image to Feishu."),
-      )
-      : [];
+    const elements = content ? [{ tag: "markdown", content }] : [];
     if (!branding) return elements;
     return [
       ...elements,
@@ -473,9 +467,10 @@ export class FeishuMessageClient implements FeishuOutbound {
     idempotencyKey?: string,
     cardTableLimitFallbackText?: string,
   ): Promise<string | undefined> {
+    const prepared = msgType === "interactive" ? await this.prepareInteractiveCard(content) : content;
     return this.enqueueSend(contextKey, async () => {
       try {
-        return await this.sendMessageNow(contextKey, msgType, content, idempotencyKey);
+        return await this.sendMessageNow(contextKey, msgType, prepared, idempotencyKey);
       } catch (error) {
         const normalized = normalizeTransportError(error, "send");
         if (!cardTableLimitFallbackText || !normalized.isCardTableLimitFailure) throw error;
@@ -501,9 +496,10 @@ export class FeishuMessageClient implements FeishuOutbound {
     idempotencyKey?: string,
     cardTableLimitFallbackText?: string,
   ): Promise<string | undefined> {
+    const prepared = msgType === "interactive" ? await this.prepareInteractiveCard(content) : content;
     return this.enqueueSend(contextKey, async () => {
       try {
-        return await this.replyMessageNow(target, msgType, content, idempotencyKey);
+        return await this.replyMessageNow(target, msgType, prepared, idempotencyKey);
       } catch (error) {
         const normalized = normalizeTransportError(error, "reply");
         if (!cardTableLimitFallbackText || !normalized.isCardTableLimitFailure) throw error;
@@ -903,24 +899,29 @@ export class FeishuMessageClient implements FeishuOutbound {
     return await this.prepareCardValue(card) as Record<string, unknown>;
   }
 
-  private async prepareCardValue(value: unknown): Promise<unknown> {
+  private async prepareCardValue(value: unknown, expandMarkdown = false): Promise<unknown> {
     if (Array.isArray(value)) {
-      // Marked Markdown expands to sibling text/image elements; other arrays keep their shape.
+      // Card Markdown expands to sibling text/image elements; other arrays keep their shape.
       const prepared = await Promise.all(value.map(async (item) => {
-        const result = await this.prepareCardValue(item);
-        return isRecord(item) && item.tag === "markdown" && item[LOCAL_CARD_MARKDOWN_IMAGES] === true && Array.isArray(result)
+        const result = await this.prepareCardValue(item, true);
+        return isRecord(item) && item.tag === "markdown" && Array.isArray(result)
           ? result : [result];
       }));
       return prepared.flat();
     }
     if (!isRecord(value)) return value;
-    if (value.tag === "markdown" && value[LOCAL_CARD_MARKDOWN_IMAGES] === true && typeof value.content === "string") {
-      const { content, element_id: elementId, [LOCAL_CARD_MARKDOWN_IMAGES]: _marker, ...format } = value;
+    if ((value.tag === "markdown" || value.tag === "lark_md") && typeof value.content === "string") {
+      const { content, element_id: elementId, ...format } = value;
       const elements = await renderMarkdownWithLocalImages(
         content,
         (filePath) => this.uploadImageCached(filePath),
         (error, filePath) => this.logger.warn({ error, filePath }, "Failed to upload local card image to Feishu."),
       );
+      if (value.tag === "lark_md" || !expandMarkdown) {
+        return { ...value, content: elements.length ? elements.map((element) => element.tag === "img"
+          ? `![${cardImageLabel(element).replace(/[\\\[\]]/gu, "\\$&")}](${String(element.img_key)})`
+          : String(element.content)).join("") : content };
+      }
       return (elements.length ? elements : [{ tag: "markdown", content }]).map((element, index) => ({
         ...(element.tag === "markdown" ? format : {}),
         ...element,
@@ -941,7 +942,7 @@ export class FeishuMessageClient implements FeishuOutbound {
     }
     const prepared: Record<string, unknown> = {};
     await Promise.all(Object.entries(value).map(async ([key, child]) => {
-      prepared[key] = await this.prepareCardValue(child);
+      prepared[key] = key === "value" ? child : await this.prepareCardValue(child);
     }));
     return prepared;
   }

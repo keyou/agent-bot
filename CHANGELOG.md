@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Unify local image handling at the Feishu outbound boundary for all cards and final answers, including live thinking-card updates; reuse uploads, degrade unavailable images to text, and preserve code examples, native image keys and callback data without per-card opt-in flags.
+
 - Remove the retired chronological thinking-card renderer, layout configuration and fixed-count pagination. Progress, execution-details and history cards now share grouped rendering; saved history and web Preview are unchanged.
 
 - Add owner-only `/settings` panels with a compact Common-first layout for Profile and per-Agent defaults, response/display policies and service options, with validated atomic YAML saves, stale-card protection and explicit safe-restart activation; existing tasks and history remain unchanged.

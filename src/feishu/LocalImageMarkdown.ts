@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import MarkdownIt from "markdown-it";
 
-const MARKDOWN_LINK = /(!?)\[([^\]]*)\]\(([^)\r\n]+)\)/g;
+const MARKDOWN_LINK = /(!?)\[([^\]\r\n]*)\]\((<[^>\r\n]+>|[^)\r\n]+)(?:[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'))?\)/g;
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".tiff", ".bmp", ".ico"]);
+const markdownParser = new MarkdownIt();
 
 export async function renderMarkdownWithLocalImages(
   markdown: string,
@@ -12,14 +14,19 @@ export async function renderMarkdownWithLocalImages(
 ): Promise<Array<Record<string, unknown>>> {
   const elements: Array<Record<string, unknown>> = [];
   const uploads = new Map<string, Promise<string>>();
+  const protectedRanges = markdown.includes("[") ? markdownCodeRanges(markdown) : [];
   let cursor = 0;
 
   for (const match of markdown.matchAll(MARKDOWN_LINK)) {
     const matchIndex = match.index;
-    const target = match[3];
-    if (matchIndex === undefined || target === undefined) continue;
+    const rawTarget = match[3];
+    if (matchIndex === undefined || rawTarget === undefined
+      || escapedAt(markdown, matchIndex)
+      || protectedRanges.some(([start, end]) => matchIndex >= start && matchIndex < end)) continue;
+    const target = markdownTarget(rawTarget);
     const filePath = localImagePath(target);
     const imageSyntax = match[1] === "!";
+    if (imageSyntax && /^img_[a-z\d_-]+$/iu.test(target)) continue;
     const label = match[2]?.trim() || path.basename(unwrapTarget(target.trim()));
     if (!filePath) {
       if (!imageSyntax) continue;
@@ -54,6 +61,50 @@ export async function renderMarkdownWithLocalImages(
 
   appendMarkdown(elements, markdown.slice(cursor));
   return elements;
+}
+
+function markdownCodeRanges(markdown: string): Array<[number, number]> {
+  const lineOffsets = [0, ...[...markdown.matchAll(/\r?\n/gu)].map(match => match.index + match[0].length)];
+  const ranges: Array<[number, number]> = [];
+  for (const token of markdownParser.parse(markdown, {})) {
+    if (!token.map) continue;
+    const start = lineOffsets[token.map[0]] ?? markdown.length;
+    const end = lineOffsets[token.map[1]] ?? markdown.length;
+    if (token.type === "fence" || token.type === "code_block") {
+      ranges.push([start, end]);
+    } else if (token.type === "inline") {
+      const text = markdown.slice(start, end);
+      const runs = [...text.matchAll(/`+/gu)];
+      for (let index = 0; index < runs.length; index += 1) {
+        const opener = runs[index]!;
+        if (escapedAt(text, opener.index)) continue;
+        const closing = runs.findIndex((run, candidate) => candidate > index && run[0].length === opener[0].length);
+        if (closing < 0) continue;
+        const closer = runs[closing]!;
+        ranges.push([start + opener.index, start + closer.index + closer[0].length]);
+        index = closing;
+      }
+    }
+  }
+  return ranges;
+}
+
+function escapedAt(text: string, offset: number): boolean {
+  let slashes = 0;
+  while (offset > 0 && text[--offset] === "\\") slashes += 1;
+  return slashes % 2 !== 0;
+}
+
+function markdownTarget(rawTarget: string): string {
+  const target = rawTarget.trim();
+  const parsed = markdownParser.helpers.parseLinkDestination(target, 0, target.length);
+  if (parsed.ok) {
+    const suffix = target.slice(parsed.pos).trim();
+    if (!suffix) return parsed.str;
+    const title = markdownParser.helpers.parseLinkTitle(suffix, 0, suffix.length);
+    if (title.ok && title.pos === suffix.length) return parsed.str;
+  }
+  return unwrapTarget(target);
 }
 
 function localImagePath(rawTarget: string): string | undefined {

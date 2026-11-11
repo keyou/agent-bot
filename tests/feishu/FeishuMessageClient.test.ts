@@ -6,7 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AppConfig } from "../../src/config/schema.js";
 import { FeishuApiError, FeishuMessageClient } from "../../src/feishu/FeishuMessageClient.js";
 import { CardRenderer } from "../../src/feishu/CardRenderer.js";
-import { localCardMarkdown } from "../../src/feishu/LocalCardImage.js";
+import { createTurnViewState } from "../../src/presentation/TurnStateReducer.js";
 
 const originalFetch = globalThis.fetch;
 const temporaryDirectories: string[] = [];
@@ -878,6 +878,125 @@ describe("FeishuMessageClient", () => {
     expect(String(fetchMock.mock.calls[1]?.[0])).toContain("receive_id_type=open_id");
   });
 
+  test.each(["send", "reply", "update"] as const)("prepares images in every card on %s without opt-in flags", async (operation) => {
+    const imagePath = createImage("progress.png");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, data: { image_key: "img_progress" } }))
+      .mockResolvedValueOnce(response({ code: 0, data: { message_id: "om_progress" } }));
+    globalThis.fetch = fetchMock;
+    const client = new FeishuMessageClient(config(), logger());
+    const callback = { action: "refresh", groups: [["a", "b"]], data: { tag: "markdown", content: `![payload](${markdownPath(imagePath)})` } };
+    const card = { schema: "2.0", body: { elements: [
+      { tag: "column_set", columns: [{ tag: "column", elements: [
+        { tag: "markdown", element_id: "progress_text", text_size: "notation", content: `Before\n![Screenshot](${markdownPath(imagePath)})\nAfter` },
+        { tag: "collapsible_panel", expanded: false, elements: [{ tag: "markdown", content: `[Again](${markdownPath(imagePath)})` }] },
+      ] }] },
+      { tag: "button", text: { tag: "plain_text", content: "Refresh" }, value: callback },
+    ] } };
+    const original = JSON.stringify(card);
+    if (operation === "send") await client.sendInteractiveCard("chat_id:c1", card, "image-uuid");
+    else if (operation === "reply") await client.replyInteractiveCard("chat_id:c1", { messageId: "anchor", replyInThread: true }, card, "image-uuid");
+    else await client.updateInteractiveCard("om_progress", card);
+    expect(fetchMock.mock.calls.filter(call => String(call[0]).includes("/im/v1/images"))).toHaveLength(1);
+    const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
+    const prepared = JSON.parse(body.content);
+    const elements = prepared.body.elements[0].columns[0].elements;
+    expect(elements[0]).toMatchObject({ tag: "markdown", content: "Before\n", element_id: "progress_text", text_size: "notation" });
+    expect(elements[1]).toMatchObject({ tag: "img", img_key: "img_progress" });
+    expect(elements[2]).toMatchObject({ tag: "markdown", content: "\nAfter", text_size: "notation" });
+    expect(elements.filter((element: Record<string, unknown>) => element.element_id === "progress_text")).toHaveLength(1);
+    expect(elements[3].elements).toEqual([expect.objectContaining({ tag: "img", img_key: "img_progress" })]);
+    expect(prepared.body.elements[1].value).toEqual(callback);
+    expect(JSON.stringify(card)).toBe(original);
+    if (operation !== "update") expect(body.uuid).toBe("image-uuid");
+    if (operation === "reply") expect(body.reply_in_thread).toBe(true);
+  });
+
+  test("uploads commentary screenshots in rendered thinking cards without losing Stop and Preview", async () => {
+    const imagePath = createImage("authorization-status.png");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, data: { image_key: "img_authorization" } }))
+      .mockResolvedValueOnce(response({ code: 0 }));
+    globalThis.fetch = fetchMock;
+    const state = createTurnViewState("session", "turn", Date.now());
+    state.status = "running";
+    state.activities = [{ kind: "assistant", id: "commentary:screenshot", text: `Before\n![Authorization](${markdownPath(imagePath)})\nAfter` }];
+    const card = new CardRenderer().renderTurn(state, "https://example.com/preview");
+    expect(JSON.stringify(card)).toContain(markdownPath(imagePath));
+    await new FeishuMessageClient(config(), logger()).updateInteractiveCard("om_progress", card);
+    const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
+    expect(body.content).toContain('"img_key":"img_authorization"');
+    expect(body.content).toContain("Before");
+    expect(body.content).toContain("After");
+    expect(body.content).toContain('"action":"turn_cancel"');
+    expect(body.content).toContain("https://example.com/preview");
+    expect(body.content).not.toContain(markdownPath(imagePath));
+  });
+
+  test("prepares scalar and legacy Markdown fields without changing their component shape", async () => {
+    const imagePath = createImage("legacy.png");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 0, tenant_access_token: "token", expire: 7200 }))
+      .mockResolvedValueOnce(response({ code: 0, data: { image_key: "img_legacy" } }))
+      .mockResolvedValueOnce(response({ code: 0, data: { message_id: "om_legacy" } }));
+    globalThis.fetch = fetchMock;
+    const content = `Before\n![Screenshot](${markdownPath(imagePath)})\nAfter`;
+    await new FeishuMessageClient(config(), logger()).sendInteractiveCard("chat_id:c1", { elements: [
+      { tag: "div", text: { tag: "lark_md", content } },
+      { tag: "note", elements: [{ tag: "lark_md", content, text_size: "notation" }] },
+      { tag: "div", text: { tag: "markdown", content } },
+    ] });
+    const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
+    expect(JSON.parse(body.content).elements).toEqual([
+      { tag: "div", text: { tag: "lark_md", content: "Before\n![Screenshot](img_legacy)\nAfter" } },
+      { tag: "note", elements: [{ tag: "lark_md", content: "Before\n![Screenshot](img_legacy)\nAfter", text_size: "notation" }] },
+      { tag: "div", text: { tag: "markdown", content: "Before\n![Screenshot](img_legacy)\nAfter" } },
+    ]);
+    expect(fetchMock.mock.calls.filter(call => String(call[0]).includes("/im/v1/images"))).toHaveLength(1);
+  });
+
+  test.each(["missing", "upload-failed"] as const)("degrades images in ordinary progress cards when %s", async (failure) => {
+    const imagePath = createImage("progress-unavailable.png");
+    if (failure === "missing") fs.unlinkSync(imagePath);
+    const fetchMock = vi.fn().mockResolvedValueOnce(response({ code: 0, tenant_access_token: "token", expire: 7200 }));
+    if (failure === "upload-failed") fetchMock.mockResolvedValueOnce(response({ code: 234001, msg: "bad image" }));
+    fetchMock.mockResolvedValueOnce(response({ code: 0 }));
+    globalThis.fetch = fetchMock;
+    await new FeishuMessageClient(config(), logger()).updateInteractiveCard("om_progress", {
+      body: { elements: [{ tag: "markdown", content: `Before\n![Screenshot](${markdownPath(imagePath)})\nAfter` }] },
+    });
+    const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
+    expect(body.content).toContain(failure === "missing" ? "图片不可用：Screenshot" : "图片上传失败：Screenshot");
+    expect(body.content).toContain("Before");
+    expect(body.content).toContain("After");
+    expect(body.content).not.toContain("![");
+  });
+
+  test("shares cached uploads across progress cards, replies and final answers", async () => {
+    const imagePath = createImage("shared.png");
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes("tenant_access_token")) return response({ code: 0, tenant_access_token: "token", expire: 7200 });
+      if (url.includes("/im/v1/images")) return response({ code: 0, data: { image_key: "img_shared" } });
+      return response({ code: 0, data: { message_id: "om_shared" } });
+    });
+    globalThis.fetch = fetchMock;
+    const client = new FeishuMessageClient(config(), logger());
+    const content = `![Shared](${markdownPath(imagePath)})`;
+    const card = { body: { elements: [{ tag: "markdown", content }] } };
+    await client.sendInteractiveCard("chat_id:c1", card);
+    await client.updateInteractiveCard("om_shared", card);
+    await client.replyMarkdown("chat_id:c2", { messageId: "anchor", replyInThread: true }, content);
+    await client.sendMarkdown("chat_id:c3", content);
+    expect(fetchMock.mock.calls.filter(call => String(call[0]).includes("/im/v1/images"))).toHaveLength(1);
+    for (const [, options] of fetchMock.mock.calls.filter(call => String(call[0]).includes("/im/v1/messages"))) {
+      const body = JSON.parse(String(options.body));
+      expect(body.content).toContain('"img_key":"img_shared"');
+      expect(body.content).not.toContain(markdownPath(imagePath));
+    }
+  });
+
   test.each(["send", "reply", "update"] as const)("uploads local Markdown images in status sections on %s without losing controls", async (operation) => {
     const imagePath = createImage("status-result.png");
     const markdown = `结果前文\n![结果截图](${markdownPath(imagePath)})\n结果后文`;
@@ -889,8 +1008,8 @@ describe("FeishuMessageClient", () => {
     const client = new FeishuMessageClient(config(), logger());
     const card = new CardRenderer().renderSectionsCard("Agent 状态", [
       { title: "指定任务", lines: ["只读状态"] },
-      { title: "最终结果", lines: [markdown], localImages: true },
-      { title: "执行详情", lines: [markdown], localImages: true, collapsible: true, elementId: "status_execution_details" },
+      { title: "最终结果", lines: [markdown] },
+      { title: "执行详情", lines: [markdown], collapsible: true, elementId: "status_execution_details" },
     ], [{ text: "Refresh", value: { action: "session_status_refresh", sessionId: "target" } }]);
     if (operation === "send") await client.sendInteractiveCard("chat_id:c1", card, "status-uuid");
     else if (operation === "reply") await client.replyInteractiveCard("chat_id:c1", { messageId: "anchor", replyInThread: true }, card, "status-uuid");
@@ -927,7 +1046,7 @@ describe("FeishuMessageClient", () => {
     fetchMock.mockResolvedValueOnce(response({ code: 0, msg: "ok", data: { message_id: "om_status" } }));
     globalThis.fetch = fetchMock;
     const card = new CardRenderer().renderSectionsCard("Agent 状态", [{
-      title: "最终结果", lines: [`结论\n![截图](${markdownPath(imagePath)})\n后续说明`], localImages: true,
+      title: "最终结果", lines: [`结论\n![截图](${markdownPath(imagePath)})\n后续说明`],
     }]);
     await expect(new FeishuMessageClient(config(), testLogger).sendInteractiveCard("chat_id:c1", card)).resolves.toBe("om_status");
     const sent = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body)) as { content: string };
@@ -940,7 +1059,7 @@ describe("FeishuMessageClient", () => {
     if (failure === "upload-failed") expect(testLogger.warn).toHaveBeenCalledTimes(1);
   });
 
-  test("preserves Markdown formatting and unique element IDs while expanding only marked sections", async () => {
+  test("preserves Markdown formatting, unique element IDs and native image keys", async () => {
     const imagePath = createImage("status-format.png");
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({ code: 0, msg: "ok", tenant_access_token: "token", expire: 7200 }))
@@ -949,8 +1068,8 @@ describe("FeishuMessageClient", () => {
     globalThis.fetch = fetchMock;
     const unchanged = { tag: "markdown", content: "原生图片：![图](img_existing_key)" };
     const card = { schema: "2.0", body: { elements: [
-      { ...localCardMarkdown(`前文\n![图](${markdownPath(imagePath)})\n后文`), element_id: "status_result", text_size: "notation" },
-      { ...localCardMarkdown(" "), element_id: "empty_result" },
+      { tag: "markdown", content: `前文\n![图](${markdownPath(imagePath)})\n后文`, element_id: "status_result", text_size: "notation" },
+      { tag: "markdown", content: " ", element_id: "empty_result" },
       unchanged,
       { tag: "button", text: { tag: "plain_text", content: "Refresh" }, value: { action: "refresh", groups: [["a", "b"]] } },
     ] } };

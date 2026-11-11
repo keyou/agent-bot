@@ -112,6 +112,41 @@ describe("renderMarkdownWithLocalImages", () => {
       { tag: "markdown", content: " 后文" },
     ]);
   });
+
+  test.each(["backtick-fence", "tilde-fence", "inline", "double-inline", "indented", "escaped"])("preserves %s image examples without uploading files", async (kind) => {
+    const image = createImage("example.png");
+    const link = `![Example](${markdownPath(image)})`;
+    const examples: Record<string, string> = {
+      "backtick-fence": `\`\`\`markdown\n${link}\n\`\`\``,
+      "tilde-fence": `~~~markdown\n${link}\n~~~`,
+      inline: `Example: \`${link}\``,
+      "double-inline": `Example: \`\`a \` ${link}\`\``,
+      indented: `    ${link}`,
+      escaped: `\\${link}`,
+    };
+    const markdown = examples[kind]!;
+    const upload = vi.fn(async () => "img_example");
+    expect(await renderMarkdownWithLocalImages(markdown, upload, vi.fn())).toEqual([{ tag: "markdown", content: markdown }]);
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  test("keeps existing Feishu image keys while degrading unsupported image targets", async () => {
+    const upload = vi.fn(async () => "unused");
+    const native = "Native: ![Image](img_v3_existing-key)";
+    const elements = await renderMarkdownWithLocalImages(`${native}\n![Web](https://example.com/a.png)\n![Gone](/missing.png)`, upload, vi.fn());
+    expect(JSON.stringify(elements)).toContain(native);
+    expect(JSON.stringify(elements)).toContain("[Web](https://example.com/a.png)");
+    expect(JSON.stringify(elements)).toContain("图片不可用：Gone");
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  test("supports parenthesized filenames and angle-wrapped targets with titles", async () => {
+    const image = createImage("screenshot (verified).png");
+    const upload = vi.fn(async () => "img_verified");
+    const elements = await renderMarkdownWithLocalImages(`![Proof](<${markdownPath(image)}> "Screenshot")`, upload, vi.fn());
+    expect(elements).toEqual([expect.objectContaining({ tag: "img", img_key: "img_verified" })]);
+    expect(upload).toHaveBeenCalledWith(path.resolve(image));
+  });
 });
 
 function createImage(name: string): string {
