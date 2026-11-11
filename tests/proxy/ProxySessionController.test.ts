@@ -4794,6 +4794,41 @@ describe("ProxySessionController", () => {
       expect(outbound.downloadImage).toHaveBeenCalledWith("m19", "img19");
     });
 
+    test.each(["receipts", "submitted", "queued-receipts"] as const)("does not report local %s read errors as Feishu permission failures", async (failure) => {
+      const { controller, runtime, outbound, store } = fixture();
+      await controller.onMessage(mention("seed", "/new"));
+      store.setChatRequiresMention("chat_id:muted", true);
+      const method = failure === "submitted" ? "recentSubmittedMessageIds" : "recentContextMessageIds";
+      const read = store[method].bind(store);
+      const spy = vi.spyOn(store, method);
+      if (failure === "queued-receipts") spy.mockImplementationOnce(read);
+      spy.mockImplementationOnce(() => { throw new Error("no such column: r.prompt_message_id"); });
+      await controller.onMessage(mention());
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+      if (failure !== "queued-receipts") expect(outbound.readRecentMessages).not.toHaveBeenCalled();
+      const error = vi.mocked(outbound.sendText).mock.calls.at(-1)?.[1];
+      expect(error).toContain("no such column: r.prompt_message_id");
+      expect(error).not.toContain("飞书历史消息/群消息读取权限");
+    });
+
+    test("keeps an already submitted turn running when recording its context receipts fails", async () => {
+      const { controller, runtime, outbound, store, logger } = fixture();
+      store.recordChatContext("chat_id:muted", "group");
+      store.setChatRequiresMention("chat_id:muted", true);
+      vi.mocked(outbound.addReaction!).mockResolvedValueOnce("reaction_pending");
+      const error = new Error("database is full");
+      vi.spyOn(store, "rememberRecentContextMessages").mockImplementationOnce(() => { throw error; });
+      await controller.onMessage(mention());
+      expect(runtime.startTurn).toHaveBeenCalledOnce();
+      expect(outbound.sendText).not.toHaveBeenCalledWith("chat_id:muted", expect.stringContaining("database is full"));
+      const sessionId = store.getUserContext("chat_id:muted")!.currentSessionId!;
+      expect(store.getSession(sessionId)?.status).toBe("running");
+      expect(store.getMessageReaction("mention")?.status).toBe("pending");
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ error, messageId: "mention" }),
+        "Failed to save recent context receipts after accepting the prompt.");
+      expect(runtime.cancelTurn).not.toHaveBeenCalled();
+    });
+
     test.each(["list", "image"])("reports %s failure without submitting or deduplicating the missing context", async (failure) => {
       const { controller, runtime, outbound, store } = fixture();
       store.recordChatContext("chat_id:muted", "group");
@@ -4804,6 +4839,7 @@ describe("ProxySessionController", () => {
       await controller.onMessage(mention());
       expect(runtime.startTurn).not.toHaveBeenCalled();
       expect(outbound.sendText).toHaveBeenCalledWith("chat_id:muted", expect.stringContaining("无法补充近期群聊上下文"));
+      expect(outbound.sendText).toHaveBeenCalledWith("chat_id:muted", expect.stringContaining("飞书历史消息/群消息读取权限"));
       await controller.onMessage(mention("retry"));
       expect(runtime.startTurn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ localImagePaths: [path.join(process.cwd(), "img_recent.png")] }));
     });

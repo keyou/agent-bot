@@ -114,6 +114,39 @@ describe("StateStore runtime metadata", () => {
   });
 
 
+  test.each([false, true])("upgrades legacy recent-context receipts with existing rows=%s and survives reopen", (populated) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-legacy-context-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "state.sqlite");
+    const legacy = new Database(file);
+    legacy.exec(`CREATE TABLE recent_context_receipts (
+      local_session_id TEXT NOT NULL, remote_session_id TEXT NOT NULL,
+      context_key TEXT NOT NULL, message_id TEXT NOT NULL,
+      PRIMARY KEY (local_session_id, remote_session_id, context_key, message_id)
+    )`);
+    if (populated) legacy.prepare("INSERT INTO recent_context_receipts VALUES (?, ?, ?, ?)")
+      .run("task", "remote", "topic", "old-context");
+    legacy.close();
+    const store = new StateStore(file);
+    stores.push(store);
+    store.bindMessageToTurn("old-context", "task", "old-turn");
+    expect([...store.recentContextMessageIds("task", "remote", "topic")]).toEqual([]);
+    store.bindMessageToTurn("prompt", "task", "turn");
+    store.rememberRecentContextMessages("task", "remote", "topic", "prompt", ["new-context"]);
+    expect([...store.recentContextMessageIds("task", "remote", "topic", false)]).toEqual(["new-context"]);
+    const reopened = new StateStore(file);
+    stores.push(reopened);
+    expect([...reopened.recentContextMessageIds("task", "remote", "topic")]).toEqual(["new-context"]);
+    const inspection = new Database(file, { readonly: true });
+    try {
+      expect(inspection.prepare("SELECT message_id FROM recent_context_receipts ORDER BY message_id").all())
+        .toEqual(populated ? [{ message_id: "new-context" }, { message_id: "old-context" }] : [{ message_id: "new-context" }]);
+    } finally { inspection.close(); }
+    reopened.rememberRecentContextMessages("task", "remote", "topic", "prompt", ["old-context"]);
+    expect([...reopened.recentContextMessageIds("task", "remote", "topic")].sort()).toEqual(["new-context", "old-context"]);
+    expect(reopened.recentContextMessageIds("task", "remote", "another-topic").size).toBe(0);
+  });
+
   test("persists bounded recent-context receipts scoped to task, remote branch and conversation", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-context-"));
     tempDirectories.push(directory);

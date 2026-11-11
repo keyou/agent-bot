@@ -312,6 +312,7 @@ export class StateStore {
     this.ensureChatContextColumns();
     this.ensureTurnAttemptColumns();
     this.ensureQueuedPromptColumns();
+    this.ensureRecentContextReceiptColumns();
     this.schedules = new ScheduledTaskStore(this.db);
     this.provenance = new ExecutionProvenanceStore(this.db);
     this.initializeContextSessionMappings();
@@ -2443,6 +2444,16 @@ export class StateStore {
     );
     if (!existing.has("display_prompt")) {
       this.db.exec("ALTER TABLE queued_prompts ADD COLUMN display_prompt TEXT");
+    }
+  }
+
+  private ensureRecentContextReceiptColumns(): void {
+    const existing = new Set(
+      (this.db.pragma("table_info(recent_context_receipts)") as Array<{ name: string }>).map((column) => column.name),
+    );
+    if (!existing.has("prompt_message_id")) {
+      // Old receipts have no provable source Prompt, so they cannot be stop boundaries.
+      this.db.exec("ALTER TABLE recent_context_receipts ADD COLUMN prompt_message_id TEXT NOT NULL DEFAULT ''");
     }
   }
 }

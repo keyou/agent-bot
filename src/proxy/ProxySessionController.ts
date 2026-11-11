@@ -1004,8 +1004,15 @@ export class ProxySessionController {
           if (command.type === "prompt" && message.chatType === "group" && message.mentionedBot
             && this.store.chatRequiresMention(baseChatContextKey(message.contextKey))) {
             const current = this.currentSession(message.contextKey);
-            if (current) this.store.rememberRecentContextMessages(current.localSessionId, current.remoteSessionId ?? "", message.contextKey, message.messageId,
-              [...recentContextIds, message.messageId, ...[referencedMessageId, injectedRootMessageId].filter((id): id is string => Boolean(id))]);
+            if (current) {
+              try {
+                this.store.rememberRecentContextMessages(current.localSessionId, current.remoteSessionId ?? "", message.contextKey, message.messageId,
+                  [...recentContextIds, message.messageId, ...[referencedMessageId, injectedRootMessageId].filter((id): id is string => Boolean(id))]);
+              } catch (error) {
+                this.logger.warn({ error, localSessionId: current.localSessionId, messageId: message.messageId },
+                  "Failed to save recent context receipts after accepting the prompt.");
+              }
+            }
           }
           if (injectedRootMessageId) {
             const current = this.currentSession(message.contextKey);
@@ -3448,12 +3455,13 @@ export class ProxySessionController {
       return { text, localImagePaths, messageIds: [] };
     }
     if (message.threadContext && !message.threadId) throw new Error("无法识别当前话题，已停止补充上下文以避免读取其他话题。");
+    const current = this.currentSession(message.contextKey);
+    const stopIds = current ? new Set([
+      ...this.store.recentContextMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey, false),
+      ...this.store.recentSubmittedMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey),
+    ]) : new Set<string>();
+    const seen = current ? this.store.recentContextMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey) : new Set<string>();
     try {
-      const current = this.currentSession(message.contextKey);
-      const stopIds = current ? new Set([
-        ...this.store.recentContextMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey, false),
-        ...this.store.recentSubmittedMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey),
-      ]) : new Set<string>();
       const messages = await this.outbound.readRecentMessages(message.contextKey, {
         chatId: message.chatId,
         ...(message.threadId ? { threadId: message.threadId } : {}),
@@ -3461,7 +3469,6 @@ export class ProxySessionController {
         beforeTimestamp: message.createdAt,
         ...(stopIds.size ? { stopBeforeMessageIds: [...stopIds] } : {}),
       });
-      const seen = current ? this.store.recentContextMessageIds(current.localSessionId, current.remoteSessionId ?? "", message.contextKey) : new Set<string>();
       seen.add(message.messageId);
       if (message.parentMessageId) seen.add(message.parentMessageId);
       if (message.threadContext && message.rootMessageId) seen.add(message.rootMessageId);
