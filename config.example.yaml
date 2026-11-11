@@ -12,8 +12,6 @@ feishu:
     project: "[{agent}] [{project}] {taskname}"
     projectless: "[{agent}] {taskname}"
     dateFormat: "MM-dd"
-  # Use "timeline" to temporarily restore the original thinking-card layout.
-  thinkingCardLayout: "grouped"
 
 console:
   enabled: true

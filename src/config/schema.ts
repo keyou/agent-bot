@@ -83,7 +83,6 @@ export const appConfigSchema = z.object({
     respondToOwnerOnly: z.boolean().default(true),
     respondToAllGroupMessages: z.boolean().default(true),
     groupNameFormat: groupNameFormatSchema,
-    thinkingCardLayout: z.enum(["grouped", "timeline"]).default("grouped"),
     useConsoleWhenMissingCredentials: z.boolean().default(false),
   }),
   agents: z.record(z.string().min(1), agentConfigSchema).refine(

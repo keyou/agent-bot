@@ -991,15 +991,15 @@ describe("FeishuTurnPresenter", () => {
   });
 
   test("freezes in-place history pages and resumes live updates on the latest page", async () => {
-    const { presenter, outbound } = createFixture(false, new CardRenderer({ thinkingCardLayout: "timeline" }));
+    const { presenter, outbound } = createFixture();
     await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
     for (let index = 1; index <= 45; index += 1) {
       await presenter.onEvent({
         type: "progress",
         sessionId: "s1",
         turnId: "turn_1",
-        activityId: `reasoning:${index}`,
-        text: `Activity ${index}`,
+        activityId: `commentary:${index}`,
+        text: `Activity ${index} ${"x".repeat(800)}`,
       });
     }
     await presenter.flushAll();
@@ -1009,7 +1009,8 @@ describe("FeishuTurnPresenter", () => {
 
     expect(outbound.updateInteractiveCard).toHaveBeenCalledOnce();
     let rendered = JSON.stringify((outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]);
-    expect(rendered).toContain("思考活动历史 · 1/2");
+    expect(rendered).toContain("思考活动历史 · 1/");
+    expect(rendered).toContain("最新页");
     expect(rendered).toContain("Activity 1");
     expect(rendered).not.toContain("Activity 45");
     (outbound.updateInteractiveCard as ReturnType<typeof vi.fn>).mockClear();

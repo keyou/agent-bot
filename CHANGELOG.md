@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Remove the retired chronological thinking-card renderer, layout configuration and fixed-count pagination. Progress, execution-details and history cards now share grouped rendering; saved history and web Preview are unchanged.
+
 - Keep Provider/model/thinking/permission changes scoped to the selected task without changing Agent defaults or conversation history.
 - Persist submission boundaries: reattach known turns, retry only proven unsubmitted requests, and show uncertain execution as unverified without replaying old instructions.
 - Persist Stop across preparation, retries, continuations and restarts; retain independent queued messages and verify termination instead of assuming an interrupt succeeded.

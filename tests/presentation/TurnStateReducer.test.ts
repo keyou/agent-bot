@@ -722,7 +722,7 @@ describe("TurnStateReducer", () => {
     ]);
   });
 
-  test("retains activity history beyond the 40-item display page", () => {
+  test("retains activity history independently of card display pagination", () => {
     let state = createTurnViewState("s1", "turn_1", 1_000);
     for (let index = 1; index <= 41; index += 1) {
       state = reduceTurnEvent(

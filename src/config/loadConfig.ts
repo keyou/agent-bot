@@ -21,7 +21,6 @@ const DEFAULT_CONFIG = `feishu:
     project: "[{agent}] [{project}] {taskname}"
     projectless: "[{agent}] {taskname}"
     dateFormat: "MM-dd"
-  thinkingCardLayout: "grouped"
 
 console:
   enabled: true

@@ -141,7 +141,7 @@ function state(): TurnViewState {
 }
 
 describe("CardRenderer", () => {
-  test.each(["grouped", "timeline"] as const)("shows the terminal error once without losing distinct warnings in %s cards", (thinkingCardLayout) => {
+  test("shows the terminal error once without losing distinct warnings", () => {
     const input = state();
     const message = JSON.stringify({ type: "error", status: 400, error: {
       message: "Persisted response cannot be replayed.", code: "unsupported_persisted_item_context", param: "previous_response_id",
@@ -151,7 +151,7 @@ describe("CardRenderer", () => {
     input.activities = [warning];
     input.status = "failed";
     input.error = message + "\n\n模型续接状态失效，正在恢复连接并继续（1/1）。";
-    const renderer = new CardRenderer({ thinkingCardLayout });
+    const renderer = new CardRenderer();
     const original = JSON.stringify(input);
     for (const card of [renderer.renderTurn(input), renderer.renderTurnDetails(input)]) {
       const serialized = JSON.stringify(card);
@@ -169,11 +169,11 @@ describe("CardRenderer", () => {
     expect(JSON.stringify(renderer.renderTurn(input))).toContain("unsupported_persisted_item_context");
   });
 
-  test.each(["grouped", "timeline"] as const)("renders runtime error reasons as literal text in %s cards", (thinkingCardLayout) => {
+  test("renders runtime error reasons as literal text", () => {
     const input = state();
     const text = '运行请求出错，Agent 正在重试：Reconnecting... 2/5\n\nrate_limit_reached (code=3003). Please try again in 60 seconds.\n<img src=x onerror="alert(1)"> ![remote](https://example.test/error.png)';
     input.activities = [{ kind: "assistant", id: "commentary:runtime-error:turn_1", text }];
-    const renderer = new CardRenderer({ thinkingCardLayout });
+    const renderer = new CardRenderer();
     for (const card of [renderer.renderTurn(input), renderer.renderTurnDetails(input)]) {
       const error = collectObjects(card).find((item) => item.tag === "markdown" && String(item.content).includes("rate_limit_reached"));
       expect(error?.content).toBe(`\`\`\`\n${text}\n\`\`\``);
@@ -1060,85 +1060,31 @@ describe("CardRenderer", () => {
     expect(JSON.stringify(rows[1])).toContain('"sessionId":"local_2"');
   });
 
-  test("keeps the original timeline layout available with unchanged chronological rendering", () => {
-    const card = new CardRenderer({ thinkingCardLayout: "timeline" }).renderTurn(state());
-    const objects = collectObjects(card);
-    const panels = objects.filter((item) => item.tag === "collapsible_panel");
-    const toolPanels = panels.filter((panel) => !panelTitle(panel).startsWith("文件变更") && !panelTitle(panel).startsWith("计划"));
-    const serialized = JSON.stringify(card);
-    const markdownContents = objects
-      .filter((item) => item.tag === "markdown")
-      .map((item) => String(item.content ?? ""))
-      .join("\n");
-    const topLevel = ((card as { body: { elements: unknown[] } }).body.elements).map((element) => JSON.stringify(element));
-    const activityOrder = ["先检查测试配置", "npm test", "再检查代码风格", "npm run lint"].map((text) =>
-      topLevel.findIndex((element) => element.includes(text)),
-    );
-
-    expect(toolPanels).toHaveLength(2);
-    expect(toolPanels.every((panel) => panel.expanded === false)).toBe(true);
-    expect(toolPanels.every((panel) => JSON.stringify(panel.border) === JSON.stringify({ color: "grey", corner_radius: "5px" }))).toBe(true);
-    expect(panels.every((panel) => (panel.header as { padding?: string }).padding === "4px 8px 4px 8px")).toBe(true);
-    expect(panels.find((panel) => panelTitle(panel).startsWith("文件变更"))).toMatchObject({
-      tag: "collapsible_panel",
-      element_id: "turn_files",
-      expanded: false,
+  test("uses the same execution grouping in progress, details and history cards", () => {
+    const input = state();
+    const original = structuredClone(input);
+    const renderer = new CardRenderer();
+    const cards = [renderer.renderTurn(input), renderer.renderTurnDetails(input), renderer.renderActivityHistory(input, 0)];
+    const ids = cards.map((card) => {
+      const objects = collectObjects(card);
+      const execution = objects.filter((item) => String(item.element_id).startsWith("turn_exec_"));
+      expect(execution).toHaveLength(1);
+      expect(panelTitle(execution[0]!)).toContain("再检查代码风格 · 2 个工具");
+      expect(execution[0]).toMatchObject({ expanded: false, border: { color: "grey" } });
+      const tools = collectObjects(execution[0]).filter((item) => String(item.element_id).startsWith("turn_tool_"));
+      expect(tools).toHaveLength(2);
+      expect(tools.every((item) => item.expanded === false)).toBe(true);
+      const serialized = JSON.stringify(card);
+      expect(serialized).toContain("$ npm test");
+      expect(serialized).toContain("all passed");
+      expect(serialized).toContain("$ npm run lint");
+      expect(serialized).toContain("命令失败");
+      expect(serialized).not.toContain("先检查测试配置");
+      return execution.map((item) => item.element_id);
     });
-    expect(panels).toContainEqual(expect.objectContaining({
-      tag: "collapsible_panel",
-      expanded: true,
-      direction: "vertical",
-      vertical_spacing: "4px",
-      padding: "8px",
-      border: { color: "blue", corner_radius: "5px" },
-    }));
-    const completedPanel = toolPanels.find((panel) => panelTitle(panel).includes("npm test"));
-    const detailElements = (completedPanel?.elements ?? []) as Array<{ content?: string }>;
-    expect(detailElements).toHaveLength(1);
-    expect(detailElements[0]?.content).toBe("```\n$ npm test\nall passed\n```");
-    expect(activityOrder).toEqual([...activityOrder].sort((left, right) => left - right));
-    expect(new Set(activityOrder).size).toBe(4);
-    expect(card).toMatchObject({
-      schema: "2.0",
-      config: { width_mode: "fill" },
-      header: {
-        subtitle: { tag: "plain_text", content: "耗时 52s · 2 个工具 · 1 个文件" },
-        padding: "12px 12px 12px 12px",
-      },
-      body: {
-        direction: "vertical",
-        vertical_spacing: "8px",
-        padding: "12px 12px 12px 12px",
-        elements: expect.any(Array),
-      },
-    });
-    expect(markdownContents).toContain("先检查测试配置");
-    expect(markdownContents).toContain("> 💭 先检查测试配置");
-    expect(markdownContents).toContain("```\n$ npm test\nall passed\n```");
-    expect(markdownContents).toContain("```\n$ npm run lint\n命令失败\n```");
-    for (const label of [
-      "**状态**",
-      "**耗时**",
-      "**💭 思考**",
-      "**工具**",
-      "**命令**",
-      "**退出码**",
-      "**结果摘要**",
-      "**错误摘要**",
-    ]) {
-      expect(markdownContents).not.toContain(label);
-    }
-    expect(markdownContents).not.toContain("\u001b");
-    expect(markdownContents).not.toContain("完整内容请查看本地日志");
-    expect(serialized).not.toContain("turn_details");
-    expect(serialized).not.toContain("查看详情");
-    expect(serialized).toContain("<font color='red'>Stop</font>");
-    expect(serialized).toContain("<font color='grey'>· 52s</font>");
-    expect(serialized).toContain('"action":"turn_cancel","sessionId":"s1","turnId":"turn_1"');
-    expect(serialized).not.toContain('"action":"turn_reset"');
-    expect(serialized).not.toContain("已完成的工具（");
-    expect(serialized).not.toContain("失败的工具（");
-    expect(serialized).not.toContain("/cancel");
+    expect(ids[1]).toEqual(ids[0]);
+    expect(ids[2]).toEqual(ids[0]);
+    expect(input).toEqual(original);
   });
 
   test("uses grouped thinking cards by default and keeps only the latest native reasoning per execution group", () => {
@@ -2244,7 +2190,7 @@ describe("CardRenderer", () => {
     expect(content).not.toContain("`");
   });
 
-  test.each(["grouped", "timeline"] as const)("preserves literal file paths in %s summaries and details", (thinkingCardLayout) => {
+  test("preserves literal file paths in summaries and details", () => {
     const running = state();
     running.projectCwd = "D:\\dev\\agent-bot";
     const paths = [
@@ -2256,7 +2202,7 @@ describe("CardRenderer", () => {
       "notes\\`sample`.md",
     ];
     running.fileSummary = paths.map((filePath) => ({ path: filePath, additions: 6, deletions: 2 }));
-    const renderer = new CardRenderer({ thinkingCardLayout });
+    const renderer = new CardRenderer();
     for (const card of [renderer.renderTurn(running), renderer.renderTurnDetails(running)]) {
       const panel = collectObjects(card).find((item) => panelTitle(item).startsWith("文件变更"));
       const content = String((panel?.elements as Array<{ content?: string }> | undefined)?.[0]?.content ?? "");
@@ -2419,7 +2365,7 @@ describe("CardRenderer", () => {
     });
   });
 
-  test.each(["grouped", "timeline"] as const)("renders mode confirmation labels and callbacks in %s cards", (thinkingCardLayout) => {
+  test("renders mode confirmation labels and callbacks", () => {
     const waiting = state();
     waiting.status = "waiting_for_approval";
     waiting.activities.push({ kind: "assistant", id: "commentary:plan:p1", text: "## Implementation plan\nRun tests before building." });
@@ -2429,7 +2375,7 @@ describe("CardRenderer", () => {
         { id: "accept", label: "Approve Plan" }, { id: "decline", label: "Reject" }, { id: "cancel", label: "Cancel Request" },
       ],
     };
-    const renderer = new CardRenderer({ thinkingCardLayout });
+    const renderer = new CardRenderer();
     expect(renderer.renderTurn(waiting)).toMatchObject({
       header: { title: { content: expect.stringContaining("等待确认") } },
     });
@@ -2453,7 +2399,7 @@ describe("CardRenderer", () => {
     }
   });
 
-  test.each(["grouped", "timeline"] as const)("renders approval controls with Card 2.0 callback behaviors in %s cards", (thinkingCardLayout) => {
+  test("renders approval controls with Card 2.0 callback behaviors", () => {
     const waiting = state();
     waiting.status = "waiting_for_approval";
     waiting.approval = {
@@ -2466,7 +2412,7 @@ describe("CardRenderer", () => {
       ],
     };
 
-    const card = new CardRenderer({ thinkingCardLayout }).renderTurn(waiting);
+    const card = new CardRenderer().renderTurn(waiting);
     const objects = collectObjects(card);
 
     expect(card).toMatchObject({
@@ -2505,7 +2451,7 @@ describe("CardRenderer", () => {
     }));
   });
 
-  test.each(["grouped", "timeline"] as const)("keeps command approvals compact without changing decisions in %s cards", (thinkingCardLayout) => {
+  test("keeps command approvals compact without changing decisions", () => {
     const command = '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "Get-Content -LiteralPath aha/components/bua/AGENTS.md | Select-Object -First 115; ' + 'Get-ChildItem -LiteralPath aha/components/bua/skills -Recurse; '.repeat(12) + 'Write-Output END"';
     const waiting = state();
     waiting.status = "waiting_for_approval";
@@ -2518,7 +2464,7 @@ describe("CardRenderer", () => {
       ],
     };
     const original = structuredClone(waiting.approval);
-    const renderer = new CardRenderer({ thinkingCardLayout });
+    const renderer = new CardRenderer();
     let elementId: unknown;
     for (const card of [renderer.renderTurn(waiting), renderer.renderTurnDetails(waiting)]) {
       const objects = collectObjects(card);
@@ -2578,14 +2524,14 @@ describe("CardRenderer", () => {
     expect(texts).toContain("\x60\x60\x60\n" + command + "\n\x60\x60\x60");
   });
 
-  test.each(["grouped", "timeline"] as const)("bounds verbose approvals and warns before showing truncated commands in %s cards", (thinkingCardLayout) => {
+  test("bounds verbose approvals and warns before showing truncated commands", () => {
     const waiting = state();
     waiting.status = "waiting_for_approval";
     waiting.plan = [];
     waiting.fileSummary = [];
     waiting.activities = Array.from({ length: 100 }, (_, index) => ({
       kind: "tool" as const, id: "tool:" + index,
-      tool: { ...waiting.completedTools[0]!, id: "tool:" + index, output: thinkingCardLayout === "grouped" ? "输出结果👋".repeat(300) : "ok" },
+      tool: { ...waiting.completedTools[0]!, id: "tool:" + index, output: "输出结果👋".repeat(300) },
     }));
     waiting.approval = {
       id: "a", title: "long command", command: 'Write-Output "' + '中文👋\\"\n'.repeat(2_000) + 'COMMAND_END"',
@@ -2594,7 +2540,7 @@ describe("CardRenderer", () => {
         { id: "decline", label: "Deny" }, { id: "cancel", label: "Cancel" },
       ],
     };
-    const renderer = new CardRenderer({ thinkingCardLayout });
+    const renderer = new CardRenderer();
     const card = renderer.renderTurn(waiting);
     const serialized = JSON.stringify(card);
     expect(serialized).toContain("请在 Preview 中查看完整命令后再授权");
@@ -2726,7 +2672,7 @@ describe("CardRenderer", () => {
     expect(String(reasoning?.content)).not.toContain("__");
   });
 
-  test("merges consecutive reasoning entries while preserving activity boundaries", () => {
+  test("keeps the latest reasoning per commentary-delimited execution group", () => {
     const running = state();
     running.plan = [];
     running.fileSummary = [];
@@ -2741,27 +2687,27 @@ describe("CardRenderer", () => {
       { kind: "reasoning", id: "reasoning:5", text: "第五段思考" },
     ];
 
-    const renderer = new CardRenderer({ thinkingCardLayout: "timeline" });
+    const renderer = new CardRenderer();
     const card = renderer.renderTurn(running);
     const reasoning = collectObjects(card)
       .filter((item) => item.tag === "markdown" && String(item.content).startsWith("> 💭"))
       .map((item) => String(item.content));
 
     expect(reasoning).toEqual([
-      "> 💭 第一段思考\n> 💭 第二段思考",
-      "> 💭 第三段思考\n> 💭 第四段思考",
       "> 💭 第五段思考",
     ]);
     const serialized = JSON.stringify(card);
-    expect(serialized.indexOf("第二段思考")).toBeLessThan(serialized.indexOf("Boundary tool"));
-    expect(serialized.indexOf("Boundary tool")).toBeLessThan(serialized.indexOf("第三段思考"));
+    for (const text of ["第一段思考", "第二段思考", "第三段思考"]) expect(serialized).not.toContain(text);
+    expect(serialized.indexOf("第四段思考")).toBeLessThan(serialized.indexOf("Boundary tool"));
+    expect(serialized.indexOf("Boundary tool")).toBeLessThan(serialized.indexOf("Assistant text"));
     expect(serialized.indexOf("第四段思考")).toBeLessThan(serialized.indexOf("Assistant text"));
     expect(serialized.indexOf("Assistant text")).toBeLessThan(serialized.indexOf("第五段思考"));
 
     const history = renderer.renderActivityHistory(running, 0);
     const historyReasoning = collectObjects(history)
       .filter((item) => item.tag === "markdown" && String(item.content).startsWith("> 💭"));
-    expect(historyReasoning).toHaveLength(3);
+    expect(historyReasoning).toHaveLength(1);
+    expect(JSON.stringify(history)).toContain("第四段思考 · 1 个工具");
   });
 
   test("renders steer messages inline and preserves their activity order", () => {
@@ -2774,7 +2720,7 @@ describe("CardRenderer", () => {
       { kind: "reasoning", id: "reasoning:2", text: "继续处理" },
     ];
 
-    const renderer = new CardRenderer({ thinkingCardLayout: "timeline" });
+    const renderer = new CardRenderer();
     const card = renderer.renderTurn(running);
     const serialized = JSON.stringify(card);
     expect(collectObjects(card)).toContainEqual({
@@ -2782,7 +2728,7 @@ describe("CardRenderer", () => {
       content: "**🙋 同时补充测试**\n**并检查结果**",
     });
     expect(serialized).not.toContain("用户追加");
-    expect(serialized.indexOf("先检查代码")).toBeLessThan(serialized.indexOf("同时补充测试"));
+    expect(serialized).not.toContain("先检查代码");
     expect(serialized.indexOf("同时补充测试")).toBeLessThan(serialized.indexOf("继续处理"));
 
     const history = renderer.renderActivityHistory(running, 0);
@@ -2808,87 +2754,49 @@ describe("CardRenderer", () => {
     ]);
   });
 
-  test("keeps the latest 40 mixed activities in the timeline compatibility layout", () => {
+  test("does not split short commentaries at the retired fixed activity count", () => {
     const running = state();
     running.plan = [];
     running.fileSummary = [];
-    running.activities = Array.from({ length: 45 }, (_value, index) => {
-      const position = index + 1;
-      if (position % 3 === 1) {
-        return { kind: "assistant" as const, id: `commentary:${position}`, text: `Assistant ${position}` };
-      }
-      if (position % 3 === 2) {
-        return {
-          kind: "tool" as const,
-          id: `tool:${position}`,
-          tool: { ...running.completedTools[0]!, id: `tool:${position}`, title: `Tool ${position}` },
-        };
-      }
-      return { kind: "reasoning" as const, id: `reasoning:${position}`, text: `Reasoning ${position}` };
-    });
-
-    const card = new CardRenderer({ thinkingCardLayout: "timeline" }).renderTurn(running);
-    const serialized = JSON.stringify(card);
-
-    expect(serialized).not.toContain("Tool 5");
-    expect(serialized).toContain("Reasoning 6");
-    expect(serialized).toContain("Assistant 7");
-    expect(serialized).toContain("Tool 44");
-    expect(serialized).toContain("Reasoning 45");
-    expect(serialized).toContain("查看历史思考（共 2 页）");
-    expect(serialized).toContain('"action":"activity_history"');
-    const elements = (card as { body: { elements: Array<Record<string, unknown>> } }).body.elements;
-    const historyLinkIndex = elements.findIndex((element) => element.tag === "column_set");
-    const firstActivityIndex = elements.findIndex((element) => element.tag === "markdown");
-    expect(historyLinkIndex).toBeGreaterThanOrEqual(0);
-    expect(historyLinkIndex).toBeLessThan(firstActivityIndex);
+    running.activities = Array.from({ length: 45 }, (_value, index) => ({
+      kind: "assistant" as const, id: `commentary:${index}`, text: `[Activity-${index}]`,
+    }));
+    const renderer = new CardRenderer();
+    for (const card of [renderer.renderTurn(running), renderer.renderTurnDetails(running)]) {
+      const serialized = JSON.stringify(card);
+      for (let index = 0; index < 45; index++) expect(serialized).toContain(`[Activity-${index}]`);
+      expect(serialized).not.toContain("查看历史思考");
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(30 * 1024);
+    }
   });
 
-  test("paginates timeline activities from oldest to newest in 40-item pages", () => {
+  test("navigates grouped history pages and clamps out-of-range page requests", () => {
     const running = state();
     running.activities = Array.from({ length: 81 }, (_value, index) => ({
-      kind: "assistant" as const,
-      id: `commentary:${index + 1}`,
-      text: index === 0 ? `FIRST-${"a".repeat(5_000)}` : index === 80 ? "LAST-81" : `Activity ${index + 1}`,
+      kind: "assistant" as const, id: `commentary:${index}`,
+      text: `[Activity-${index}] ${"x".repeat(800)}`,
     }));
-    const renderer = new CardRenderer({ thinkingCardLayout: "timeline" });
-    const firstPage = JSON.stringify(renderer.renderActivityHistory(running, 0));
-    const middlePage = JSON.stringify(renderer.renderActivityHistory(running, 1));
-    const lastPage = JSON.stringify(renderer.renderActivityHistory(running, 2));
-
-    expect(firstPage).toContain("思考活动历史 · 1/3");
-    expect(firstPage).toContain("FIRST-");
-    expect(firstPage).not.toContain("Activity 2");
-    expect(firstPage).toContain("下一页");
-    expect(firstPage).toContain("最新页");
-    expect(middlePage).toContain("Activity 2");
-    expect(middlePage).toContain("Activity 41");
-    expect(middlePage).not.toContain("Activity 42");
-    expect(middlePage).not.toContain("下一页");
-    expect(middlePage).toContain('"page":"latest"');
-    expect(lastPage).toContain("思考活动历史 · 3/3");
-    expect(lastPage).toContain("Activity 42");
-    expect(lastPage).toContain("LAST-81");
-    expect(lastPage).toContain("上一页");
-    expect(lastPage).toContain("最新页");
-
-    const firstPageElements = (renderer.renderActivityHistory(running, 0) as {
-      body: { elements: Array<Record<string, unknown>> };
-    }).body.elements;
-    expect(firstPageElements[0]?.tag).toBe("column_set");
-    expect(firstPageElements[1]?.tag).toBe("hr");
-    expect(firstPageElements[2]?.tag).toBe("markdown");
-    const firstPageLabels = collectObjects(renderer.renderActivityHistory(running, 0))
-      .filter((item) => item.tag === "interactive_container")
-      .map((item) => JSON.stringify(item));
-    expect(firstPageLabels[0]).toContain("最新页");
-    expect(firstPageLabels[1]).toContain("下一页");
-
-    const lastPageLabels = collectObjects(renderer.renderActivityHistory(running, 2))
-      .filter((item) => item.tag === "interactive_container")
-      .map((item) => JSON.stringify(item));
-    expect(lastPageLabels[0]).toContain("最新页");
-    expect(lastPageLabels[1]).toContain("上一页");
+    const renderer = new CardRenderer();
+    const live = renderer.renderTurn(running);
+    const historyAction = collectObjects(live).find((item) => item.action === "activity_history")!;
+    expect(historyAction).toBeDefined();
+    const lastPageIndex = Number(historyAction.page);
+    expect(lastPageIndex).toBeGreaterThan(0);
+    const first = renderer.renderActivityHistory(running, 0);
+    const last = renderer.renderActivityHistory(running, lastPageIndex);
+    expect(renderer.renderActivityHistory(running, -1)).toEqual(first);
+    expect(renderer.renderActivityHistory(running, Number.MAX_SAFE_INTEGER)).toEqual(last);
+    const actions = (card: unknown) => collectObjects(card).filter((item) => item.action === "activity_history").map((item) => item.page);
+    expect(actions(first)).toEqual(["latest", "1"]);
+    expect(actions(last)).toEqual(["latest", String(lastPageIndex - 1)]);
+    expect(JSON.stringify(first)).toContain(`思考活动历史 · 1/${lastPageIndex + 2}`);
+    const pages = Array.from({ length: lastPageIndex + 1 }, (_, page) => renderer.renderActivityHistory(running, page));
+    const serialized = JSON.stringify([live, ...pages]);
+    for (let index = 0; index < 81; index++) expect(serialized).toContain(`[Activity-${index}]`);
+    for (const page of pages) {
+      expect(Buffer.byteLength(JSON.stringify(page), "utf8")).toBeLessThan(30 * 1024);
+      expect(collectObjects(page).filter((item) => typeof item.tag === "string").length).toBeLessThan(200);
+    }
   });
 
   test("renders task actions as colored callback links below the body", () => {

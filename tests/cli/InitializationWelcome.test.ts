@@ -115,7 +115,6 @@ function config(userOpenId?: string): AppConfig {
         projectless: "[{agent}] {taskname}",
         dateFormat: "MM-dd",
       },
-      thinkingCardLayout: "grouped",
       useConsoleWhenMissingCredentials: false,
     },
     agents: {

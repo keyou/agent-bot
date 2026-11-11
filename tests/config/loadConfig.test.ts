@@ -47,7 +47,6 @@ describe("loadConfig", () => {
           "groupNameFormat",
           "respondToAllGroupMessages",
           "respondToOwnerOnly",
-          "thinkingCardLayout",
           "transport",
           "userOpenId",
           "useConsoleWhenMissingCredentials",
@@ -60,7 +59,8 @@ describe("loadConfig", () => {
         projectless: "[{agent}] {taskname}",
         dateFormat: "MM-dd",
       });
-      expect(config.feishu.thinkingCardLayout).toBe("grouped");
+      expect(config.feishu).not.toHaveProperty("thinkingCardLayout");
+      expect(fs.readFileSync(defaultConfigPath(), "utf8")).not.toContain("thinkingCardLayout");
       expect(config.fileViewer).toEqual({
         enabled: true,
         host: "127.0.0.1",
@@ -96,7 +96,7 @@ describe("loadConfig", () => {
     expect(config.feishu.respondToAllGroupMessages).toBe(true);
     expect(config.feishu.respondToOwnerOnly).toBe(true);
     expect(config.feishu.groupNameFormat.project).toBe("[{agent}] [{project}] {taskname}");
-    expect(config.feishu.thinkingCardLayout).toBe("grouped");
+    expect(config.feishu).not.toHaveProperty("thinkingCardLayout");
     expect(config.fileViewer).toEqual({
       enabled: true,
       host: "127.0.0.1",
@@ -146,7 +146,7 @@ describe("loadConfig", () => {
     }
   });
 
-  test("can restore the original thinking-card timeline layout", () => {
+  test("ignores the retired layout key without rewriting existing configuration", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-thinking-card-"));
     const configPath = path.join(directory, "config.yaml");
     fs.writeFileSync(configPath, [
@@ -160,7 +160,9 @@ describe("loadConfig", () => {
     ].join("\n"));
 
     try {
-      expect(loadConfig(configPath).feishu.thinkingCardLayout).toBe("timeline");
+      const original = fs.readFileSync(configPath, "utf8");
+      expect(loadConfig(configPath).feishu).not.toHaveProperty("thinkingCardLayout");
+      expect(fs.readFileSync(configPath, "utf8")).toBe(original);
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }

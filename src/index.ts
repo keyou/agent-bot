@@ -126,7 +126,7 @@ let serverReady = false;
 
 const feishuOutbound = transport === "sdk" ? new FeishuMessageClient(config, logger) : undefined;
 if (feishuOutbound) {
-  const renderer = new CardRenderer({ thinkingCardLayout: config.feishu.thinkingCardLayout });
+  const renderer = new CardRenderer();
   const presenter = new FeishuTurnPresenter(feishuOutbound, store, renderer, {
     normalIntervalMs: 2_000,
     criticalGapMs: 500,

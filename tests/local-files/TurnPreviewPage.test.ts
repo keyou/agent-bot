@@ -121,14 +121,14 @@ describe("Turn Preview", () => {
   test.each(["zh", "en"] as const)("renders independent reasoning sections lazily without changing cards (%s)", (language) => {
     const input = state({ output: "tool result" });
     input.activities.unshift({ kind: "reasoning", id: "reasoning:r1:0", text: "Old truncated summary" });
-    const renderers = (["grouped", "timeline"] as const).map((thinkingCardLayout) => new CardRenderer({ thinkingCardLayout }));
-    const cards = renderers.map((renderer) => [renderer.renderTurn(input), renderer.renderTurnDetails(input)]);
+    const renderer = new CardRenderer();
+    const cards = [renderer.renderTurn(input), renderer.renderTurnDetails(input)];
     input.reasoningItems = [
       { itemId: "r1", summary: ["**Understanding API Implementation**\n\nSummary paragraph", "Second summary"], content: ["<script>alert(1)</script>\n\nBody paragraph"] },
       { itemId: "body-only", afterActivityId: "tool:1", summary: [], content: ["Only body"] },
       { itemId: "empty", summary: [" "], content: [] },
     ];
-    expect(renderers.map((renderer) => [renderer.renderTurn(input), renderer.renderTurnDetails(input)])).toEqual(cards);
+    expect([renderer.renderTurn(input), renderer.renderTurnDetails(input)]).toEqual(cards);
     const html = renderTurnPreviewSnapshot(input, undefined, language).content;
     const doc = parseHTML(html).document;
     expect(doc.querySelectorAll("details.reasoning-step")).toHaveLength(2);
