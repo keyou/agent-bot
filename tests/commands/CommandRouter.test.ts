@@ -4,6 +4,13 @@ import { CommandRouter } from "../../src/commands/CommandRouter.js";
 describe("CommandRouter", () => {
   const router = new CommandRouter();
 
+  test("opens global settings without treating arguments as a Prompt", () => {
+    expect(router.parse("/settings")).toEqual({ type: "settings" });
+    expect(router.parse("/sett")).toEqual({ type: "settings" });
+    expect(() => router.parse("/settings auto")).toThrow("不接受参数");
+    expect(() => router.parse("/se")).toThrow("不唯一");
+  });
+
   test("parses clone commands, explicit Agents, titles, and abbreviations", () => {
     expect(router.parse("/clone")).toEqual({ type: "clone", title: undefined, agentName: undefined });
     expect(router.parse('/clone "新的任务" --agent traex')).toEqual({ type: "clone", title: "新的任务", agentName: "traex" });
@@ -365,7 +372,7 @@ describe("CommandRouter", () => {
     expect(router.parse("/fork 2")).toEqual({ type: "fork", sessionId: "2" });
     expect(() => router.parse("/m")).toThrow("命令前缀 /m 不唯一，可匹配：/model、/mute");
     expect(() => router.parse("/s")).toThrow(
-      "命令前缀 /s 不唯一，可匹配：/schedule、/sessions、/status、/stop、/switch",
+      "命令前缀 /s 不唯一，可匹配：/schedule、/sessions、/settings、/status、/stop、/switch",
     );
     expect(() => router.parse("/f")).toThrow(
       "命令前缀 /f 不唯一，可匹配：/file、/fork、/forkgroup",

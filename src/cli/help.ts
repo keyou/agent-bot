@@ -63,6 +63,7 @@ export function renderCliHelp(version: string, language: CliLanguage = cliLangua
 选项：
   --profile <目录>                  使用独立的 Profile 目录
   --config <路径>                   使用指定的配置文件
+                                    全局配置：飞书 /settings 面板，或编辑此 YAML 文件
   --json                            在支持时输出 JSON
   -h, --help                        显示帮助
   -v, --version                     显示版本
@@ -164,6 +165,7 @@ Task commands:
 Options:
   --profile <directory>             Use an isolated profile directory
   --config <path>                   Use a specific config file
+                                    Global settings: Lark /settings panel, or edit this YAML file
   --json                            Print JSON when supported
   -h, --help                        Show help
   -v, --version                     Show version

@@ -10,6 +10,7 @@ import type {
   ThreadWriterProcessController,
 } from "../../src/codex/ThreadWriterProcess.js";
 import type { AgentExecutionDefaults, AppConfig } from "../../src/config/schema.js";
+import { SettingsStore } from "../../src/config/SettingsStore.js";
 import * as agentExecutionDefaultsStore from "../../src/config/AgentExecutionDefaultsStore.js";
 import { generateGroupAvatarPng, resolveGroupAvatarProjectName } from "../../src/feishu/GroupAvatarGenerator.js";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
@@ -614,6 +615,9 @@ function fixture(
     { root: "D:\\", driveType: "Fixed" },
   ]);
   const shellCommandJobs = new FakeShellCommandJobManager(shellCommandExecutor);
+  const settingsFile = path.join(dir, "config.yaml");
+  fs.writeFileSync(settingsFile, JSON.stringify(config));
+  const globalSettings = new SettingsStore(settingsFile, config);
   const controller = new ProxySessionController(
     config,
     store,
@@ -622,6 +626,7 @@ function fixture(
     logger,
     {
       restart,
+      settings: globalSettings,
       canStartScheduledTasks,
       supervised: true,
       cancelSafeRestart,
@@ -646,6 +651,8 @@ function fixture(
   });
   return {
     controller,
+    globalSettings,
+    settingsFile,
     runtime,
     sessions,
     goals,
@@ -675,6 +682,221 @@ function fixture(
     canStartScheduledTasks,
   };
 }
+
+describe("global settings panel", () => {
+  test("opens in an unbound topic without creating, resuming or changing a task", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const incoming = { ...threadMessage("c1", "group", "settings-topic", "root", "/settings"), userId: "ou_owner" };
+    await f.controller.onMessage(incoming);
+    expect(f.outbound.replyInteractiveCard).toHaveBeenCalledWith(incoming.contextKey,
+      { messageId: incoming.messageId, replyInThread: true }, expect.objectContaining({ schema: "2.0" }));
+    const card = JSON.stringify(vi.mocked(f.outbound.replyInteractiveCard!).mock.calls.at(-1));
+    expect(card).toContain("**常用**");
+    expect(card).toContain("默认 Agent");
+    expect(card).not.toContain("思考卡片布局");
+    expect(card).not.toContain("日志级别");
+    expect(f.store.listSessions(incoming.contextKey)).toEqual([]);
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.runtime.createSession).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+
+  test.each([undefined, "ou_other"])("denies non-owner %s even when normal conversations are public", async (userId) => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    f.config.feishu.respondToOwnerOnly = false;
+    const original = fs.readFileSync(f.settingsFile, "utf8");
+    await f.controller.onMessage({ ...message("/settings"), userId });
+    const view = f.globalSettings.read();
+    for (const action of ["bot_settings_show", "bot_settings_agent", "bot_settings_change", "bot_settings_restart"]) {
+      await f.controller.onCardAction({ actionId: `denied-${action}`, contextKey: "chat_id:c1", messageId: "card", userId,
+        value: { action, section: "general", field: "updates", revision: view.fieldRevisions.updates, checked: false } });
+    }
+    expect(fs.readFileSync(f.settingsFile, "utf8")).toBe(original);
+    expect(f.outbound.sendInteractiveCard).not.toHaveBeenCalled();
+    expect(f.outbound.updateInteractiveCard).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("saves Agent defaults separately from a running task, then safely restarts only on request", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    await f.controller.onMessage({ ...message("keep working"), userId: "ou_owner" });
+    const task = f.store.listSessions("chat_id:c1")[0]!;
+    const beforeTask = structuredClone(f.store.getSession(task.localSessionId));
+    const beforeConfig = structuredClone(f.config);
+    const view = f.globalSettings.read("agents", "codex");
+    await f.controller.onCardAction({ actionId: "save-defaults", contextKey: "chat_id:c1", userId: "ou_owner", messageId: "settings-card",
+      value: { action: "bot_settings_change", section: "agents", agentName: "codex", field: "model", revision: view.fieldRevisions.model,
+        option: "gpt-next" } });
+    expect(f.globalSettings.read("agents", "codex").values.model).toBe("gpt-next");
+    expect(f.store.getSession(task.localSessionId)).toEqual(beforeTask);
+    expect(f.config).toEqual(beforeConfig);
+    expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    expect(f.runtime.setModel).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+    expect(JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1))).toContain("待安全重启生效");
+    const contextKey = "chat_id:c1:thread_id:t1";
+    await f.controller.onCardAction({ actionId: "settings-restart", contextKey: "chat_id:c1", userId: "ou_owner", messageId: "settings-card",
+      value: { action: "bot_settings_restart", contextKey } });
+    expect(f.restart).toHaveBeenCalledWith(contextKey, false, { messageId: "settings-card", replyInThread: true });
+  });
+
+  test("switches Agent and section in the existing card and reports stale submission", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const common = { contextKey: "chat_id:c1", userId: "ou_owner", messageId: "settings-card" };
+    await f.controller.onCardAction({ ...common, actionId: "agent-select", value: { action: "bot_settings_agent", section: "agents", option: "acp" } });
+    expect(JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1))).toContain('"agentName":"acp"');
+    await f.controller.onCardAction({ ...common, actionId: "section-select", value: { action: "bot_settings_show", section: "general" } });
+    expect(JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1))).toContain("默认 Agent");
+    const view = f.globalSettings.read();
+    f.globalSettings.saveField("general", undefined, "updates", view.fieldRevisions.updates, false);
+    await f.controller.onCardAction({ ...common, actionId: "stale", value: { action: "bot_settings_change", section: "general", field: "updates", revision: view.fieldRevisions.updates, checked: true } });
+    expect(f.globalSettings.read().values.updates).toBe(false);
+    expect(JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1))).toContain("此配置项已变化");
+    expect(f.outbound.sendInteractiveCard).not.toHaveBeenCalled();
+  });
+
+  test.each([undefined, "configured-provider"])("discovers models for the Agent Provider %s without loading a task", async (provider) => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const saved = JSON.parse(fs.readFileSync(f.settingsFile, "utf8"));
+    saved.agents.codex.defaults = { modelProvider: provider, model: "gpt-test" };
+    fs.writeFileSync(f.settingsFile, JSON.stringify(saved));
+    const original = fs.readFileSync(f.settingsFile, "utf8");
+    await f.controller.onCardAction({ actionId: "agent-dropdowns", contextKey: "chat_id:c1", userId: "ou_owner", messageId: "settings-card",
+      value: { action: "bot_settings_show", section: "agents", agentName: "codex" } });
+    expect(f.runtime.listModels).toHaveBeenCalledExactlyOnceWith(provider ?? "openai", "gpt-test");
+    expect(f.runtime.listModelProviders).toHaveBeenCalledOnce();
+    const card = JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1));
+    expect(card).toContain('"value":"gpt-next"');
+    expect(card).toContain('"value":"xhigh"');
+    expect(card).toContain("GPT Next (gpt-next)");
+    expect(card).not.toContain('"name":"modelProvider"');
+    expect(card).not.toContain('"tag":"input"');
+    expect(fs.readFileSync(f.settingsFile, "utf8")).toBe(original);
+    expect(f.runtime.createSession).not.toHaveBeenCalled();
+    expect(f.runtime.resumeSession).not.toHaveBeenCalled();
+    expect(f.runtime.forkSession).not.toHaveBeenCalled();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.runtime.setModel).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+
+  test.each(["error", "empty", "warning"])("retains defaults and permits permission edits with a %s model catalog", async (mode) => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const saved = JSON.parse(fs.readFileSync(f.settingsFile, "utf8"));
+    saved.agents.codex.defaults = { modelProvider: "custom", model: "Unavailable-ID", reasoningEffort: "custom-effort", permissionMode: "auto" };
+    fs.writeFileSync(f.settingsFile, JSON.stringify(saved));
+    f.runtime.listModelsWithStatus = vi.fn(async () => {
+      if (mode === "error") throw new Error("private-provider-secret");
+      return { models: [], ...(mode === "warning" ? { warning: "private-provider-secret" } : {}) };
+    });
+    const view = f.globalSettings.read("agents", "codex");
+    await f.controller.onCardAction({ actionId: "save-permissions", contextKey: "chat_id:c1", userId: "ou_owner", messageId: "settings-card",
+      value: { action: "bot_settings_change", section: "agents", agentName: "codex", field: "permissionMode", revision: view.fieldRevisions.permissionMode,
+        option: "confirm" } });
+    expect(f.globalSettings.read("agents", "codex")).toMatchObject({ modelProvider: "custom",
+      values: { model: "Unavailable-ID", reasoningEffort: "custom-effort", permissionMode: "confirm" } });
+    const card = JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1));
+    expect(card).toContain("模型列表");
+    expect(card).toContain('"initial_option":"Unavailable-ID"');
+    expect(card).toContain('"initial_option":"custom-effort"');
+    expect(card).not.toContain("private-provider-secret");
+    expect(f.runtime.setPermissionMode).not.toHaveBeenCalled();
+    expect(f.runtime.createSession).not.toHaveBeenCalled();
+  });
+
+  test("rejects incompatible selections without saving any field", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    let view = f.globalSettings.read("agents", "codex");
+    f.globalSettings.saveField("agents", "codex", "model", view.fieldRevisions.model, "gpt-next", { models: await f.runtime.listModels() });
+    view = f.globalSettings.read("agents", "codex");
+    const original = fs.readFileSync(f.settingsFile, "utf8");
+    await f.controller.onCardAction({ actionId: "invalid-defaults", contextKey: "chat_id:c1", userId: "ou_owner", messageId: "settings-card",
+      value: { action: "bot_settings_change", section: "agents", agentName: "codex", field: "reasoningEffort", revision: view.fieldRevisions.reasoningEffort,
+        option: "low" } });
+    expect(fs.readFileSync(f.settingsFile, "utf8")).toBe(original);
+    expect(JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1))).toContain("不支持此思考强度");
+    expect(f.outbound.sendText).not.toHaveBeenCalled();
+  });
+
+  test("rejects configuration changes made during asynchronous model discovery", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const view = f.globalSettings.read("agents", "codex");
+    vi.mocked(f.runtime.listModels).mockImplementationOnce(async () => {
+      fs.appendFileSync(f.settingsFile, "\n# newer settings");
+      return [{ id: "gpt-next", supportedReasoningEfforts: [] }];
+    });
+    await f.controller.onCardAction({ actionId: "raced-defaults", contextKey: "chat_id:c1", userId: "ou_owner", messageId: "settings-card",
+      value: { action: "bot_settings_change", section: "agents", agentName: "codex", field: "model", revision: view.fieldRevisions.model,
+        option: "gpt-next" } });
+    expect(f.globalSettings.read("agents", "codex").values.model).toBe(view.values.model);
+    expect(JSON.stringify(vi.mocked(f.outbound.sendText).mock.calls)).toContain("配置已变化");
+    expect(f.outbound.updateInteractiveCard).not.toHaveBeenCalled();
+  });
+
+  test("autosaves consecutive controls from the same card without reverting other fields", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const view = f.globalSettings.read();
+    const base = { contextKey: "chat_id:c1", messageId: "settings-card", userId: "ou_owner" };
+    await Promise.all(["updates", "ownerOnly"].map((field) => f.controller.onCardAction({ ...base, actionId: `change-${field}`,
+      value: { action: "bot_settings_change", section: "general", field, revision: view.fieldRevisions[field], checked: false } })));
+    expect(f.globalSettings.read().values).toMatchObject({ updates: false, ownerOnly: false });
+    expect(f.outbound.updateInteractiveCard).toHaveBeenCalledTimes(2);
+    expect(f.outbound.sendText).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+    expect(f.runtime.createSession).not.toHaveBeenCalled();
+  });
+
+  test("autosaves native text and number callbacks and leaves invalid input unsaved", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const base = { contextKey: "chat_id:c1", messageId: "settings-card", userId: "ou_owner" };
+    for (const [section, field, inputValue] of [["naming", "project", "{project} {taskname}"], ["services", "port", "1423"]]) {
+      const view = f.globalSettings.read(section);
+      await f.controller.onCardAction({ ...base, actionId: `input-${field}`,
+        value: { action: "bot_settings_change", section, field, inputValue, revision: view.fieldRevisions[field!] } });
+      expect(f.globalSettings.read(section).values[field!]).toBe(field === "port" ? 1423 : inputValue);
+    }
+    const view = f.globalSettings.read("services");
+    await f.controller.onCardAction({ ...base, actionId: "invalid-port",
+      value: { action: "bot_settings_change", section: "services", field: "port", inputValue: "bad", revision: view.fieldRevisions.port } });
+    expect(f.globalSettings.read("services").values.port).toBe(1423);
+    expect(JSON.stringify(vi.mocked(f.outbound.updateInteractiveCard).mock.calls.at(-1))).toContain("未保存");
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+
+  test("opens single-Agent Provider/model defaults and autosaves Provider selection without creating work", async () => {
+    const f = fixture();
+    f.config.feishu.userOpenId = "ou_owner";
+    const saved = JSON.parse(fs.readFileSync(f.settingsFile, "utf8"));
+    delete saved.agents.acp;
+    fs.writeFileSync(f.settingsFile, JSON.stringify(saved));
+    await f.controller.onMessage({ ...message("/settings"), userId: "ou_owner" });
+    const card = JSON.stringify(vi.mocked(f.outbound.sendInteractiveCard).mock.calls.at(-1));
+    expect(card).toContain("默认 Provider");
+    expect(card).toContain("默认模型");
+    expect(card).not.toContain("默认 Agent");
+    expect(card).toContain('"value":"azure"');
+    const view = f.globalSettings.read();
+    await f.controller.onCardAction({ actionId: "default-provider", contextKey: "chat_id:c1", messageId: "settings-card", userId: "ou_owner",
+      value: { action: "bot_settings_change", section: "general", field: "modelProvider", revision: view.fieldRevisions.modelProvider, option: "azure" } });
+    expect(f.runtime.listModels).toHaveBeenLastCalledWith("azure", undefined);
+    expect(f.globalSettings.read().values).toMatchObject({ modelProvider: "azure", model: "gpt-test" });
+    expect(f.runtime.setExecutionSettings).not.toHaveBeenCalled();
+    expect(f.runtime.createSession).not.toHaveBeenCalled();
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+});
 
 describe("runtime event state consistency", () => {
   test.each(["turn_completed", "turn_cancelled", "turn_failed"] as const)(
@@ -13014,6 +13236,7 @@ describe("ProxySessionController", () => {
       "/turns",
       "/sessions",
       "/schedule",
+      "/settings",
       "/archive",
       "/dismiss",
       "/switch",

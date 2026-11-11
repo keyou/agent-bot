@@ -276,6 +276,7 @@ Send a message beginning with `/` to run a command. Use `/help` in Feishu for th
 | `/thinking`                                   | Set reasoning effort                 |
 | `/permissions`                                | Set execution permissions            |
 | `/agent [name]`                               | Choose the Agent for new tasks       |
+| `/settings`                                   | Configure Profile and Agent defaults (owner only) |
 | `/newgroup [title] [--agent <name>] [--dir <path> \| --nodir]` | Start a task in a new private group  |
 | `/forkgroup [title]`                          | Branch a task into a new private group |
 | `/clonegroup [title] [--agent <name>]`         | Transfer dialogue into a new private group |
@@ -303,6 +304,23 @@ Only groups explicitly enabled with `/mute` or `/mute on` supplement ordinary @-
 `/new` and `/newgroup` use the conversation's default Agent unless `--agent <name>` selects another configured Agent for this task only; the source conversation's default is unchanged. For example, `/new Fix tests --agent codex` or `/newgroup Review --agent traex --dir ~/dev/project`. They inherit the current project; execution settings are inherited only when the selected Agent matches the current task's Agent, otherwise Provider, model, reasoning, and permission mode use the target Agent's saved defaults. Use `--dir` to choose another directory or `--nodir` to start without a project directory; `--nodir` requires the selected Agent to be App Server, and `~` represents your home directory.
 
 `/dir` opens the file browser. `NewFolder` creates a child directory and opens it in the same card at page one, without changing the task's working directory. `Back` cancels creation and restores the previous directory and page.
+
+### Global Settings Panel
+
+Send `/settings` to configure the current Profile. It opens on Common, with compact tabs for Common, Agent, Group names and Advanced. Only the configured Agent Bot owner can use it, including when normal conversations accept other users; no current task is required.
+
+| Section | Options |
+| --- | --- |
+| Common | Default Agent when multiple Agents are configured; otherwise default Provider and model. Also owner-only responses, all-group-message responses and automatic stable updates |
+| Agent | Default model, reasoning effort and permissions as dropdowns; with one Agent, model selection moves to Common and no Agent selector is shown. Select Use Agent default to clear an override |
+| Group names | Project/projectless templates and date format |
+| Advanced | Console, web terminal, file/Turn Preview, listen host/port and log level |
+
+Each control saves independently to the Profile YAML, with no separate Save button. Selectors and checkboxes save on change; text and number fields save when Feishu sends their native input-submit callback (use the input's own submit icon, not a page Save button). Feishu does not expose a blur/keystroke callback. Invalid input keeps the previous value and displays an error on the same card. **Changes take effect after a safe restart**, which remains an explicit action waiting for active tasks, terminals and final delivery. Field-level revision checks prevent stale overwrites while independent edits can be saved from the same card. No-op saves preserve the file exactly; updates retain comments, environment references and unrelated fields.
+
+Agent model and reasoning choices come from that Agent's configured Provider, preserving upstream IDs and display names. The reasoning dropdown lists available efforts; saving validates the chosen model/effort pair. Changing the single Agent's default Provider retains its model when supported, otherwise selects the new Provider's default/first available model (or uses the Agent default if discovery is unavailable). Incompatible reasoning overrides return to the Agent default. Discovery failures show a warning; unrelated edits retain unavailable current values. The public base URL is not editable in this panel; existing `fileViewer.publicBaseUrl` values remain unchanged and can still be managed in YAML.
+
+Global defaults never rewrite existing tasks or history; same-Agent new tasks and forks still prefer inherited settings. Naming changes do not rename existing groups. All-group-message mode still requires the corresponding Lark permissions and does not grant them automatically. Credentials, owner identity, Agent launch commands/environment, database/log paths and Lark transport debugging options remain local configuration or `agentbot init` concerns and are not displayed on cards.
 
 ### Scheduled Tasks
 
@@ -433,7 +451,7 @@ HTML files (`.html` and `.htm`) open in preview mode with a code toggle, line an
 
 CSV files (`.csv`, case-insensitive) open as read-only tables with row numbers, column letters, sticky labels, and horizontal/vertical scrolling. The first row remains data, not an inferred header. Standard comma-separated fields support quoted commas, escaped quotes, embedded newlines, empty cells, and UTF-8/UTF-16 BOM or GB18030 text decoding; numeric strings and formulas remain plain text. Preview reads at most the first 2 MiB and displays up to 500 records, 50 columns, and 4,000 characters per cell, with explicit truncation or malformed-quote notices. Incomplete records at the byte boundary are omitted. The code view displays up to 2,000 physical lines; raw/download links preserve the entire original file. Live updates retain the selected view and table scroll position.
 
-Provider, model, reasoning effort, and permission choices apply only to the current task; they never create or update Agent defaults in `config.yaml`. Configure `agents.<name>.defaults` explicitly to choose defaults for unrelated new tasks. Existing configured defaults remain unchanged. Same-Agent `/new` and `/newgroup` still inherit the source task's settings, and `/fork` and `/forkgroup` preserve source-task settings and history.
+Provider, model, reasoning effort, and permission choices apply only to the current task; they never create or update Agent defaults in `config.yaml`. Use the Agent defaults page in `/settings` or explicitly edit `agents.<name>.defaults` to choose defaults for unrelated new tasks. Same-Agent `/new` and `/newgroup` still inherit the source task's settings, and `/fork` and `/forkgroup` preserve source-task settings and history.
 
 For App Server tasks, permission changes apply both approval and sandbox policies on the next Turn: `auto` uses no sandbox and no approval prompts; `confirm` uses the workspace-write sandbox and on-request approval. Choose the mode in `/permissions`, or use `agentbot task permissions auto|confirm`. Switching requires no Agent restart, fork, or new task and does not change already-running tool processes or steering requests. Workspace writable roots, network access, and temporary-directory exclusions retain the Agent's configured values.
 

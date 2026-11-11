@@ -86,7 +86,7 @@ describe("CLI help", () => {
     expect(help).toContain("省略任务，CLI 会自动使用当前任务");
   });
 
-  test("documents a CLI counterpart for every Feishu slash command", () => {
+  test("documents a CLI or config-file counterpart for every Feishu slash command", () => {
     const help = renderCliHelp("1.2.3", "en");
     const counterparts: Record<(typeof COMMAND_NAMES)[number], string> = {
       agent: "task agent",
@@ -113,6 +113,7 @@ describe("CLI help", () => {
       restart: "task restart",
       schedule: "schedule list",
       sessions: "task list",
+      settings: "Global settings: Lark /settings panel, or edit this YAML file",
       status: "task status|chat",
       stop: "task stop",
       switch: "task switch",

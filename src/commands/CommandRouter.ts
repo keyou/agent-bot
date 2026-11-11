@@ -25,6 +25,7 @@ export const COMMAND_NAMES = [
   "restart",
   "schedule",
   "sessions",
+  "settings",
   "status",
   "stop",
   "switch",
@@ -60,6 +61,8 @@ export class CommandRouter {
     const command = resolveCommandName(rawCommand);
 
     switch (command) {
+      case "settings":
+        return settingsCommand("/settings", args, { type: "settings" });
       case "schedule":
         return { type: "schedule", command: parseScheduleCommand(args) };
       case "dir":

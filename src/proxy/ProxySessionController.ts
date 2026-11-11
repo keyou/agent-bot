@@ -54,6 +54,8 @@ import { RECENT_CONTEXT_LIMIT, RECENT_CONTEXT_IMAGE_LIMIT, RECENT_CONTEXT_TEXT_L
 import { allowsFeishuUser } from "../feishu/ownerAccess.js";
 import type { ScheduleCommand, ScheduledJob, ScheduleInput } from "../scheduling/types.js";
 import { scheduleCommandSchema } from "../scheduling/types.js";
+import type { SettingsCatalog, SettingsSnapshot, SettingsStore } from "../config/SettingsStore.js";
+import { renderSettingsCard } from "../feishu/SettingsCard.js";
 import { renderSchedule, renderScheduleList, renderScheduleForm } from "../scheduling/ScheduleCards.js";
 import { classifyFileContent } from "../local-files/LocalFileViewerServer.js";
 import { errorLogValue } from "../logging/errorLogValue.js";
@@ -297,6 +299,7 @@ const HELP_COMMAND_SECTIONS: Array<{
       },
       { command: "/sessions", usage: "[关键词]", description: "查找本机任务" },
       { command: "/schedule", description: "创建和管理绑定现有任务的定时计划" },
+      { command: "/settings", description: "配置 Agent Bot 和各 Agent 默认值（仅所有者）" },
       {
         command: "/archive",
         usage: "[序号或任务 ID]",
@@ -526,6 +529,7 @@ export interface ControlTaskReleaseResult {
 }
 
 export interface ProxyLifecycle {
+  settings?: SettingsStore;
   canStartScheduledTasks?(): boolean;
   terminalUrl?(jobId: string): string | undefined;
   authorizeTerminal?(action: CardAction): Promise<string>;
@@ -564,6 +568,7 @@ export class ProxySessionController {
   private readonly queuedPromptCards = new Map<string, Map<string, string>>();
   private readonly queuedPromptCardWrites = new Map<string, Promise<void>>();
   private readonly settingsOperations = new SessionOperationQueue();
+  private readonly globalSettingsOperations = new SessionOperationQueue();
   // Loads may run inside settingsOperations; never acquire that queue while hydrating.
   private readonly sessionHydrationOperations = new SessionOperationQueue();
   private readonly sessionResets = new Map<string, Promise<void>>();
@@ -1062,7 +1067,9 @@ export class ProxySessionController {
     await this.outbound.withReplyTarget(contextKey, replyTarget, async () => {
       try {
         const kind = String(scopedAction.value.action ?? "");
-        if (kind.startsWith("schedule_")) {
+        if (kind.startsWith("bot_settings_")) {
+          await this.handleSettingsAction(scopedAction, replyTarget);
+        } else if (kind.startsWith("schedule_")) {
           await this.handleScheduleAction(scopedAction, replyTarget);
         } else if (kind === "terminal_authorize") {
           if (!this.lifecycle?.authorizeTerminal) throw new Error("网页终端未启用。");
@@ -1829,6 +1836,72 @@ export class ProxySessionController {
     return this.store.schedules.change(job.id, job.revision, command.operation as "pause" | "resume" | "delete");
   }
 
+  private requireSettingsOwner(userId?: string): SettingsStore {
+    if (!this.config.feishu.userOpenId || userId !== this.config.feishu.userOpenId) {
+      throw new Error("只有 Agent Bot 所有者可以管理全局配置。");
+    }
+    if (!this.lifecycle?.settings) throw new Error("当前运行方式不支持配置面板。");
+    return this.lifecycle.settings;
+  }
+
+  private async handleSettingsAction(action: CardAction, replyTarget?: MessageReplyTarget): Promise<void> {
+    const settings = this.requireSettingsOwner(action.userId);
+    return this.globalSettingsOperations.run("profile", () => this.handleSettingsActionNow(settings, action, replyTarget));
+  }
+
+  private async settingsCatalog(snapshot: SettingsSnapshot, selectedProvider?: string): Promise<SettingsCatalog | undefined> {
+    if (!snapshot.agentName) return undefined;
+    let providers: SettingsCatalog["providers"];
+    try {
+      const runtime = this.runtimes.forAgent(snapshot.agentName);
+      providers = await runtime.listModelProviders?.() ?? [];
+      const requested = selectedProvider ?? snapshot.modelProvider;
+      const provider = requested || providers.find((entry) => entry.isDefault)?.id;
+      const result = await this.modelOptions(runtime, provider,
+        selectedProvider === undefined || selectedProvider === (snapshot.modelProvider ?? "") ? snapshot.model : undefined);
+      return { models: result.models, providers,
+        ...(result.warning || result.models.length === 0
+          ? { warning: "模型列表暂不可完整获取；保留当前配置，也可选择使用 Agent 默认。" } : {}) };
+    } catch {
+      return { models: [], providers, warning: "无法获取模型列表；保留当前配置，也可选择使用 Agent 默认。" };
+    }
+  }
+
+  private async handleSettingsActionNow(settings: SettingsStore, action: CardAction, replyTarget?: MessageReplyTarget): Promise<void> {
+    const kind = action.value.action;
+    if (kind === "bot_settings_restart") {
+      await this.lifecycle!.restart(action.contextKey, false, replyTarget);
+      return;
+    }
+    if (!["bot_settings_show", "bot_settings_agent", "bot_settings_change"].includes(String(kind))) throw new Error("无效的配置操作。");
+    const messageId = requiredCardMessageId(action.messageId);
+    const agentValue = kind === "bot_settings_agent" ? action.value.option : action.value.agentName;
+    const agentName = typeof agentValue === "string" ? agentValue : undefined;
+    const current = settings.read(action.value.section, agentName);
+    const selectedProvider = kind === "bot_settings_change" && action.value.field === "modelProvider" && typeof action.value.option === "string"
+      ? (action.value.option === "__agent_default__" ? "" : action.value.option) : undefined;
+    const catalog = await this.settingsCatalog(current, selectedProvider);
+    if (settings.read(current.section, current.agentName).revision !== current.revision)
+      throw new Error("配置已变化，请刷新面板后重新编辑。");
+    let snapshot = settings.read(current.section, current.agentName, catalog);
+    let notice: string | undefined;
+    if (kind === "bot_settings_change") {
+      const field = snapshot.fields.find((entry) => entry.name === action.value.field);
+      const value = field?.kind === "boolean" ? action.value.checked
+        : field?.kind === "select" ? action.value.option : action.value.inputValue;
+      try {
+        snapshot = settings.saveField(snapshot.section, snapshot.agentName, action.value.field, action.value.revision, value, catalog);
+        if (["modelProvider", "model"].includes(String(action.value.field))
+          && current.agentName && settings.read("agents", current.agentName).values.reasoningEffort === ""
+          && current.reasoningEffort) notice = "已自动保存，思考强度已恢复 Agent 默认；安全重启后生效。";
+      } catch (error) {
+        snapshot = settings.read(current.section, current.agentName, await this.settingsCatalog(current));
+        notice = `未保存：${error instanceof Error ? error.message : "配置保存失败，请重试。"}`;
+      }
+    }
+    await this.outbound.updateInteractiveCard(action.contextKey, messageId, renderSettingsCard(snapshot, action.contextKey, notice));
+  }
+
   private createSchedule(input: ScheduleInput, localSessionId: string, contextKey: string, replyMessageId?: string): ScheduledJob {
     if (!this.config.feishu.userOpenId) throw new Error("请先配置 Agent Bot 所有者，才能创建定时任务。");
     this.requireSession(contextKey, localSessionId);
@@ -2214,6 +2287,16 @@ export class ProxySessionController {
       throw new Error(unboundThreadTaskMessage());
     }
     switch (command.type) {
+      case "settings": {
+        const settings = this.requireSettingsOwner(userId);
+        await this.globalSettingsOperations.run("profile", async () => {
+          const current = settings.read();
+          const catalog = await this.settingsCatalog(current);
+          if (settings.read().revision !== current.revision) throw new Error("配置已变化，请重新打开设置。");
+          await this.outbound.sendInteractiveCard(contextKey, renderSettingsCard(settings.read("general", undefined, catalog), contextKey));
+        });
+        return;
+      }
       case "schedule": {
         if (!this.config.feishu.userOpenId || userId !== this.config.feishu.userOpenId) throw new Error("只有 Agent Bot 所有者可以管理定时任务。");
         if (command.command.operation === "list") {

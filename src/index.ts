@@ -8,6 +8,7 @@ import { LocalControlServer } from "./cli/LocalControlServer.js";
 import { controlEndpoint, type ControlRequest, type ControlResponse } from "./cli/controlProtocol.js";
 import { readPackageVersion } from "./cli/packageVersion.js";
 import { loadConfig } from "./config/loadConfig.js";
+import { SettingsStore } from "./config/SettingsStore.js";
 import { persistFeishuUserOpenIdIfMissing } from "./config/FeishuUserOpenIdStore.js";
 import {
   agentBotHome,
@@ -266,6 +267,7 @@ function serverActivity() {
 }
 
 const controller = new ProxySessionController(config, store, runtimes, outbound, logger, {
+  settings: new SettingsStore(activeConfigPath, config),
   canStartScheduledTasks: () => serverReady && !shuttingDown && !restartRequested && !safeRestart.scheduled,
   supervised,
   terminalUrl: (jobId) => terminalServer?.createUrl(jobId),

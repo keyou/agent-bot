@@ -413,6 +413,15 @@ function getCardActionValue(action: Record<string, unknown>): Record<string, unk
     if (Object.keys(option).length > 0) return option;
   }
   const value = isRecord(action.value) ? action.value : {};
+  if (action.tag === "select_static" && typeof action.option === "string") {
+    return { ...value, option: action.option };
+  }
+  if (action.tag === "checker" && typeof action.checked === "boolean") {
+    return { ...value, checked: action.checked };
+  }
+  if (action.tag === "input" && typeof action.input_value === "string") {
+    return { ...value, inputValue: action.input_value };
+  }
   return isRecord(action.form_value)
     ? { ...value, formValue: action.form_value }
     : value;

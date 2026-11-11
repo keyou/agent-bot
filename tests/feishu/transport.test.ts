@@ -1040,6 +1040,25 @@ test("dispatches direct Feishu SDK card action events", async () => {
   });
 });
 
+test.each([
+  { tag: "select_static", option: "traex", value: { action: "bot_settings_agent", section: "agents" }, expected: { action: "bot_settings_agent", section: "agents", option: "traex" } },
+  { tag: "select_static", option: "Upstream-ID", value: { action: "bot_settings_change", field: "model" }, expected: { action: "bot_settings_change", field: "model", option: "Upstream-ID" } },
+  { tag: "checker", checked: false, value: { action: "bot_settings_change", field: "updates", checked: true }, expected: { action: "bot_settings_change", field: "updates", checked: false } },
+  { tag: "checker", checked: true, value: { action: "bot_settings_change", field: "updates" }, expected: { action: "bot_settings_change", field: "updates", checked: true } },
+  { tag: "input", input_value: "1423", value: { action: "bot_settings_change", field: "port" }, expected: { action: "bot_settings_change", field: "port", inputValue: "1423" } },
+  { tag: "input", input_value: "", value: { action: "bot_settings_change", field: "project", inputValue: "old" }, expected: { action: "bot_settings_change", field: "project", inputValue: "" } },
+])("preserves settings callback values: $tag", async ({ expected, ...action }) => {
+  const config = { feishu: { transport: "sdk", appId: "cli_app", appSecret: "secret" } } as AppConfig;
+  const handler = { onMessage: vi.fn(), onCardAction: vi.fn() };
+  const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+  const connector = new FeishuConnector(config, handler, logger);
+  await connector.start();
+  await larkSdkMock.handlers["card.action.trigger"]({ event_id: "evt_settings", action,
+    operator: { open_id: "ou_owner" }, context: { open_chat_id: "oc_1", open_message_id: "om_settings" } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(handler.onCardAction).toHaveBeenCalledWith({ actionId: "evt_settings", contextKey: "chat_id:oc_1", userId: "ou_owner", messageId: "om_settings", value: expected });
+});
+
 test.each(["envelope", "sdk", "wrapped_envelope"])("preserves event IDs and form values in %s card actions", async (shape) => {
   const config = {
     feishu: {

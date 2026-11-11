@@ -55,7 +55,7 @@ agents:
       - "--listen"
       - "stdio://"
     env: {}
-    # Updated automatically by the Provider, Model, Thinking, and Permission settings.
+    # Configure explicitly here or through /settings; task settings stay task-local.
     defaults:
       # modelProvider: "openai"
       # model: "gpt-5"

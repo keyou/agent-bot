@@ -8,6 +8,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Remove the retired chronological thinking-card renderer, layout configuration and fixed-count pagination. Progress, execution-details and history cards now share grouped rendering; saved history and web Preview are unchanged.
 
+- Add owner-only `/settings` panels with a compact Common-first layout for Profile and per-Agent defaults, response/display policies and service options, with validated atomic YAML saves, stale-card protection and explicit safe-restart activation; existing tasks and history remain unchanged.
+- Keep the Agent settings page to model, reasoning and permission dropdowns, using runtime catalogs with model/effort validation and preserving existing Provider settings and unavailable current values.
+- Autosave settings per component without a page Save button, protect independent edits with field revisions, and keep invalid input unsaved. Single-Agent profiles show Provider/model defaults on Common instead of an Agent selector; the public base URL remains YAML-only.
+
 - Keep Provider/model/thinking/permission changes scoped to the selected task without changing Agent defaults or conversation history.
 - Persist submission boundaries: reattach known turns, retry only proven unsubmitted requests, and show uncertain execution as unverified without replaying old instructions.
 - Persist Stop across preparation, retries, continuations and restarts; retain independent queued messages and verify termination instead of assuming an interrupt succeeded.
