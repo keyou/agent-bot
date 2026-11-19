@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.25-alpha.2] - 2026-11-19
+
 - Automatically migrate legacy recent-context receipt tables at startup without losing records or guessing source Prompts; distinguish local-state failures from Feishu permission errors, and keep accepted tasks running if receipt persistence fails.
 
 - Unify local image handling at the Feishu outbound boundary for all cards and final answers, including live thinking-card updates; reuse uploads, degrade unavailable images to text, and preserve code examples, native image keys and callback data without per-card opt-in flags.
