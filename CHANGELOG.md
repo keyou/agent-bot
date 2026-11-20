@@ -6,6 +6,16 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-20
+
+- Promote 0.1.25-alpha.2 to the stable release channel, including the changes from all 0.1.25 Alpha releases.
+- Add confirmed one-time and Cron schedules with busy-task queueing, a 60-minute latest-start deadline, execution records, and Prompt delivery before thinking cards.
+- Keep execution settings task-scoped, persist submission and cancellation boundaries, and verify uncertain recovery without replaying old instructions or duplicating final replies.
+- Add owner-only global settings panels with validated, atomic configuration saves and explicit safe-restart activation.
+- Unify outbound local-image handling across Feishu cards and final replies, with upload reuse and safe text fallback; use one grouped thinking-card renderer.
+- Automatically upgrade legacy recent-context receipt databases without losing records, distinguish local-state errors from Feishu permissions, and preserve accepted work when receipt writes fail.
+- Fix quoted/merged-forward message pairing and resource downloads, and retain minimal delayed-message diagnostics.
+
 ## [0.1.25-alpha.2] - 2026-11-19
 
 - Automatically migrate legacy recent-context receipt tables at startup without losing records or guessing source Prompts; distinguish local-state failures from Feishu permission errors, and keep accepted tasks running if receipt persistence fails.
