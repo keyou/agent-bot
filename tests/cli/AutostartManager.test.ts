@@ -35,6 +35,8 @@ describe("autostart plans", () => {
     expect(plan.definitionPath).toMatch(/^\/Users\/tester\/Library\/LaunchAgents\/com\.keyou\.agent-bot\.[a-f0-9]{10}\.plist$/);
     expect(plan.definitionContent).toContain("<key>RunAtLoad</key>\n    <true/>");
     expect(plan.definitionContent).toContain("<key>KeepAlive</key>\n    <false/>");
+    expect(plan.definitionContent).toContain("<key>ProcessType</key>\n    <string>Standard</string>");
+    expect(plan.definitionContent).not.toContain("<string>Background</string>");
     expect(plan.definitionContent).toContain("/Users/tester/.agent-bot/autostart/supervisor-bootstrap.mjs");
   });
 
@@ -52,6 +54,24 @@ describe("autostart plans", () => {
 });
 
 describe("AutostartManager", () => {
+  test.each([".agent-bot", ".agent-bot-rescue"])("re-registers the existing macOS %s LaunchAgent as Standard without unloading active work", (profile) => {
+    const context = posixContext(`/Users/tester/${profile}`);
+    const previous = createAutostartPlan(context, "darwin", "/Users/tester");
+    const files = new Map([[previous.definitionPath, previous.definitionContent!.replace("<string>Standard</string>", "<string>Background</string>")]]);
+    const run = vi.fn(() => result(0));
+    const manager = new AutostartManager(context, {
+      platform: "darwin", homeDirectory: "/Users/tester", username: "tester", uid: 501,
+      run, exists: (filePath) => files.has(filePath), write: (filePath, content) => files.set(filePath, content),
+      remove: vi.fn(), removeDirectoryIfEmpty: vi.fn(),
+    });
+
+    expect(manager.enable()).toMatchObject({ enabled: true, loaded: true, definitionPath: previous.definitionPath, name: previous.name });
+    expect(files.get(previous.definitionPath)).toContain("<key>ProcessType</key>\n    <string>Standard</string>");
+    expect(files.get(previous.definitionPath)).not.toContain("<string>Background</string>");
+    expect(files.get(previous.bootstrapPath)).toBe(manager.plan!.bootstrapContent);
+    expect(run.mock.calls).toEqual([["launchctl", ["print", `gui/501/${previous.name}`]]]);
+  });
+
   test("enables Linux autostart and optional user lingering, then disables only the unit", () => {
     const files = new Map<string, string>();
     const calls: Array<[string, string[]]> = [];

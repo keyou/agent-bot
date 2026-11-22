@@ -441,7 +441,7 @@ ${argumentsXml}
     <key>KeepAlive</key>
     <false/>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
     <key>StandardOutPath</key>
     <string>${escapeXml(input.stdoutPath)}</string>
     <key>StandardErrorPath</key>
