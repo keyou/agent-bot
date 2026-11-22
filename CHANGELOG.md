@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-11-22
+
 - Automatically continue verified interrupted ordinary Codex/TraeX tasks after restart within a twenty-minute activity window, including non-user interruptions already marked stopped, using a persisted one-shot continuation in the original thread instead of replaying the original Prompt. Distinguish durable user Stop intent from interruption status, preserve Reset, newer-instruction and settings guards, and never resubmit ambiguous work. Duplicate status events do not extend the recovery window. Report recovery outcomes in the original conversation/topic and retain interruption explanations in cards and Preview; prevent legacy backfill from reviving durably stopped Turns.
 
 ## [0.1.25] - 2026-11-20
