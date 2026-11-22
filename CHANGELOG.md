@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.27-alpha.0] - 2026-11-22
+
 - Generate macOS LaunchAgents with `ProcessType=Standard` instead of `Background`, avoiding background scheduling for user-requested Agent and build work. Re-register existing Profiles with `agentbot server autostart enable`, then reload the LaunchAgent after active work has finished (for example by logging out and back in); an ordinary Agent Bot restart alone does not replace an already-loaded launchd policy.
 
 - Replace browser-terminal verification-code approvals with password login. Configure the password in owner-only Settings > Advanced or `terminal.password` (default `123456`); keep saved passwords out of cards, URLs and browser storage, rate-limit failed attempts, and retain source-conversation management cards, Shell recovery and safe-restart protections.
