@@ -22,6 +22,7 @@ function fixture(singleAgent = false) {
   dirs.push(dir);
   const file = path.join(dir, "config.yaml");
   const config = appConfigSchema.parse({
+    terminal: { password: "private-terminal-password" },
     feishu: { appSecret: "private-secret" },
     agents: {
       codex: {
@@ -104,6 +105,7 @@ describe("renderSettingsCard", () => {
         "private-secret",
         "private-token",
         "private-launch-command",
+        "private-terminal-password",
       ])
         expect(serialized).not.toContain(secret);
     },

@@ -9,9 +9,37 @@ const { Terminal: Xterm } = createRequire(import.meta.url)("@xterm/xterm") as ty
 const terminals: InstanceType<typeof Xterm>[] = [];
 afterEach(() => { for (const term of terminals.splice(0)) term.dispose(); vi.useRealTimers(); });
 
+test("empty passwords do not request a terminal and Enter submits the entered password", async () => {
+  const f = page();
+  const input = f.document.querySelector<HTMLInputElement>("#password")!;
+  expect(input.getAttribute("type")).toBe("password");
+  expect(input.getAttribute("autocomplete")).toBe("current-password");
+  input.value = "";
+  f.document.getElementById("welcome-connect")!.click();
+  expect(f.fetch).not.toHaveBeenCalled();
+  expect(f.document.getElementById("status")!.textContent).toBe("请输入终端密码");
+  input.value = "entered-secret";
+  input.dispatchEvent(Object.assign(new f.document.defaultView!.Event("keydown"), { key: "Enter" }));
+  await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
+  expect(JSON.parse(f.fetch.mock.calls[0]![1]!.body as string).password).toBe("entered-secret");
+  expect(f.stored.get(f.key)).not.toContain("entered-secret");
+  f.event("pagehide");
+});
+
+test("wrong passwords display the server error without saving a grant or automatically retrying", async () => {
+  vi.useFakeTimers(); const f = page();
+  f.fetch.mockImplementationOnce(async () => ({ ok: false, status: 401, json: async () => ({ error: "终端密码错误，请重新输入。" }) }));
+  f.document.getElementById("welcome-connect")!.click();
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(f.document.getElementById("status")!.textContent).toContain("终端密码错误");
+  expect(f.fetch).toHaveBeenCalledOnce(); expect(f.stored.has(f.key)).toBe(false); expect(f.sockets).toHaveLength(0);
+  f.event("pagehide");
+});
+
 function page(saved = false, origin = "https://preview.example", pathname = "/proxy/terminal/A7k2M9qR", recovery = false) {
   const base = "/proxy/terminal";
   const { document } = parseHTML(terminalPage(base, recovery));
+  document.querySelector<HTMLInputElement>("#password")!.value = "test-password";
   const windowEvents = new Map<string, () => void>();
   const documentEvents = new Map<string, () => void>();
   document.addEventListener = ((name: string, listener: () => void) => { documentEvents.set(name, listener); }) as typeof document.addEventListener;
@@ -19,7 +47,7 @@ function page(saved = false, origin = "https://preview.example", pathname = "/pr
   const key = "agentbot-terminal:" + pathname;
   if (saved) stored.set(key, JSON.stringify({ requestId: "saved", browserKey: "a".repeat(64) }));
   const sessionStorage = { getItem: (key: string) => stored.get(key), setItem: (key: string, value: string) => stored.set(key, value), removeItem: (key: string) => stored.delete(key) };
-  const fetch = vi.fn(async (url: string, _options?: RequestInit) => ({ ok: true, json: async () => url.endsWith("/request")
+  const fetch = vi.fn(async (url: string, _options?: RequestInit): Promise<{ ok: boolean; status?: number; json(): Promise<unknown> }> => ({ ok: true, json: async () => url.endsWith("/request")
     ? { requestId: "request", code: "123456" } : { state: "approved" } }));
   const sockets: Socket[] = [];
   class Socket {
@@ -60,14 +88,17 @@ function page(saved = false, origin = "https://preview.example", pathname = "/pr
   };
 }
 
-test.each(["connect", "welcome-connect"])("%s explicitly requests approval, displays code, streams input and closes independently", async (buttonId) => {
+test.each(["connect", "welcome-connect"])("%s submits the password, streams input and closes independently", async (buttonId) => {
   const f = page();
   expect(f.document.getElementById("details")!.textContent).toContain("网页断开 3 分钟后自动关闭 Shell");
   expect(f.document.getElementById("details")!.textContent).toContain("空闲 30 分钟或网页断开 3 分钟");
   expect(f.fetch).not.toHaveBeenCalled();
   f.document.getElementById(buttonId)!.click();
   await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
-  expect(f.document.getElementById("code")!.textContent).toContain("123456");
+  expect(JSON.parse(f.fetch.mock.calls[0]![1]!.body as string).password).toBe("test-password");
+  expect(f.document.querySelector<HTMLInputElement>("#password")!.value).toBe("");
+  expect(f.stored.get(f.key)).not.toContain("test-password");
+  expect(f.document.getElementById("code")).toBeNull();
   const ws = f.sockets[0]!; ws.onopen?.();
   expect(ws.url.toString()).toBe("wss://preview.example/proxy/terminal/socket");
   expect(f.document.getElementById("transport-warning")).toBeNull();
@@ -148,7 +179,7 @@ test("reconnecting reattaches the clipboard handler and stale input cannot reach
   f.event("pagehide");
 });
 
-test("welcome and header actions share their pending state and cannot duplicate approval requests", async () => {
+test("welcome and header actions share their pending state and cannot duplicate password requests", async () => {
   vi.useFakeTimers(); const f = page();
   const header = f.document.getElementById("connect")!;
   const welcome = f.document.querySelector<HTMLButtonElement>("#welcome #welcome-connect")!;
@@ -156,8 +187,7 @@ test("welcome and header actions share their pending state and cannot duplicate 
   f.fetch.mockImplementationOnce(() => new Promise((resolve) => {
     complete = () => resolve({ ok: true, json: async () => ({ requestId: "request", code: "123456" }) });
   }));
-  f.fetch.mockImplementation(async () => ({ ok: true, json: async () => ({ state: "pending" }) }));
-  expect(welcome.textContent).toBe("请求连接");
+  expect(welcome.textContent).toBe("连接");
   welcome.click();
   for (const button of [header, welcome]) expect(button.hasAttribute("disabled")).toBe(true);
   header.click(); welcome.click();
@@ -167,8 +197,8 @@ test("welcome and header actions share their pending state and cannot duplicate 
     expect(button.textContent).toBe("重新连接");
     expect(button.hasAttribute("disabled")).toBe(true);
   }
-  expect(f.document.getElementById("code")!.textContent).toContain("123456");
-  expect(f.sockets).toHaveLength(0);
+  expect(f.document.querySelector<HTMLInputElement>("#password")!.value).toBe("");
+  expect(f.sockets).toHaveLength(1);
   expect(f.fetch.mock.calls.filter(([url]) => url.endsWith("/request"))).toHaveLength(1);
   f.event("pagehide");
 });
@@ -179,9 +209,9 @@ test("a failed welcome request enables both actions and can be retried from the 
   const welcome = f.document.getElementById("welcome-connect")!;
   f.fetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
   welcome.click(); await vi.advanceTimersByTimeAsync(0);
-  expect(f.document.getElementById("status")!.textContent).toContain("请求授权失败");
+  expect(f.document.getElementById("status")!.textContent).toContain("连接失败");
   for (const button of [header, welcome]) {
-    expect(button.textContent).toBe("请求连接");
+    expect(button.textContent).toBe("连接");
     expect(button.hasAttribute("disabled")).toBe(false);
   }
   header.click(); await vi.advanceTimersByTimeAsync(0);
@@ -417,14 +447,14 @@ test("a query split at the replay/live boundary is answered only when its live s
   f.event("pagehide");
 });
 
-test("server-selected recovery mode requests approval for the exact terminal", async () => {
+test("server-selected recovery mode requests password access to the exact terminal", async () => {
   const pathname = "/proxy/terminal/B8j3N2pS";
   const f = page(false, "https://preview.example", pathname, true);
   expect(f.document.querySelector("#welcome h1")!.textContent).toBe("恢复已有终端");
-  expect(f.document.getElementById("connect")!.textContent).toBe("请求恢复连接");
-  expect(f.document.getElementById("welcome-connect")!.textContent).toBe("请求恢复连接");
+  expect(f.document.getElementById("connect")!.textContent).toBe("恢复连接");
+  expect(f.document.getElementById("welcome-connect")!.textContent).toBe("恢复连接");
   expect(f.document.getElementById("details")!.textContent).toContain("原会话的终端管理卡");
-  expect(f.document.getElementById("welcome")!.textContent).toContain("命令所在的飞书会话或话题");
+  expect(f.document.getElementById("welcome")!.textContent).toContain("终端密码");
   expect(f.fetch).not.toHaveBeenCalled();
   f.document.getElementById("welcome-connect")!.click();
   await vi.waitFor(() => expect(f.sockets).toHaveLength(1));

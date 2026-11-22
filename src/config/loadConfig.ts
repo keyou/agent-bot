@@ -31,7 +31,8 @@ updates:
 
 terminal:
   enabled: true
-  # Shares fileViewer host, port and publicBaseUrl; keeps independent owner authorization.
+  # Shares fileViewer networking. Set a strong password before exposing to other devices.
+  # password: "123456" # Default when omitted; configurable in /settings > Advanced.
 
 fileViewer:
   enabled: true

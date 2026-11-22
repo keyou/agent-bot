@@ -115,7 +115,7 @@ export class FeishuConnector {
         }
         const action = toCardAction(data);
         if (!action) {
-          this.logger.debug({ data }, "Ignored unsupported Feishu card action.");
+          this.logger.debug({ actionId: getEventId(data) }, "Ignored unsupported Feishu card action.");
           return {};
         }
 

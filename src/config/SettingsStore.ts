@@ -1,8 +1,8 @@
 import fs from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { isMap, parseDocument } from "yaml";
 import { z } from "zod";
-import { appConfigSchema, type AppConfig } from "./schema.js";
+import { appConfigSchema, DEFAULT_TERMINAL_PASSWORD, terminalPasswordSchema, type AppConfig } from "./schema.js";
 import type { ModelListResult, ModelProviderOption } from "../runtime/types.js";
 
 export interface SettingsCatalog extends ModelListResult {
@@ -20,7 +20,7 @@ export interface SettingsField {
   name: string;
   label: string;
   path: string[];
-  kind: "text" | "boolean" | "select" | "number";
+  kind: "text" | "boolean" | "select" | "number" | "secret";
   fallback: string | boolean | number;
   optional?: boolean;
   options?: Array<{ value: string; label: string }>;
@@ -240,6 +240,7 @@ function fieldsFor(
       return [
         bool("console", "本地控制台", ["console", "enabled"]),
         bool("terminal", "网页终端", ["terminal", "enabled"]),
+        field("terminalPassword", "终端密码", ["terminal", "password"], "secret", DEFAULT_TERMINAL_PASSWORD, terminalPasswordSchema),
         bool("preview", "文件与 Turn 预览", ["fileViewer", "enabled"]),
         field(
           "host",
@@ -292,6 +293,8 @@ const revisionOf = (contents: string) =>
   createHash("sha256").update(contents).digest("hex");
 
 export class SettingsStore {
+  private readonly secretRevisionKey = randomBytes(32);
+
   constructor(
     private readonly configPath: string,
     private readonly activeConfig: AppConfig,
@@ -358,7 +361,7 @@ export class SettingsStore {
     for (const entry of fields) {
       const raw = document.getIn(entry.path);
       const effective = getValue(config, entry.path) ?? entry.fallback;
-      values[entry.name] =
+      values[entry.name] = entry.kind === "secret" ? "" :
         entry.kind === "text" && typeof raw === "string"
           ? raw
           : typeof effective === "string" ||
@@ -368,7 +371,7 @@ export class SettingsStore {
             : entry.fallback;
       const active = getValue(this.activeConfig, entry.path) ?? entry.fallback;
       pendingRestart ||= effective !== active;
-      fieldRevisions[entry.name] = revisionOf(
+      const fieldRevision =
         JSON.stringify([
           entry.path,
           raw,
@@ -385,8 +388,10 @@ export class SettingsStore {
                       : config.agents[agentName]!.defaults.model,
               }
             : undefined,
-        ]),
-      );
+        ]);
+      fieldRevisions[entry.name] = entry.kind === "secret"
+        ? createHmac("sha256", this.secretRevisionKey).update(fieldRevision).digest("hex")
+        : revisionOf(fieldRevision);
     }
     return {
       section,

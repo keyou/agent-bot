@@ -84,14 +84,15 @@ function renderField(
     {
       tag: "input",
       name: entry.name,
-      default_value: String(value),
+      default_value: entry.kind === "secret" ? "" : String(value),
       behaviors,
       input_type: "text",
       ...(entry.kind === "number"
         ? { placeholder: plain("0：自动分配并复用") }
+        : entry.kind === "secret" ? { placeholder: plain("输入新密码，留空不修改；未设置时为 123456") }
         : {}),
       width: "fill",
-      max_length: entry.kind === "number" ? 5 : 1000,
+      max_length: entry.kind === "number" ? 5 : entry.kind === "secret" ? 256 : 1000,
     },
   ];
 }

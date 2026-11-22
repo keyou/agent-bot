@@ -11,17 +11,17 @@ test("command cards retain the independent terminal link in running and complete
       terminalUrl: "https://preview.example/terminal/A7k2M9qR",
     }));
     expect(card).toContain("[Open Terminal](https://preview.example/terminal/A7k2M9qR)");
-    expect(card).toContain("需在本会话由所有者授权");
+    expect(card).toContain("输入终端密码连接");
   }
 });
 
-test("terminal authorization explains privileges and carries explicit allow/deny decisions", () => {
-  const card = new CardRenderer().renderTerminalAuthorization({ contextKey: "chat_id:source:thread_id:topic", commandCardMessageId: "command", shellStarted: false, requestId: "request", terminalId: "terminal", approvalToken: "token", code: "123456", cwd: "/tmp", expiresAt: Date.now() + 300_000, reopenToken: "B8j3N2pS", reopenUrl: "https://preview.example/terminal/B8j3N2pS", recovery: false, state: "pending", connected: false });
-  expect(JSON.stringify(card)).toContain("系统用户权限");
+test("terminal management uses password links and has no approval decisions or password", () => {
+  const card = new CardRenderer().renderTerminalAuthorization({ contextKey: "chat_id:source:thread_id:topic", commandCardMessageId: "command", shellStarted: false, requestId: "request", terminalId: "terminal", approvalToken: "token", cwd: "/tmp", expiresAt: Date.now() + 300_000, reopenToken: "B8j3N2pS", reopenUrl: "https://preview.example/terminal/B8j3N2pS", recovery: false, state: "approved", connected: false });
+  expect(JSON.stringify(card)).toContain("输入终端密码");
+  expect(JSON.stringify(card)).not.toContain("验证码");
   const decisions = collectObjects(card).filter((item) => item.action === "terminal_authorize");
   expect(decisions).toEqual([
-    { action: "terminal_authorize", contextKey: "chat_id:source:thread_id:topic", requestId: "request", token: "token", decision: "allow" },
-    { action: "terminal_authorize", contextKey: "chat_id:source:thread_id:topic", requestId: "request", token: "token", decision: "deny" },
+    { action: "terminal_authorize", contextKey: "chat_id:source:thread_id:topic", requestId: "request", token: "token", decision: "close" },
     { action: "terminal_authorize", contextKey: "chat_id:source:thread_id:topic", requestId: "request", token: "token", decision: "refresh" },
   ]);
 });
@@ -62,24 +62,24 @@ test("source terminal management card retains reopen and close controls after th
   const closed = renderer.renderTerminalAuthorization({ ...view, state: "closed", message: "已关闭" });
   expect(JSON.stringify(closed)).not.toContain("重新打开终端");
   expect(collectObjects(closed).some((item) => item.decision === "close")).toBe(false);
-  const pending = JSON.stringify(renderer.renderTerminalAuthorization({ ...view, state: "pending" }));
-  expect(pending).toContain("恢复原 Shell，不创建新终端");
-  expect(pending).toContain("拒绝不影响原终端");
+  const pending = JSON.stringify(renderer.renderTerminalAuthorization({ ...view, state: "running" }));
+  expect(pending).toContain("恢复原 Shell");
+  expect(pending).not.toContain("验证码");
   const waiting = JSON.stringify(renderer.renderTerminalAuthorization({ ...view, shellStarted: false, state: "approved" }));
   expect(waiting).toContain("[打开终端](https://preview.example/terminal/B8j3N2pS)");
   expect(waiting).toContain("Shell 尚未启动");
   expect(waiting).not.toContain("可在这里");
-  const reopenUnstarted = JSON.stringify(renderer.renderTerminalAuthorization({ ...view, shellStarted: false, state: "pending" }));
-  expect(reopenUnstarted).toContain("继续打开同一个终端");
+  const reopenUnstarted = JSON.stringify(renderer.renderTerminalAuthorization({ ...view, shellStarted: false, state: "approved" }));
+  expect(reopenUnstarted).toContain("输入终端密码");
   expect(reopenUnstarted).not.toContain("恢复原 Shell");
 });
 
-test.each(["pending", "approved", "running", "closed"] as const)("terminal cards display the recovery token instead of an internal ID when %s", (state) => {
+test.each(["approved", "running", "closed"] as const)("terminal cards display the recovery token instead of an internal ID when %s", (state) => {
   for (const reopenToken of ["B8j3N2pS", "a_-Z9bQ2"]) {
     const requestId = "f".repeat(32), approvalToken = "e".repeat(64), terminalId = "a55ccf55".repeat(4);
     const card = new CardRenderer().renderTerminalAuthorization({
       contextKey: "chat_id:source", commandCardMessageId: "command", shellStarted: state === "running",
-      requestId, terminalId, approvalToken, code: "123456", cwd: "/tmp", expiresAt: 300_000,
+      requestId, terminalId, approvalToken, cwd: "/tmp", expiresAt: 300_000,
       reopenToken, reopenUrl: `https://preview.example/bot/terminal/${reopenToken}`, recovery: true, state, connected: false,
     });
     const contents = collectObjects(card).filter((item) => item.tag === "markdown").map((item) => item.content);

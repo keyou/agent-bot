@@ -10,7 +10,7 @@ export async function sendTerminalAuthorization(
   const card = new CardRenderer().renderTerminalAuthorization(view);
   if (isThreadContextKey(view.contextKey)) {
     if (!outbound.replyInteractiveCard || !view.commandCardMessageId) {
-      throw new Error("无法向原话题发送终端授权卡，请重新打开命令卡片。");
+      throw new Error("无法向原话题发送终端管理卡，请重新打开命令卡片。");
     }
     return outbound.replyInteractiveCard(view.contextKey, { messageId: view.commandCardMessageId, replyInThread: true }, card);
   }

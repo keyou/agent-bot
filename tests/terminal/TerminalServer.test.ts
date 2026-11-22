@@ -12,6 +12,67 @@ import type { TerminalProcess } from "../../src/terminal/TerminalProcess.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { try { for (const cleanup of cleanups.splice(0)) await cleanup(); } finally { vi.useRealTimers(); } });
 const jobId = "00000000-0000-4000-8000-000000000001";
+
+test("custom passwords are exact, do not expose credentials, and replace the default", async () => {
+  const f = await fixture();
+  const password = " custom-secret ";
+  Object.assign(f.options, { password: () => password });
+  for (const value of ["123456", password.trim()]) {
+    expect((await f.post("request", { launch: f.launch, browserKey: f.browserKey, password: value })).status).toBe(401);
+  }
+  const response = await f.post("request", { launch: f.launch, browserKey: f.browserKey, password });
+  expect(response.status).toBe(200);
+  const grant = await response.json() as { requestId: string };
+  expect(JSON.stringify(grant)).not.toContain(password);
+  const c = await f.connect({ ...grant, browserKey: f.browserKey });
+  await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
+  expect(JSON.stringify(f.requestApproval.mock.calls)).not.toContain(password);
+  expect(JSON.stringify([...f.options.logger.info.mock.calls, ...f.options.logger.warn.mock.calls])).not.toContain(password);
+});
+
+test("failed password attempts are limited before creating sessions and expire after one minute", async () => {
+  const f = await fixture();
+  for (let i = 0; i < 5; i++) {
+    expect((await f.post("request", { launch: f.launch, browserKey: f.browserKey, password: "wrong" })).status).toBe(401);
+  }
+  expect((await f.post("request", { launch: f.launch, browserKey: f.browserKey, password: "123456" })).status).toBe(429);
+  expect(f.readJob).not.toHaveBeenCalled(); expect(f.requestApproval).not.toHaveBeenCalled();
+  f.tick(60_000);
+  const grant = await f.request();
+  const c = await f.connect(grant);
+  await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
+});
+
+test("changing the configured password revokes previous browser grants", async () => {
+  const f = await fixture();
+  let password = "123456";
+  Object.assign(f.options, { password: () => password });
+  const grant = await f.request();
+  const c = await f.connect(grant);
+  await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
+  password = "changed-password";
+  expect(await (await f.post("status", grant)).json()).toMatchObject({ state: "closed" });
+  expect(f.pty.kill).toHaveBeenCalledOnce();
+  const late = await f.connect(grant);
+  await vi.waitFor(() => expect(late.messages[0]?.type).toBe("error"));
+  expect(f.spawn).toHaveBeenCalledOnce();
+});
+
+test.each([undefined, "wrong-password", "123456"])("password login validates %s before issuing browser credentials", async (password) => {
+  const f = await fixture();
+  const response = await f.post("request", { launch: f.launch, browserKey: f.browserKey, password });
+  expect(response.status).toBe(password === "123456" ? 200 : 401);
+  if (response.status === 200) {
+    const credentials = { ...await response.json() as { requestId: string }, browserKey: f.browserKey };
+    expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "approved" });
+    const c = await f.connect(credentials);
+    await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
+    expect(f.requestApproval.mock.calls[0]?.[0].state).toBe("approved");
+  } else {
+    expect(f.readJob).not.toHaveBeenCalled();
+    expect(f.requestApproval).not.toHaveBeenCalled();
+  }
+});
 async function fixture(publicBaseUrl?: string, host = "127.0.0.1") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentbot-terminal-"));
   let now = Date.now();
@@ -56,7 +117,8 @@ async function fixture(publicBaseUrl?: string, host = "127.0.0.1") {
   const launch = new URL(server.createUrl(jobId)!).pathname;
   const browserKey = randomBytes(32).toString("hex");
   const post = (route: string, body: unknown, origin = base.origin) => fetchPage(new URL(base.pathname + "/api/" + route, base), {
-    method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify(body),
+    method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
+    body: JSON.stringify(route === "request" ? { password: "123456", ...body as object } : body),
   });
   const request = async () => {
     const response = await post("request", { launch, browserKey });
@@ -65,7 +127,7 @@ async function fixture(publicBaseUrl?: string, host = "127.0.0.1") {
   };
   const approve = (overrides = {}) => server.resolveApproval({
     actionId: "action", contextKey: "chat_id:source:thread_id:topic", userId: "ou_owner", messageId: approvalCardId,
-    value: { requestId: authorization.requestId, token: authorization.approvalToken, decision: "allow" }, ...overrides,
+    value: { requestId: authorization.requestId, token: authorization.approvalToken, decision: "refresh" }, ...overrides,
   });
   const clients: WebSocket[] = [];
   const connect = async (credentials: unknown, origin = base.origin) => {
@@ -95,7 +157,7 @@ test("opening the command link only loads the page and assets; it never launches
   expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
   expect(response.headers.get("content-security-policy")).toContain(`connect-src 'self' ${f.base.origin.replace(/^http/u, "ws")}`);
   expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-  expect(await response.text()).toContain("请求连接");
+  expect(await response.text()).toContain('type="password"');
   for (const asset of ["xterm.js", "xterm.css", "fit.js", "terminal.js", "terminal.css"]) {
     expect((await f.fetchPage(new URL(f.base.pathname + "/assets/" + asset, f.base))).status).toBe(200);
   }
@@ -104,13 +166,11 @@ test("opening the command link only loads the page and assets; it never launches
   expect((await f.fetchPage(new URL("/preview/anything", f.base))).status).toBe(404);
 });
 
-test("only the owner, matching approval card, and private browser credential authorize a shell", async () => {
+test("password grants browser access while management remains owner and card scoped", async () => {
   const f = await fixture(); const credentials = await f.request();
   expect(f.spawn).not.toHaveBeenCalled();
   await expect(f.approve({ userId: "ou_other" })).rejects.toThrow("无效");
   await expect(f.approve({ messageId: "forwarded-card" })).rejects.toThrow("无效");
-  const unauthorized = await f.connect(credentials);
-  await vi.waitFor(() => expect(unauthorized.messages[0]?.type).toBe("error"));
   await f.approve();
   expect(f.spawn).not.toHaveBeenCalled();
   await f.post("status", credentials);
@@ -170,10 +230,9 @@ test.each(["http://10.23.45.67:1423/proxy", "https://preview.example/bot"])("sha
   expect(fs.existsSync(path.join(f.options.stateDirectory, "port"))).toBe(false);
 });
 
-test("authorization expires and rejected requests cannot spawn", async () => {
+test("an unused password grant expires without spawning a shell", async () => {
   const f = await fixture(); const credentials = await f.request();
   f.tick(5 * 60_000);
-  await expect(f.approve()).rejects.toThrow();
   expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "closed" });
   expect(f.spawn).not.toHaveBeenCalled();
 });
@@ -587,9 +646,9 @@ test("restart closure during startup retains the blocker until the late PTY exit
   expect(f.server.activeCount).toBe(1); f.exit(); expect(f.server.activeCount).toBe(0);
 });
 
-test("denial, session caps and restart gating prevent new shells", async () => {
+test("closure, session caps and restart gating prevent new shells", async () => {
   const f = await fixture(); const credentials = await f.request();
-  await f.approve({ value: { requestId: f.authorization().requestId, token: f.authorization().approvalToken, decision: "deny" } });
+  await f.approve({ value: { requestId: f.authorization().requestId, token: f.authorization().approvalToken, decision: "close" } });
   const denied = await f.connect(credentials);
   await vi.waitFor(() => expect(denied.messages[0]?.type).toBe("error"));
   expect(f.spawn).not.toHaveBeenCalled();
@@ -686,17 +745,15 @@ test("source routing is captured from the command and retained for recovery, nev
 
 test("an approved terminal can reopen before its first connection without creating a second session or Shell", async () => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization();
-  expect(await f.approve()).toContain("打开终端");
+  await f.approve();
   expect(f.options.updateCard.mock.lastCall?.[1]).toMatchObject({ state: "approved", shellStarted: false, reopenUrl: management.reopenUrl });
   expect(f.spawn).not.toHaveBeenCalled(); f.tick(11_000);
   const browserKey = randomBytes(32).toString("hex");
   const response = await f.post("request", { launch: new URL(management.reopenUrl).pathname, browserKey });
   expect(response.status).toBe(200);
   const recovered = { ...await response.json() as { requestId: string }, browserKey };
-  expect(f.authorization()).toMatchObject({ terminalId: original.requestId, state: "pending", recovery: true, shellStarted: false });
-  expect(await (await f.post("status", original)).json()).toMatchObject({ state: "approved" });
-  const unauthorized = await f.connect(recovered);
-  await vi.waitFor(() => expect(unauthorized.messages[0]?.type).toBe("error"));
+  expect(f.authorization()).toMatchObject({ terminalId: original.requestId, state: "approved", recovery: true, shellStarted: false });
+  expect((await f.post("status", original)).status).toBe(400);
   expect(f.spawn).not.toHaveBeenCalled();
   await expect(f.approve({ userId: "ou_other" })).rejects.toThrow("无效");
   await f.approve();
@@ -707,25 +764,25 @@ test("an approved terminal can reopen before its first connection without creati
   expect(f.options.updateCard.mock.lastCall?.[1]).toMatchObject({ state: "running", terminalId: original.requestId });
 });
 
-test.each(["deny", "browser-close"])("unstarted terminal recovery %s preserves original authorization", async (decision) => {
+test.each(["wrong-password", undefined])("unstarted recovery with password %s preserves original access", async (password) => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve(); f.tick(11_000);
   const browserKey = randomBytes(32).toString("hex");
-  const response = await f.post("request", { launch: new URL(management.reopenUrl).pathname, browserKey });
-  const recovered = { ...await response.json() as { requestId: string }, browserKey };
-  if (decision === "deny") await f.approve({ value: { requestId: recovered.requestId, token: f.authorization().approvalToken, decision } });
-  else await f.post("close", recovered);
+  const response = await f.post("request", { launch: new URL(management.reopenUrl).pathname, browserKey, password });
+  expect(response.status).toBe(401);
   expect(await (await f.post("status", original)).json()).toMatchObject({ state: "approved" });
-  expect(await (await f.post("status", recovered)).json()).toMatchObject({ state: "closed" });
   const next = await f.connect(original); await vi.waitFor(() => expect(next.messages[0]?.type).toBe("ready"));
   expect(f.spawn).toHaveBeenCalledOnce();
 });
 
-test("unstarted recovery cannot bypass restart gating at request or approval time", async () => {
+test("unstarted password recovery cannot bypass restart gating at request or connection time", async () => {
   const f = await fixture(); await f.request(); const management = f.authorization(); await f.approve(); f.tick(11_000);
   const launch = new URL(management.reopenUrl).pathname;
-  expect((await f.post("request", { launch, browserKey: f.browserKey })).status).toBe(200);
+  const response = await f.post("request", { launch, browserKey: f.browserKey });
+  expect(response.status).toBe(200);
+  const recovered = { ...await response.json() as { requestId: string }, browserKey: f.browserKey };
   f.blockStart();
-  await expect(f.approve()).rejects.toThrow("重启");
+  const blocked = await f.connect(recovered);
+  await vi.waitFor(() => expect(blocked.messages[0]?.message).toContain("重启"));
   f.tick(11_000);
   expect((await f.post("request", { launch, browserKey: f.browserKey })).status).toBe(400);
   expect(f.spawn).not.toHaveBeenCalled();
@@ -735,9 +792,9 @@ test.each(["close", "expire"])("an unstarted terminal that ends before recovery 
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve(); f.tick(11_000);
   const response = await f.post("request", { launch: new URL(management.reopenUrl).pathname, browserKey: f.browserKey });
   const recovered = { ...await response.json() as { requestId: string }, browserKey: f.browserKey };
-  if (reason === "close") await f.post("close", original);
+  if (reason === "close") await f.post("close", recovered);
   else f.tick(300_000);
-  await expect(f.approve()).rejects.toThrow();
+  await expect(f.approve({ value: { requestId: f.authorization().requestId, token: f.authorization().approvalToken, decision: "allow" } })).rejects.toThrow();
   const next = await f.connect(recovered); await vi.waitFor(() => expect(next.messages[0]?.type).toBe("error"));
   expect(f.spawn).not.toHaveBeenCalled();
 });
@@ -749,7 +806,7 @@ test("a missing source conversation fails closed rather than delivering elsewher
   expect(f.requestApproval).not.toHaveBeenCalled(); expect(f.spawn).not.toHaveBeenCalled();
 });
 
-test("owner can reopen a lost tab with new approval and close its original Shell from Feishu", async () => {
+test("password reopens a lost tab and the owner can close its original Shell from Feishu", async () => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve();
   const first = await f.connect(original); await vi.waitFor(() => expect(first.messages[0]?.type).toBe("ready"));
   first.ws.close(); f.data("keep my shell"); f.tick(11_000); f.blockStart();
@@ -759,11 +816,9 @@ test("owner can reopen a lost tab with new approval and close its original Shell
   const response = await f.post("request", { launch, browserKey });
   expect(response.status).toBe(200);
   const recovered = { ...await response.json() as { requestId: string }, browserKey };
-  expect(await (await f.post("status", recovered)).json()).toMatchObject({ state: "pending" });
+  expect(await (await f.post("status", recovered)).json()).toMatchObject({ state: "running" });
   expect(f.authorization().recovery).toBe(true);
   expect(f.authorization().reopenUrl).toBe(management.reopenUrl);
-  const unauthorized = await f.connect(recovered);
-  await vi.waitFor(() => expect(unauthorized.messages[0]?.type).toBe("error"));
   await f.approve();
   const next = await f.connect(recovered);
   await vi.waitFor(() => expect(next.messages[0]).toMatchObject({ type: "ready", output: "keep my shell", replay: true }));
@@ -779,21 +834,16 @@ test("owner can reopen a lost tab with new approval and close its original Shell
   expect(f.spawn).toHaveBeenCalledOnce();
 });
 
-test("denied, expired and browser-cancelled recovery requests never close or revoke the original Shell", async () => {
+test("wrong recovery passwords never close or revoke the original Shell", async () => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve();
   const first = await f.connect(original); await vi.waitFor(() => expect(first.messages[0]?.type).toBe("ready"));
   const launch = new URL(management.reopenUrl).pathname;
-  for (const decision of ["deny", "expire", "browser-close"] as const) {
+  for (const password of ["incorrect", undefined, ""] as const) {
     f.tick(11_000);
     const browserKey = randomBytes(32).toString("hex");
-    const response = await f.post("request", { launch, browserKey });
-    expect(response.status).toBe(200);
-    const pending = { ...await response.json() as { requestId: string }, browserKey };
-    if (decision === "deny") await f.approve({ value: { requestId: pending.requestId, token: f.authorization().approvalToken, decision: "deny" } });
-    else if (decision === "expire") { f.tick(300_000); await expect(f.approve()).rejects.toThrow(); }
-    else await f.post("close", pending);
+    const response = await f.post("request", { launch, browserKey, password });
+    expect(response.status).toBe(401);
     expect(await (await f.post("status", original)).json()).toMatchObject({ state: "running" });
-    expect(await (await f.post("status", pending)).json()).toMatchObject({ state: "closed" });
     expect(f.pty.kill).not.toHaveBeenCalled();
   }
 });
@@ -808,7 +858,8 @@ test("recovery keeps the displayed terminal token while rotating browser access 
     const current = { ...await response.json() as { requestId: string; code: string }, browserKey };
     expect(current.requestId).not.toBe(previous.requestId);
     expect(f.authorization()).toMatchObject({ terminalId: management.terminalId, reopenToken: management.reopenToken, reopenUrl: management.reopenUrl });
-    expect(await (await f.post("status", previous)).json()).toMatchObject({ state: "running" });
+    const previousStatus = await f.post("status", previous);
+    expect(previousStatus.status === 400 || (await previousStatus.json()).state === "closed").toBe(true);
     await f.approve();
     const client = await f.connect(current); await vi.waitFor(() => expect(client.messages[0]?.type).toBe("ready"));
     const rejected = await f.connect(previous); await vi.waitFor(() => expect(rejected.messages[0]?.type).toBe("error"));
@@ -839,17 +890,17 @@ test("failed recovery notifications, invalid links and wrong cards cannot distur
   await expect(f.approve({ userId: "ou_intruder" })).rejects.toThrow();
   const closePending = { requestId: f.authorization().requestId, token: f.authorization().approvalToken, decision: "close" };
   await f.approve({ value: closePending });
-  expect(f.pty.kill).not.toHaveBeenCalled(); expect(f.server.activeCount).toBe(1);
+  expect(f.pty.kill).toHaveBeenCalledOnce(); expect(f.server.activeCount).toBe(0);
 });
 
-test("terminal close invalidates pending recovery and late approvals never respawn it", async () => {
+test("terminal close invalidates password recovery and legacy approvals never respawn it", async () => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve();
   const first = await f.connect(original); await vi.waitFor(() => expect(first.messages[0]?.type).toBe("ready"));
   f.tick(11_000);
   const response = await f.post("request", { launch: new URL(management.reopenUrl).pathname, browserKey: f.browserKey });
   const recovery = { ...await response.json() as { requestId: string }, browserKey: f.browserKey };
-  await f.post("close", original);
-  await expect(f.approve()).rejects.toThrow();
+  await f.post("close", recovery);
+  await expect(f.approve({ value: { requestId: f.authorization().requestId, token: f.authorization().approvalToken, decision: "allow" } })).rejects.toThrow();
   expect(await (await f.post("status", recovery)).json()).toMatchObject({ state: "closed" });
   const c = await f.connect(recovery); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("error"));
   expect(f.spawn).toHaveBeenCalledOnce();

@@ -4,8 +4,8 @@ import type { TerminalCardView } from "../../src/terminal/TerminalServer.js";
 
 const view: TerminalCardView = {
   contextKey: "chat_id:source:thread_id:topic", commandCardMessageId: "original-command-card", shellStarted: false,
-  requestId: "request", terminalId: "terminal", approvalToken: "token", code: "123456", cwd: "/workspace",
-  expiresAt: 99999, reopenToken: "B8j3N2pS", reopenUrl: "https://preview.example/terminal/B8j3N2pS", recovery: false, state: "pending", connected: false,
+  requestId: "request", terminalId: "terminal", approvalToken: "token", cwd: "/workspace",
+  expiresAt: 99999, reopenToken: "B8j3N2pS", reopenUrl: "https://preview.example/terminal/B8j3N2pS", recovery: false, state: "approved", connected: false,
 };
 
 test.each([false, true])("authorization stays in the original topic (recovery=%s)", async (recovery) => {

@@ -16,9 +16,9 @@ import { agentConfigSchema, appConfigSchema } from "../../src/config/schema.js";
 describe("loadConfig", () => {
   test("shares Preview networking for terminals and allows disabling them", () => {
     const minimal = { feishu: {}, agents: { codex: { title: "Codex", command: "codex" } } };
-    expect(appConfigSchema.parse(minimal).terminal).toEqual({ enabled: true });
+    expect(appConfigSchema.parse(minimal).terminal).toEqual({ enabled: true, password: "123456" });
     expect(appConfigSchema.parse({ ...minimal, terminal: { enabled: false } }).terminal.enabled).toBe(false);
-    expect(loadConfig(path.resolve("config.example.yaml")).terminal).toEqual({ enabled: true });
+    expect(loadConfig(path.resolve("config.example.yaml")).terminal).toEqual({ enabled: true, password: "123456" });
   });
   test("enables daily stable updates by default and permits disabling them", () => {
     const minimal = { feishu: {}, agents: { codex: { title: "Codex", command: "codex" } } };

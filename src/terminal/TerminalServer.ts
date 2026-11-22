@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
@@ -8,6 +8,7 @@ import path from "node:path";
 import type { Logger } from "pino";
 import { WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
+import { DEFAULT_TERMINAL_PASSWORD } from "../config/schema.js";
 import type { CardAction } from "../feishu/types.js";
 import { spawnTerminal, type TerminalProcess, type TerminalSpawner } from "./TerminalProcess.js";
 import { terminalPage, TERMINAL_CSS, TERMINAL_SCRIPT } from "./TerminalPage.js";
@@ -30,11 +31,11 @@ const frame = z.discriminatedUnion("type", [
 ]);
 
 export interface TerminalAuthorization {
-  requestId: string; approvalToken: string; code: string; cwd: string; expiresAt: number;
+  requestId: string; approvalToken: string; cwd: string; expiresAt: number;
 }
 export interface TerminalCardView extends TerminalAuthorization {
   contextKey: string; commandCardMessageId: string; shellStarted: boolean;
-  terminalId: string; reopenToken: string; reopenUrl: string; recovery: boolean; state: "pending" | "approved" | "running" | "closed";
+  terminalId: string; reopenToken: string; reopenUrl: string; recovery: boolean; state: "approved" | "running" | "closed";
   connected: boolean; message?: string;
 }
 export interface ActiveTerminal {
@@ -45,6 +46,7 @@ export interface ActiveTerminal {
 export interface TerminalServerOptions {
   stateDirectory: string;
   ownerId(): string | undefined;
+  password?(): string;
   canStart?(): boolean;
   readJob(jobId: string): Promise<{ cwd: string; contextKey: string; cardMessageId?: string }>;
   requestApproval(authorization: TerminalCardView): Promise<string | undefined>;
@@ -56,9 +58,9 @@ export interface TerminalServerOptions {
 interface TerminalSession extends TerminalAuthorization {
   reopenToken: string;
   contextKey: string; commandCardMessageId: string;
-  ownerId: string; keyHash: Buffer; createdAt: number; lastActivity: number;
+  ownerId: string; keyHash: Buffer; passwordHash: Buffer; createdAt: number; lastActivity: number;
   activeAccessId: string;
-  state: "pending" | "approved" | "running" | "closed";
+  state: "approved" | "running" | "closed";
   message?: string; cardId?: string; pty?: TerminalProcess; socket?: WebSocket;
   starting?: Promise<void>; output: string;
   attached?: boolean;
@@ -69,7 +71,7 @@ interface TerminalSession extends TerminalAuthorization {
 }
 interface TerminalRecovery extends TerminalAuthorization {
   targetId: string; ownerId: string; keyHash: Buffer; cardId?: string;
-  state: "pending" | "approved" | "closed"; message?: string;
+  state: "approved" | "closed"; message?: string;
 }
 
 export class TerminalServer {
@@ -79,6 +81,7 @@ export class TerminalServer {
   private readonly recoveries = new Map<string, TerminalRecovery>();
   private cardUpdates = Promise.resolve();
   private readonly requests: number[] = [];
+  private readonly passwordFailures: Array<{ address: string; at: number }> = [];
   private timer?: NodeJS.Timeout;
   private links?: TerminalLinks;
   private base?: URL;
@@ -189,32 +192,7 @@ export class TerminalServer {
       this.publishCards(session); await this.cardUpdates;
       return recovery?.state === "closed" && session.state !== "closed" ? "恢复连接请求已取消，原终端不受影响。" : "终端已关闭。";
     }
-    if (authorization.state !== "pending") throw new Error("该终端授权已处理或过期，请查看原会话中的终端管理卡。");
-    if (action.value.decision === "allow") {
-      if (recovery) {
-        if (!this.canReopen(session)) throw new Error("原终端已结束，不能恢复。");
-        if (session.state === "approved") {
-          this.assertCanStart();
-          session.expiresAt = this.now() + AUTH_TTL;
-        }
-        for (const other of this.recoveries.values()) {
-          if (other.targetId === session.requestId && other !== recovery && other.state !== "closed") this.closeRecovery(other, "已由另一网页恢复连接");
-        }
-        recovery.state = "approved"; session.activeAccessId = recovery.requestId;
-        session.socket?.close(1000, "Reconnected from another page"); session.socket = undefined;
-        this.markDisconnected(session);
-      } else session.state = "approved";
-      this.publishCards(session); await this.cardUpdates;
-      this.options.logger.info({ requestId: session.requestId }, "Terminal authorized by owner.");
-      return session.state === "approved"
-        ? "已授权，请返回网页连接；若原网页已关闭，点击本卡片的“打开终端”。"
-        : "已授权，请返回网页；也可点击本卡片的“重新打开终端”或“关闭终端”。";
-    }
-    if (action.value.decision !== "deny") throw new Error("无效的终端授权操作。");
-    if (recovery) this.closeRecovery(recovery, "恢复连接已拒绝，原终端不受影响");
-    else this.disposeSession(session, "终端授权已拒绝");
-    this.publishCards(session); await this.cardUpdates;
-    return "已拒绝终端连接。";
+    throw new Error("请在网页中输入终端密码连接；此卡片仅用于管理终端。");
   }
 
   async close(): Promise<void> {
@@ -264,8 +242,8 @@ export class TerminalServer {
   }
   private cardView(session: TerminalSession, recovery?: TerminalRecovery): TerminalCardView {
     const auth = recovery ?? session;
-    const state = recovery && recovery.state !== "approved" ? recovery.state : session.state;
-    return { requestId: auth.requestId, approvalToken: auth.approvalToken, code: auth.code, cwd: session.cwd,
+    const state = recovery?.state === "closed" ? "closed" : session.state;
+    return { requestId: auth.requestId, approvalToken: auth.approvalToken, cwd: session.cwd,
       contextKey: session.contextKey, commandCardMessageId: session.commandCardMessageId, shellStarted: Boolean(session.pty),
       expiresAt: auth.expiresAt, terminalId: session.requestId, reopenToken: session.reopenToken, reopenUrl: this.reopenUrl(session), recovery: Boolean(recovery), state,
       connected: session.socket?.readyState === WebSocket.OPEN, message: recovery?.message ?? session.message };
@@ -303,7 +281,7 @@ export class TerminalServer {
   }
   private authenticated(value: unknown): TerminalSession {
     const { authorization, session } = this.access(value);
-    if (authorization.state === "pending" || authorization.state === "closed" || session.activeAccessId !== authorization.requestId) {
+    if (authorization.state === "closed" || session.activeAccessId !== authorization.requestId) {
       throw new Error("终端尚未授权、已结束或已由其他网页恢复。");
     }
     return session;
@@ -335,7 +313,20 @@ export class TerminalServer {
     }
     const data = await readJson(req);
     if (route === "/api/request") {
-      const parsed = z.object({ launch: z.string().max(300), browserKey: KEY }).parse(data);
+      const result = z.object({ launch: z.string().max(300), browserKey: KEY, password: z.string().max(256).optional() }).safeParse(data);
+      if (!result.success) { this.json(res, 400, { error: "终端连接参数无效。" }); return; }
+      const parsed = result.data;
+      const now = this.now();
+      const address = req.socket.remoteAddress ?? "unknown";
+      while (this.passwordFailures[0] && this.passwordFailures[0].at <= now - 60_000) this.passwordFailures.shift();
+      if (this.passwordFailures.length >= 50 || this.passwordFailures.filter((failure) => failure.address === address).length >= 5) {
+        this.json(res, 429, { error: "密码尝试过于频繁，请一分钟后重试。" }); return;
+      }
+      const passwordHash = hash(this.options.password?.() ?? DEFAULT_TERMINAL_PASSWORD);
+      if (parsed.password === undefined || !timingSafeEqual(hash(parsed.password), passwordHash)) {
+        this.passwordFailures.push({ address, at: now });
+        this.json(res, 401, { error: "终端密码错误，请重新输入。" }); return;
+      }
       const resumeId = this.resumeId(parsed.launch);
       const jobId = this.launchJob(parsed.launch);
       const ownerId = this.options.ownerId();
@@ -345,41 +336,51 @@ export class TerminalServer {
         throw new Error("原终端尚未授权、已结束或服务已重启；请从原命令卡片创建新终端。");
       }
       if (!existing || existing.state === "approved") this.assertCanStart();
-      const now = this.now();
       while (this.requests[0] !== undefined && this.requests[0] < now - 3600_000) this.requests.shift();
       if (this.requests.length >= 20 || (this.requests.length > 0 && now - this.requests.at(-1)! < 10_000)
-        || (existing ? [...this.recoveries.values()].filter((r) => r.state === "pending").length >= 3
-          : [...this.sessions.values()].filter((s) => s.state !== "closed").length >= 3)) {
+        || (!existing && [...this.sessions.values()].filter((s) => s.state !== "closed").length >= 3)) {
         this.json(res, 429, { error: "终端请求过于频繁或已达 3 个会话上限，请稍后重试。" }); return;
       }
       this.requests.push(now);
       if (existing) {
         const recovery: TerminalRecovery = { requestId: randomBytes(16).toString("hex"), targetId: existing.requestId, ownerId,
-          keyHash: hash(parsed.browserKey), approvalToken: randomBytes(32).toString("hex"), code: String(randomInt(100000, 1000000)),
-          cwd: existing.cwd, expiresAt: now + AUTH_TTL, state: "pending" };
+          keyHash: hash(parsed.browserKey), approvalToken: randomBytes(32).toString("hex"),
+          cwd: existing.cwd, expiresAt: now + AUTH_TTL, state: "approved" };
         this.recoveries.set(recovery.requestId, recovery);
         try {
           recovery.cardId = await this.options.requestApproval(this.cardView(existing, recovery));
-          if (!recovery.cardId) throw new Error("无法发送飞书授权卡片。");
-        } catch (error) { this.closeRecovery(recovery, "恢复授权通知失败"); throw error; }
-        if (existing.state !== "running" || recovery.state !== "pending") this.publishCards(existing);
-        this.json(res, 200, { requestId: recovery.requestId, code: recovery.code }); return;
+          if (!recovery.cardId) throw new Error("无法发送终端管理卡片。");
+          if (!this.canReopen(existing) || existing.ownerId !== this.options.ownerId()
+            || !timingSafeEqual(passwordHash, hash(this.options.password?.() ?? DEFAULT_TERMINAL_PASSWORD))) {
+            throw new Error("终端已结束或连接设置已变化，请重新连接。");
+          }
+          if (existing.state === "approved") { this.assertCanStart(); existing.expiresAt = this.now() + AUTH_TTL; }
+        } catch (error) { this.closeRecovery(recovery, "恢复连接未完成，原终端不受影响"); this.publishCards(existing); throw error; }
+        for (const other of this.recoveries.values()) {
+          if (other !== recovery && other.targetId === existing.requestId && other.state !== "closed") this.closeRecovery(other, "已由另一网页恢复连接");
+        }
+        existing.activeAccessId = recovery.requestId;
+        existing.socket?.close(1000, "Reconnected from another page"); existing.socket = undefined;
+        this.markDisconnected(existing);
+        this.publishCards(existing);
+        this.json(res, 200, { requestId: recovery.requestId }); return;
       }
       const job = await this.options.readJob(jobId!);
       this.assertCanStart();
       if (!job.cardMessageId || !job.contextKey?.trim()) throw new Error("命令卡片或原始会话信息尚未就绪。");
       const requestId = randomBytes(16).toString("hex");
       const session: TerminalSession = { requestId, reopenToken: this.links!.createRecovery(), activeAccessId: requestId, ownerId, cwd: job.cwd, keyHash: hash(parsed.browserKey),
+        passwordHash,
         contextKey: job.contextKey, commandCardMessageId: job.cardMessageId,
-        approvalToken: randomBytes(32).toString("hex"), code: String(randomInt(100000, 1000000)),
-        createdAt: now, lastActivity: now, expiresAt: now + AUTH_TTL, state: "pending", output: "" };
+        approvalToken: randomBytes(32).toString("hex"),
+        createdAt: now, lastActivity: now, expiresAt: now + AUTH_TTL, state: "approved", output: "" };
       this.sessions.set(requestId, session);
       try {
         session.cardId = await this.options.requestApproval(this.cardView(session));
-        if (!session.cardId) throw new Error("无法发送飞书授权卡片。");
-        if (session.state !== "pending") this.publishCards(session);
-      } catch (error) { this.disposeSession(session, "授权通知失败"); throw error; }
-      this.json(res, 200, { requestId, code: session.code }); return;
+        if (!session.cardId) throw new Error("无法发送终端管理卡片。");
+        this.publishCards(session);
+      } catch (error) { this.disposeSession(session, "终端管理卡发送失败"); throw error; }
+      this.json(res, 200, { requestId }); return;
     }
     if (route !== "/api/status" && route !== "/api/close") { this.json(res, 404, { error: "Not found." }); return; }
     const { authorization, session } = this.access(data);
@@ -490,14 +491,11 @@ export class TerminalServer {
     const now = this.now();
     for (const recovery of this.recoveries.values()) {
       const target = this.sessions.get(recovery.targetId);
-      if (recovery.state === "pending" && now >= recovery.expiresAt) {
-        this.closeRecovery(recovery, "恢复授权已过期，原终端不受影响");
-        if (target) this.publishCards(target);
-      }
       if (!target || (recovery.state === "closed" && now >= recovery.expiresAt + AUTH_TTL)) this.recoveries.delete(recovery.requestId);
     }
     for (const s of this.sessions.values()) {
-      if (s.ownerId !== this.options.ownerId() || now - s.createdAt >= MAX_TTL
+      if (s.ownerId !== this.options.ownerId() || !timingSafeEqual(s.passwordHash, hash(this.options.password?.() ?? DEFAULT_TERMINAL_PASSWORD))
+        || now - s.createdAt >= MAX_TTL
         || (s.state !== "running" && s.state !== "closed" && now >= s.expiresAt)) {
         this.disposeSession(s, "终端已超时或授权已失效，请重新连接");
       }

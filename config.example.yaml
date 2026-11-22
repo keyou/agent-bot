@@ -21,10 +21,11 @@ console:
 updates:
   enabled: true
 
-# Interactive terminal: independent authorization, not a read-only Preview.
+# Interactive terminal: password-protected Shell, not a read-only Preview.
 terminal:
   enabled: true
-  # Shares fileViewer host, port and publicBaseUrl; keeps independent owner authorization.
+  # Shares fileViewer networking. Set a strong password before exposing to other devices.
+  # password: "123456" # Default when omitted; configurable in /settings > Advanced.
 
 # Signed, read-only pages for local files referenced in Agent replies.
 fileViewer:

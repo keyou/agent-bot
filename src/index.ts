@@ -8,6 +8,7 @@ import { LocalControlServer } from "./cli/LocalControlServer.js";
 import { controlEndpoint, type ControlRequest, type ControlResponse } from "./cli/controlProtocol.js";
 import { readPackageVersion } from "./cli/packageVersion.js";
 import { loadConfig } from "./config/loadConfig.js";
+import { DEFAULT_TERMINAL_PASSWORD } from "./config/schema.js";
 import { SettingsStore } from "./config/SettingsStore.js";
 import { persistFeishuUserOpenIdIfMissing } from "./config/FeishuUserOpenIdStore.js";
 import {
@@ -244,6 +245,7 @@ if (feishuOutbound && localFileViewer && config.terminal?.enabled !== false) {
   const server = new TerminalServer({
     stateDirectory: path.join(path.dirname(config.storage.sqlitePath), "terminal"),
     ownerId: () => config.feishu.userOpenId,
+    password: () => config.terminal?.password ?? DEFAULT_TERMINAL_PASSWORD,
     canStart: () => !shuttingDown && !restartRequested && !safeRestart.scheduled && !safeRestart.restarting,
     readJob: (jobId) => shellCommandJobs.readJob(jobId),
     requestApproval: (authorization) => sendTerminalAuthorization(feishuOutbound, authorization),
@@ -253,7 +255,7 @@ if (feishuOutbound && localFileViewer && config.terminal?.enabled !== false) {
   try {
     const publicBaseUrl = await server.start(localFileViewer);
     terminalServer = server;
-    logger.info({ publicBaseUrl }, "Interactive terminal service started (owner authorization required).");
+    logger.info({ publicBaseUrl }, "Interactive terminal service started (password authentication required).");
   } catch (error) {
     await server.close();
     logger.warn({ error }, "Terminal service unavailable; command cards remain usable.");

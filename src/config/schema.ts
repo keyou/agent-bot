@@ -56,10 +56,15 @@ export const agentConfigSchema = z.object({
   defaults: agentExecutionDefaultsSchema,
 });
 
+export const terminalPasswordSchema = z.string().min(1).max(256)
+  .refine((value) => !/[\r\n\0]/u.test(value), "Terminal password cannot contain line breaks or null characters.");
+export const DEFAULT_TERMINAL_PASSWORD = "123456";
+
 export const appConfigSchema = z.object({
   terminal: z.object({
     enabled: z.boolean().default(true),
-  }).default({ enabled: true }),
+    password: terminalPasswordSchema.default(DEFAULT_TERMINAL_PASSWORD),
+  }).default({ enabled: true, password: DEFAULT_TERMINAL_PASSWORD }),
   updates: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
   console: z
     .object({

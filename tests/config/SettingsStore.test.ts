@@ -73,6 +73,33 @@ afterEach(() => {
 });
 
 describe("SettingsStore", () => {
+  test("saves terminal passwords without exposing them in snapshots or overwriting them on blank saves", () => {
+    const f = fixture();
+    const initial = f.store.read("services");
+    expect(initial.values.terminalPassword).toBe("");
+    expect(initial.pendingRestart).toBe(false);
+    const password = " custom terminal pass ";
+    const saved = f.store.saveField("services", undefined, "terminalPassword", initial.fieldRevisions.terminalPassword, password);
+    expect(parse(f.read()).terminal.password).toBe(password);
+    expect(saved.values.terminalPassword).toBe("");
+    expect(JSON.stringify(saved)).not.toContain(password);
+    expect(saved.pendingRestart).toBe(true);
+    const previous = f.read();
+    f.store.saveField("services", undefined, "terminalPassword", saved.fieldRevisions.terminalPassword, "");
+    expect(f.read()).toBe(previous);
+    f.store.saveField("services", undefined, "logLevel", saved.fieldRevisions.logLevel, "warn");
+    expect(parse(f.read()).terminal.password).toBe(password);
+    expect(() => f.store.saveField("services", undefined, "terminalPassword", initial.fieldRevisions.terminalPassword, "new-value")).toThrow("已变化");
+  });
+
+  test.each(["bad\npassword", "bad\0password", "a".repeat(257)])("rejects invalid terminal passwords without saving or echoing their contents", (password) => {
+    const f = fixture();
+    const view = f.store.read("services");
+    const previous = f.read();
+    expect(() => f.store.saveField("services", undefined, "terminalPassword", view.fieldRevisions.terminalPassword, password)).toThrow("配置项无效");
+    expect(f.read()).toBe(previous);
+  });
+
   test("reads only allowlisted fields with defaults and no credentials", () => {
     vi.stubEnv("SETTINGS_TEST_SECRET", "never-show-this-secret");
     const f = fixture();
@@ -112,6 +139,7 @@ describe("SettingsStore", () => {
     expect(f.store.read("services").fields.map((entry) => entry.name)).toEqual([
       "console",
       "terminal",
+      "terminalPassword",
       "preview",
       "host",
       "port",
@@ -122,7 +150,7 @@ describe("SettingsStore", () => {
         .read(section, "codex")
         .fields.map((entry) => entry.path.join(".")),
     );
-    expect(paths).toHaveLength(16);
+    expect(paths).toHaveLength(17);
     expect(paths).not.toContain("fileViewer.publicBaseUrl");
     expect(paths).not.toContain("agents.codex.defaults.modelProvider");
     expect(paths).not.toContain("feishu.thinkingCardLayout");
