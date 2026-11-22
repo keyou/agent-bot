@@ -114,6 +114,8 @@ Server 成功启动或安全重启成功安排后，`init` 会直接向 `feishu.
 
 `agentbot server autostart enable|status|disable` 管理每个 Profile 独立的操作系统启动项。Windows 会先创建 `ONLOGON` 任务计划；如果系统拒绝创建任务，则自动回退到隐藏窗口启动的当前用户启动文件夹脚本。macOS 写入 `RunAtLoad` LaunchAgent，Linux 启用 systemd 用户单元。启动项通过 `<profile>/autostart/supervisor-bootstrap.mjs` 直接启动 Supervisor；bootstrap 只保存 Node 可执行文件、已安装 Supervisor、Profile、配置文件路径和安全的可执行文件搜索路径，会清除继承的飞书凭据变量，再由目标 Profile 自己的 `.env` 加载密钥。LaunchAgent 的 `KeepAlive` 和 systemd 的 `Restart` 均保持关闭，因为 Worker 恢复已经由 Supervisor 负责，同时必须保证 `server stop` 后直到下次登录或开机前不会被立刻拉起。Linux 的 `--linger` 会执行 `loginctl enable-linger`，让用户单元可在登录前启动；禁用 Agent Bot 自启动时不会关闭这个用户级全局设置。禁用自启动也不会停止当前 Server。状态命令会同时显示操作系统注册/加载状态和 Agent Bot 实际就绪状态。不支持的平台可以查看状态，但不能启用启动项。
 
+macOS LaunchAgent 明确使用 `ProcessType=Standard` 而非 `Background`，避免将用户请求的 Agent/编译工作登记为后台工作。使用升级后的 CLI 再执行 `server autostart enable` 会覆盖同一 Profile 的 plist 和 bootstrap，不卸载当前任务，不中断执行。已加载的 launchd job 在重载前仍保留原策略；只能在任务完成后安排重载，或注销再重新登录。普通 Agent Bot 重启并非 launchd 重载，不能宣称它已改变现有进程树的调度分类。
+
 ## 飞书应用要求
 
 基础消息能力依赖以下核心配置：
@@ -249,17 +251,17 @@ HTML 文本文件（`.html`、`.htm`，不区分大小写）支持预览与代�
 
 ## 交互式网页终端
 
-路由从服务器保存的 Shell job 获取 contextKey 和命令卡片 ID，不接受浏览器指定。话题内授权通过 reply_in_thread=true 回复原命令卡；私聊与群正文沿用原目的地。重新授权保留该路由，不随任务后续移动而变化；投递失败不降级发往私聊或群正文。管理卡回调携带原 contextKey，反馈仍留在原话题。
+飞书 `!` 命令卡片的 Open Terminal 打开密码表单。POST 先校验 `terminal.password`，未配置时默认 `123456`；通过后才读取命令任务、发送管理卡和签发浏览器凭证，不再需要飞书 Allow/Deny 审批。持有链接和密码的人可运行完整主机用户权限的 Shell，向其他设备开放前应更换默认密码。所有者可在 `/settings` → 高级 → 终端密码修改；密码保存在本机 Profile YAML，安全重启后生效，设置快照与卡片不回显已保存值，留空保留原值。其他凭证仍仅在本机管理。
 
-已授权但尚无 PTY 的终端提供“打开终端”，新网页可为同一个终端 ID 申请重新授权。仅所有者明确批准后才切换浏览器访问权，并刷新首次启动的授权时限，不延长绝对寿命。页面加载、申请或批准都不启动 Shell，实际 WebSocket 鉴权后最多启动一个 Shell。安全重启等待期间阻止这类首次启动恢复的申请和批准，但已运行 PTY 仍可恢复。
+密码通过固定长度摘要进行恒定时间比较。同一连接来源地址一分钟内五次错误尝试，或全局五十次错误尝试后，暂时拒绝登录；不信任转发 IP 请求头。正确登录仍受每十秒一次、每小时二十次和最多三个终端的限制。密码仅在登录 POST 请求体中传递，不放入 URL、日志或浏览器存储。随机浏览器密钥仅放在 sessionStorage 与 POST/WebSocket 请求体，不使用 Cookie。新标签页重新输入密码，同标签页刷新复用已签发凭证。五分钟未连接的授权自动过期，所有者或密码变更会撤销会话。
 
-授权卡在原命令会话中原位更新为终端管理卡，显示稳定终端 ID、目录和连接状态，可直接关闭或刷新，也可通过`/terminal/<8位token>` 短链接恢复。链接不是执行凭证：新标签页生成自己的浏览器密钥，申请五分钟有效的恢复授权；所有者核对验证码批准后，才撤销旧网页访问、连接原 PTY。请求、拒绝、过期或取消待批准恢复不会中断原 Shell；恢复申请或授权不延长三分钟断开时限，只有 WebSocket 鉴权并重新连接成功才取消断开计时并重置三十分钟空闲计时，绝对寿命不变。关闭操作校验所有者、卡片 ID 和操作令牌，不依赖浏览器凭证。已运行 Shell 的恢复不受新建终端的安全重启限制，也不额外占用 PTY 名额，但独立限制同时待批准恢复数和请求频率。关闭/退出更新管理卡，迟到批准不能重新创建已结束终端。卡片更新失败会记录警告，可用“刷新”重试；网页标签关闭后可在三分钟内重连，超时将结束 Shell。
+cwd、contextKey 和原命令卡片 ID 均取自服务端 Shell job，不接受浏览器指定。终端管理卡发往原会话，话题使用 reply_in_thread=true；任务移动后恢复仍保留原路由，投递失败不降级发往其他会话，也不启动 Shell。仅所有者可通过原始卡片 ID 和操作令牌关闭或刷新。管理卡展示稳定的八位终端 token 和打开/重开链接，不展示密码或浏览器密钥。
 
-WebSocket 就绪帧携带有界输出快照和回放标志：首次连接的启动输出允许正常查询响应，后续重连快照只恢复画面。回放期间禁用 xterm 输入/自动响应，等待异步解析完成后恢复，再按顺序解析实时输出；不会用正则删除 ANSI 或用户输入。每次连接使用独立的 xterm 实例，旧实例回调不能向新连接写入或解除其回放保护。
+原命令链接用于创建独立 Shell，管理链接用于恢复同一个终端。新网页密码正确且管理卡投递成功后，撤销旧浏览器凭证并复用原 PTY；密码错误或投递失败不影响原 Shell 与访问权。页面加载和密码校验本身不创建进程，仅 WebSocket 鉴权成功后最多启动一个 Shell。安全重启阻止新建或首次启动 Shell，但允许重连或关闭已运行 Shell；已结束或上次进程的终端不能复活。
 
-切换后台标签页保留现有 WebSocket；pagehide/离线时断开并暂停恢复，无连接的隐藏页面暂停轮询。visibilitychange、pageshow（含 bfcache）、online/focus 恢复时查询原授权。状态请求十秒超时，网络/暂时性服务错误按 1/2/4/8/10 秒上限退避重试；WebSocket 十五秒未就绪会重新连接。并发恢复事件只产生一个查询/连接，旧请求/旧 socket 的迟到结果会被忽略。自动重试和手动“重新连接”不撤销原授权，不重复申请或执行输入；拒绝、过期、关闭或 Shell 错误明确停止。日志只记录授权被浏览器观察、WebSocket 鉴权及失败阶段，不记录验证码、令牌或终端输入输出。
+WebSocket 就绪帧提供有界输出快照和回放标志。首次连接正常回应启动查询，重连只恢复画面；异步回放解析完成前禁用输入和自动响应。每次连接使用独立 xterm 实例，旧回调不能向新连接写入。Ctrl+C 复制选中文字，Ctrl+V 通过浏览器原生事件粘贴，工具栏保留显式中断按钮。
 
-`!` 命令卡片的 Open Terminal 链接只用于申请连接，不是执行凭证。GET 只加载本地 xterm.js 资源；POST 才向原命令所在会话/话题发送六位验证码授权卡，仅所有者可批准。授权绑定所有者、原始卡片、请求令牌和随机浏览器密钥，五分钟有效；原浏览器通过 WebSocket 鉴权才启动 Shell。密钥仅在 sessionStorage 和 POST/WebSocket 请求体中，不放在 URL/Cookie。Preview token 无法授权终端。不要批准非本人发起的请求或公开分享入口链接。
+切换后台标签保留现有 WebSocket；pagehide/离线断开并暂停重试，pageshow、visibilitychange、online/focus 恢复原凭证。状态请求十秒超时，暂时性错误使用 1/2/4/8/10 秒上限退避，WebSocket 就绪等待十五秒。重试保持单次在途，不回放输入或重复提交密码。过期、关闭或 Shell 错误终止重试；日志只记录生命周期 ID 和失败阶段，不记录密码、凭证或输入输出。
 
 ```yaml
 fileViewer:
@@ -269,19 +271,16 @@ fileViewer:
   # publicBaseUrl: "https://agentbot.example.com/bot"
 terminal:
   enabled: true
+  # password: "replace-with-a-strong-password" # 未配置时：123456
 ```
 
-终端挂载到同一 HTTP 服务的 `<Preview 路径前缀>/terminal`。协议、主机、端口、物理网卡地址选择和 `publicBaseUrl` 全部来自 `fileViewer`。例如 `http://10.0.0.2:1423/preview/...` 对应 `http://10.0.0.2:1423/terminal/xxxxxxxx`；代理的 `/bot` 前缀会同时保留在页面、资源、API 和 WebSocket 路径中。不再单独监听端口、保存终端端口文件或提供终端网络配置。关闭 Preview 或 `terminal.enabled` 后不显示终端入口。链接仅支持 `/terminal/<8位token>`，新建和恢复共用这一格式，token 使用区分大小写的 base64url 字符。新建链接映射保存在 `<data>/terminal/open-links/<SHA256(token)>.json`，仅保存 token 和命令任务 ID，重启后仍有效。token 由密钥生成伪随机引用，冲突时重试且不覆盖已有映射；文件名哈希保证 Windows 下也能区分 token 大小写。GET 和请求授权只解析已有映射，不创建映射。恢复 token 随机生成，仅绑定当前进程的一个终端，不能恢复已关闭 Shell；同一映射目录永久保留 token 占位，不保存会话凭证，防止当前或过期的恢复 token 与命令 token 冲突。页面渲染和授权请求都由服务端解析 token 决定模式，通过 data 属性传给页面，不再从 URL 推断。`<data>/terminal/secret` 用于稳定生成新建 token；浏览器密钥、授权令牌、所有者检查和请求限频保持不变。Preview token 不能授权执行命令。
+终端挂载于 Preview 路径前缀加 `/terminal`，共用 `fileViewer` 的协议、主机、端口和代理路径，无独立监听器或端口文件。命令和恢复链接统一使用 `/terminal/<8位token>`，区分大小写的 base64url token 只定位，不授权执行。持久化命令映射保存在 `<data>/terminal/open-links/<SHA256(token)>.json`；命令 token 使用密钥生成，冲突时重试而不覆盖。恢复 token 随机生成并在同一命名空间永久占位，只能定位当前进程内的终端。`<data>/terminal/secret` 用于生成命令引用；关闭 Preview 或 `terminal.enabled` 后隐藏终端入口。
 
-可信局域网支持 HTTP，但终端凭证/输入/输出没有加密，可被网络监听或篡改；所有者授权不能替代 TLS。不可信网络/互联网访问请使用 HTTPS。反向代理保留 Host/Origin，并在同一 Preview 地址支持 WebSocket 升级（HTTP 用 `ws`，HTTPS 用 `wss`），避免记录终端 URL、凭证或流量。不需要额外域名/origin。
+HTTP 仅适合可信网络，密码和终端流量均为明文。不可信网络使用 HTTPS，反向代理保留 Host/Origin 并支持 WebSocket。终端拒绝不透明的 `null` origin，校验请求来源和负载上限；Preview 路由保持只读，HTML/原始文件使用响应级沙箱，防止预览文档访问终端存储和同源 API。共用地址不等于共用授权。
 
-共用地址不等于共用授权。终端仍校验 Host/Origin（拒绝沙箱的 `null` origin）、JSON/帧大小、所有者/原始卡片/浏览器凭证。文件和 Turn 路由仍只读。HTML 渲染保持响应级不透明 origin 沙箱，可执行内联脚本，但没有同源权限或网络访问；原始文件也使用禁止脚本的响应级沙箱，覆盖直接打开 HTML/SVG/XML，防止预览文档读取终端 sessionStorage 或操作终端页面。同源仅应运行应用自身脚本。
+`node-pty` 是可选原生依赖，缺失时提示 Shell 启动失败而不阻止安装。Windows 使用 ConPTY（Windows 10 1903/Server 2022 或更新版本），按 pwsh、Windows PowerShell、cmd.exe 顺序选择并保留 profile；Unix 使用配置/登录/平台 Shell。语法高亮由 Shell 提供，xterm 只渲染。仅继承卡片 cwd，不继承原命令或进程状态；终端不受 Agent 沙箱限制。输出仅在内存保留最后 256 Ki 字符，不写入持久日志。
 
-`node-pty` 为可选原生依赖，构建失败不阻塞 Agent Bot 安装，终端启动会提示错误；需按 node-pty 文档安装编译前置条件并重装可选依赖。Windows 需要 Windows 10 1903/Server 2022 或更新系统（使用 node-pty 随包提供的 ConPTY）；保留 PowerShell profile，依次选择 `pwsh`、Windows PowerShell、`cmd.exe`。Unix 依次选择 `$SHELL`、登录 Shell、平台默认 Shell，以交互模式启动。输入高亮来自 Shell，xterm 渲染 ANSI，不解析命令语言。
-
-只继承卡片 cwd，不继承原命令或进程状态；Shell 有主机用户完整权限。过滤飞书/Agent Bot 内部环境变量不等于沙箱，主机文件和其他继承凭证仍可访问。应用不记录终端输入/输出；内存仅保留最后 256 Ki 字符用于重连，不保存无限历史或保证完全重建所有全屏程序画面。最多三个待授权/已授权/运行中会话；每十秒最多一次申请，每小时二十次。授权/连接五分钟未完成会回收。Shell 启动后，网页断开即开始三分钟计时，由独立定时器执行，并在请求时校验；只有 WebSocket 鉴权后重连成功才取消计时，输出、轮询、resize 和恢复授权均不延长时限。连接正常且处于前台时不因空闲关闭。前台页面每三十秒通过已鉴权 WebSocket 上报可见性，有效九十秒，后台停止心跳；切到后台或前台状态失效后开始三十分钟无输入/输出计时。重复后台状态、轮询、resize、仅授权不重置空闲计时；成功重连取消断开计时并重置三十分钟空闲时间，输入/输出刷新空闲时间但不延长断开时限。后台空闲或断开超时任一满足即关闭，可见性消息不写入 PTY，累计八小时的绝对寿命不变。
-
-关闭标签页后断开连接，三分钟内未成功重连则自动结束 Shell；“关闭终端”停止 Shell，脱离终端的后台进程可能继续运行。所有者变更撤销会话，Worker 重启不保留终端。安全重启/更新单独统计活动终端、在卡片提示并等待关闭；计划重启后禁止新建 Shell，已有终端可重连。ForceRestart/停止服务会关闭终端。原有后台 `!` 命令及 Cancel 行为不变。
+页面关闭开始独立三分钟断开计时，输出、状态查询和密码验证不延长时限。WebSocket 重连成功才取消计时并重置三十分钟输入/输出空闲时间。前台每三十秒上报可见性、有效九十秒，持续前台不因空闲关闭；后台空闲或断开超时任一满足均结束 Shell，累计寿命最多八小时。“关闭终端”立即结束 Shell，脱离终端的后台进程可能继续运行。活动终端仍阻止安全重启，重启卡展示活跃状态及当前命令，Worker 重启不保留 Shell。原后台 `!` 命令与终端相互独立。
 
 ## Agent Runtime
 

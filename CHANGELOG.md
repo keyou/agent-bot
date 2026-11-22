@@ -6,6 +6,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Generate macOS LaunchAgents with `ProcessType=Standard` instead of `Background`, avoiding background scheduling for user-requested Agent and build work. Re-register existing Profiles with `agentbot server autostart enable`, then reload the LaunchAgent after active work has finished (for example by logging out and back in); an ordinary Agent Bot restart alone does not replace an already-loaded launchd policy.
+
+- Replace browser-terminal verification-code approvals with password login. Configure the password in owner-only Settings > Advanced or `terminal.password` (default `123456`); keep saved passwords out of cards, URLs and browser storage, rate-limit failed attempts, and retain source-conversation management cards, Shell recovery and safe-restart protections.
+
 ## [0.1.26] - 2026-11-22
 
 - Automatically continue verified interrupted ordinary Codex/TraeX tasks after restart within a twenty-minute activity window, including non-user interruptions already marked stopped, using a persisted one-shot continuation in the original thread instead of replaying the original Prompt. Distinguish durable user Stop intent from interruption status, preserve Reset, newer-instruction and settings guards, and never resubmit ambiguous work. Duplicate status events do not extend the recovery window. Report recovery outcomes in the original conversation/topic and retain interruption explanations in cards and Preview; prevent legacy backfill from reviving durably stopped Turns.
