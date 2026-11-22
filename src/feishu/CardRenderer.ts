@@ -1340,6 +1340,7 @@ export class CardRenderer {
       const labels: Record<ExecutionProvenance["trigger"], string> = {
         user: "用户消息", queue: "排队消息", schedule: "定时任务", recovery: "未提交请求恢复",
         retry: "提交前重试", plan_handoff: "已批准方案续接", response_continuation: "模型空输入续接",
+        recovery_continuation: "重启后自动续跑",
       };
       const settings = provenance.settings;
       elements.push(markdown([

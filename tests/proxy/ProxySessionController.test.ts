@@ -298,6 +298,7 @@ function fixture(
     close: vi.fn(async () => undefined),
   },
   referenceInstructionWindowMs = 0,
+  nativeAgentName = "codex",
 ) {
   const sessions = new Map<string, RuntimeSession>();
   const remoteSessions: RemoteSessionSummary[] = [];
@@ -574,7 +575,7 @@ function fixture(
       },
     },
     agents: {
-      codex: { kind: "app-server", title: "Codex", command: "codex", args: [], env: {} },
+      [nativeAgentName]: { kind: "app-server", title: nativeAgentName === "codex" ? "Codex" : "TraeX", command: nativeAgentName, args: [], env: {} },
       acp: { kind: "acp", title: "ACP", command: "acp", args: [], env: {} },
       ...Object.fromEntries(Object.keys(extraRuntimes).map((agentName) => [
         agentName,
@@ -587,7 +588,7 @@ function fixture(
         },
       ])),
     },
-    defaults: { agent: "codex", cwd: process.cwd() },
+    defaults: { agent: nativeAgentName, cwd: process.cwd() },
     storage: { sqlitePath: path.join(dir, "state.sqlite") },
   } as unknown as AppConfig;
   const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } as unknown as Logger;
@@ -621,7 +622,7 @@ function fixture(
   const controller = new ProxySessionController(
     config,
     store,
-    new AgentRuntimeRegistry({ acp, codex: runtime, ...extraRuntimes }),
+    new AgentRuntimeRegistry({ acp, [nativeAgentName]: runtime, ...extraRuntimes }),
     outboundRouter,
     logger,
     {
@@ -1340,18 +1341,18 @@ describe("delayed inbound message diagnostics", () => {
   });
 });
 
-function recoveryFixture(status: "active" | "not_loaded" = "active") {
-  const value = fixture();
+function recoveryFixture(status: "active" | "not_loaded" = "active", recoveryContextKey = "chat_id:c1", agentName = "codex") {
+  const value = fixture({}, undefined, 0, agentName);
   const { store, remoteSessions } = value;
   const id = "00000000-0000-4000-8000-000000000001";
   store.getOrCreateUserContext("chat_id:c1", "codex");
-  store.createSession({ localSessionId: "crashed", contextKey: "chat_id:c1", agentName: "codex", cwd: process.cwd(), status: "running" });
+  store.createSession({ localSessionId: "crashed", contextKey: "chat_id:c1", agentName, cwd: process.cwd(), status: "running" });
   store.updateRuntimeSession("crashed", { runtimeKind: "codex", remoteSessionId: id, lastTurnId: "old-turn", lastTurnStatus: "running" });
   store.setCurrentSession("chat_id:c1", "crashed");
   store.saveTurnSnapshot("old-turn", "crashed", {
     ...createTurnViewState("crashed", "old-turn", Date.now()), status: "running", prompt: "finish work",
   }, "chat_id:c1");
-  store.createTurnAttempt({ attemptId: "recover", localSessionId: "crashed", contextKey: "chat_id:c1", promptText: "finish work", turnId: "old-turn", status: "running" });
+  store.createTurnAttempt({ attemptId: "recover", localSessionId: "crashed", contextKey: recoveryContextKey, promptText: "finish work", turnId: "old-turn", status: "running" });
   remoteSessions.push({ id, cwd: process.cwd(), source: "agent-bot", status, lastTurnId: "old-turn", lastTurnStatus: status === "active" ? "inProgress" : "interrupted" });
   return { ...value, remoteId: id };
 }
@@ -1453,6 +1454,374 @@ describe("execution contract integration", () => {
 });
 
 describe("crash recovery", () => {
+  function interruptOnSync(f: ReturnType<typeof recoveryFixture>) {
+    vi.mocked(f.runtime.synchronizeSession).mockImplementation(async (id) => {
+      const session = f.sessions.get(id)!;
+      session.activeTurnId = undefined;
+      for (const listener of f.listeners) listener({ type: "turn_cancelled", sessionId: id, turnId: "old-turn" });
+      return session;
+    });
+  }
+
+  test.each([
+    { minutes: 15, terminal: false, stopped: false, expected: 1 },
+    { minutes: 20, terminal: false, stopped: false, expected: 1 },
+    { minutes: 20.01, terminal: false, stopped: false, expected: 0 },
+    { minutes: 15, terminal: true, stopped: false, expected: 1 },
+    { minutes: 20, terminal: true, stopped: false, expected: 1 },
+    { minutes: 20.01, terminal: true, stopped: false, expected: 0 },
+    { minutes: 15, terminal: true, stopped: true, expected: 0 },
+    { minutes: 20, terminal: true, stopped: true, expected: 0 },
+  ])("recovers $minutes-minute interrupted work (terminal=$terminal, userStop=$stopped) only when eligible", async ({ minutes, terminal, stopped, expected }) => {
+    vi.useFakeTimers();
+    const interruptedAt = Date.now();
+    const f = recoveryFixture("not_loaded");
+    try {
+      if (stopped) f.store.requestSessionExecutionStop("crashed");
+      if (terminal) {
+        f.store.markTurnAttemptTerminal("old-turn", "cancelled");
+        f.store.updateSession("crashed", { status: "ready" });
+        f.store.updateRuntimeSession("crashed", { lastTurnStatus: "cancelled" });
+        f.store.saveTurnSnapshot("old-turn", "crashed", {
+          ...createTurnViewState("crashed", "old-turn", interruptedAt), status: "cancelled", prompt: "finish work",
+        }, "chat_id:c1");
+      }
+      interruptOnSync(f);
+      vi.setSystemTime(interruptedAt + minutes * 60_000);
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(expected);
+      if (expected) expect(f.store.provenance.forTurn("turn_1", "crashed")?.trigger).toBe("recovery_continuation");
+      if (stopped) {
+        expect(f.store.getTurnAttempt("recovery_continuation:crashed:old-turn")).toBeUndefined();
+        expect(f.runtime.resumeSession).not.toHaveBeenCalled();
+      }
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test.each(["codex", "traex"])("automatically continues a verified interrupted %s turn on the same task without replaying its prompt", async (agentName) => {
+    const f = recoveryFixture("not_loaded", "chat_id:c1", agentName);
+    try {
+      vi.mocked(f.runtime.synchronizeSession).mockImplementation(async (id) => {
+        const session = f.sessions.get(id)!;
+        session.activeTurnId = undefined;
+        for (const listener of f.listeners) listener({ type: "turn_cancelled", sessionId: id, turnId: "old-turn" });
+        return session;
+      });
+      await f.controller.recoverInterruptedTasks();
+      await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledTimes(1));
+      expect(f.runtime.startTurn).toHaveBeenCalledWith("crashed", expect.stringContaining("继续"));
+      expect(f.runtime.startTurn).not.toHaveBeenCalledWith("crashed", "finish work");
+      expect(f.runtime.forkSession).not.toHaveBeenCalled();
+      expect(f.store.getSession("crashed")?.remoteSessionId).toBe(f.remoteId);
+      expect(f.store.provenance.forTurn("turn_1", "crashed")).toMatchObject({
+        trigger: "recovery_continuation", parentSourceTurnId: "old-turn",
+      });
+      for (const listener of f.listeners) listener({ type: "turn_cancelled", sessionId: "crashed", turnId: "old-turn" });
+      await f.controller.recoverInterruptedTasks();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    } finally { f.controller.close(); }
+  });
+
+  test.each(["legacy-intent", "failed-after-stop"] as const)("never recovers user Stop from %s", async (scenario) => {
+    const f = recoveryFixture("not_loaded");
+    try {
+      interruptOnSync(f);
+      if (scenario === "legacy-intent") f.store.updateTurnAttempt("recover", { status: "cancelling" });
+      else {
+        f.store.requestSessionExecutionStop("crashed");
+        f.store.markTurnAttemptTerminal("old-turn", "failed");
+      }
+      await f.controller.recoverInterruptedTasks();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.store.executionGeneration("crashed")).toBe(1);
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+      expect(f.store.getTurnAttempt("recovery_continuation:crashed:old-turn")).toBeUndefined();
+    } finally { f.controller.close(); }
+  });
+
+  test("a failed recovery check does not refresh the interrupted task's twenty-minute deadline", async () => {
+    vi.useFakeTimers();
+    const interruptedAt = Date.now();
+    const f = recoveryFixture("not_loaded");
+    try {
+      f.store.markTurnAttemptTerminal("old-turn", "cancelled");
+      f.store.updateSession("crashed", { status: "ready" });
+      f.store.updateRuntimeSession("crashed", { lastTurnStatus: "cancelled" });
+      f.store.saveTurnSnapshot("old-turn", "crashed", {
+        ...createTurnViewState("crashed", "old-turn", interruptedAt), status: "cancelled",
+      }, "chat_id:c1");
+      vi.setSystemTime(interruptedAt + 15 * 60_000);
+      vi.mocked(f.runtime.readRemoteSession!).mockRejectedValue(new Error("temporarily unavailable"));
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(f.store.getTurnAttempt("recover")).toMatchObject({
+        status: "recovering", updatedAt: new Date(interruptedAt).toISOString(),
+      });
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test.each(["stale", "newer-instruction"] as const)("legacy card backfill cannot revive %s cancelled work", async (scenario) => {
+    vi.useFakeTimers();
+    const interruptedAt = Date.now();
+    const f = recoveryFixture("not_loaded");
+    try {
+      f.store.markTurnAttemptTerminal("old-turn", "cancelled");
+      vi.setSystemTime(interruptedAt + (scenario === "stale" ? 21 : 5) * 60_000);
+      f.store.updateRuntimeSession("crashed", { title: "metadata refreshed" });
+      if (scenario === "newer-instruction") {
+        f.store.createTurnAttempt({ attemptId: "newer", localSessionId: "crashed", contextKey: "chat_id:c1", promptText: "new explicit work" });
+        f.store.updateTurnAttempt("newer", { status: "failed" });
+      }
+      interruptOnSync(f);
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+      expect(f.store.getTurnAttempt("recovery_continuation:crashed:old-turn")).toBeUndefined();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test.each(["stop", "newer-attempt", "queue", "pending-provider", "changed-model", "reset-head"] as const)(
+    "does not automatically continue interrupted work superseded by %s", async (change) => {
+      const f = recoveryFixture("not_loaded");
+      try {
+        interruptOnSync(f);
+        if (change === "stop") f.store.requestSessionExecutionStop("crashed");
+        if (change === "newer-attempt") {
+          f.store.createTurnAttempt({ attemptId: "newer", localSessionId: "crashed", contextKey: "chat_id:c1", promptText: "new work" });
+          f.store.updateTurnAttempt("newer", { status: "failed" });
+        }
+        if (change === "queue") f.store.enqueuePrompt({ promptId: "queued-new", localSessionId: "crashed", contextKey: "chat_id:c1", text: "new queued work" });
+        if (change === "pending-provider") f.store.savePendingProviderSettings({
+          localSessionId: "crashed", contextKey: "chat_id:c1", settings: {
+            modelProvider: "other", model: "new-model", reasoningEffort: "high", permissionMode: "auto",
+          },
+        });
+        if (change === "changed-model") {
+          f.store.provenance.recordSubmission({ attemptId: "recover", localSessionId: "crashed", trigger: "user", settings: {
+            agentName: "codex", model: "old-model", cwd: process.cwd(), permissionMode: "auto",
+          } });
+          f.store.provenance.bindLatestTurn("recover", "old-turn");
+          f.store.updateRuntimeSession("crashed", { model: "new-model" });
+        }
+        if (change === "reset-head") f.store.updateRuntimeSession("crashed", { lastTurnId: "reset-turn" });
+        await f.controller.recoverInterruptedTasks();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(vi.mocked(f.runtime.startTurn).mock.calls.some((call) => String(call[1]).includes("上一轮因"))).toBe(false);
+        expect(f.store.getTurnAttempt(`recovery_continuation:crashed:old-turn`)).toBeUndefined();
+      } finally { f.controller.close(); }
+    },
+  );
+
+  test.each(["stop", "new-message", "remote-new-turn", "model", "shutdown"] as const)(
+    "rechecks %s after creating the continuation card but before submitting", async (change) => {
+      const f = recoveryFixture("not_loaded");
+      try {
+        interruptOnSync(f);
+        const userStarts: Promise<void>[] = [];
+        vi.mocked(f.presenter.startPendingTurn).mockImplementationOnce(async () => {
+          if (change === "stop") f.store.requestSessionExecutionStop("crashed");
+          if (change === "new-message") userStarts.push(f.controller.onMessage(message("new explicit instruction")));
+          if (change === "remote-new-turn") Object.assign(f.remoteSessions[0]!, { lastTurnId: "external", lastTurnStatus: "completed" });
+          if (change === "model") f.store.updateRuntimeSession("crashed", { model: "changed" });
+          if (change === "shutdown") {
+            f.store.enqueuePrompt({ promptId: "after-shutdown", localSessionId: "crashed", contextKey: "chat_id:c1", text: "must stay queued" });
+            f.controller.close();
+          }
+          return "pending-recovery";
+        });
+        await f.controller.recoverInterruptedTasks();
+        await vi.waitFor(() => expect(f.store.getTurnAttempt(`recovery_continuation:crashed:old-turn`)?.status).toBe("cancelled"));
+        await Promise.all(userStarts);
+        expect(vi.mocked(f.runtime.startTurn).mock.calls.some((call) => String(call[1]).includes("上一轮因"))).toBe(false);
+        if (change === "new-message") expect(f.runtime.startTurn).toHaveBeenCalledWith("crashed", "new explicit instruction");
+        if (change === "shutdown") {
+          expect(f.runtime.startTurn).not.toHaveBeenCalled();
+          expect(f.store.countQueuedPrompts("crashed")).toBe(1);
+        }
+      } finally { f.controller.close(); }
+    },
+  );
+
+  test("recovers a persisted unsubmitted continuation after a second crash without replaying the original prompt", async () => {
+    const f = recoveryFixture("not_loaded");
+    try {
+      const continuation = f.store.claimRecoveryContinuation("recover", "继续完成尚未完成的任务，不要重复已完成操作。")!;
+      f.store.updateRuntimeSession("crashed", { lastTurnStatus: "cancelled" });
+      await f.controller.recoverInterruptedTasks();
+      await vi.waitFor(() => expect(f.runtime.startTurn).toHaveBeenCalledExactlyOnceWith("crashed", continuation.promptText));
+      expect(f.store.provenance.forTurn("turn_1", "crashed")).toMatchObject({
+        trigger: "recovery_continuation", parentSourceTurnId: "old-turn",
+      });
+    } finally { f.controller.close(); }
+  });
+
+  test("does not resubmit a continuation whose submission result is unknown", async () => {
+    const f = recoveryFixture("not_loaded");
+    try {
+      const continuation = f.store.claimRecoveryContinuation("recover", "continue remaining work")!;
+      f.store.beginTurnAttemptSubmission(continuation.attemptId);
+      await f.controller.recoverInterruptedTasks();
+      expect(f.store.getTurnAttempt(continuation.attemptId)?.status).toBe("unknown");
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    } finally { f.controller.close(); }
+  });
+
+  test("does not loop or replay a continuation after an ambiguous start failure", async () => {
+    const f = recoveryFixture("not_loaded");
+    try {
+      interruptOnSync(f);
+      vi.mocked(f.runtime.startTurn).mockRejectedValue(new Error("connection lost after submission"));
+      await f.controller.recoverInterruptedTasks();
+      await vi.waitFor(() => expect(f.store.getTurnAttempt(`recovery_continuation:crashed:old-turn`)?.status).toBe("unknown"));
+      for (const listener of f.listeners) listener({ type: "turn_cancelled", sessionId: "crashed", turnId: "old-turn" });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+      expect(f.store.hasUnknownTurnAttemptForSession("crashed")).toBe(true);
+    } finally { f.controller.close(); }
+  });
+
+  test("still reconciles a completed attempt when a crash left its card and session running", async () => {
+    const f = recoveryFixture("not_loaded");
+    try {
+      f.store.markTurnAttemptTerminal("old-turn", "completed");
+      f.remoteSessions[0]!.lastTurnStatus = "completed";
+      vi.mocked(f.runtime.synchronizeSession).mockImplementation(async (id) => {
+        const session = f.sessions.get(id)!;
+        session.activeTurnId = undefined;
+        for (const listener of f.listeners) listener({ type: "turn_completed", sessionId: id, turnId: "old-turn", finalResponse: "Done" });
+        return session;
+      });
+      await f.controller.recoverInterruptedTasks();
+      await vi.waitFor(() => expect(f.store.getSession("crashed")?.status).toBe("ready"));
+      expect(f.store.getSession("crashed")?.lastTurnStatus).toBe("completed");
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+      expect(f.presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "turn_completed", finalResponse: "Done" }));
+    } finally { f.controller.close(); }
+  });
+
+  test.each(["completed", "failed", "interrupted"] as const)("reports a verified %s recovery result without replaying the submitted request", async (status) => {
+    vi.useFakeTimers();
+    const contextKey = "chat_id:c1:thread_id:recovery-topic";
+    const f = recoveryFixture("not_loaded", contextKey);
+    try {
+      f.store.updateTurnAttempt("recover", { replyMessageId: "root-recovery" });
+      f.outbound.replyText = vi.fn(async () => "recovery-notice");
+      f.remoteSessions[0]!.lastTurnStatus = status;
+      const terminal = status === "completed"
+        ? { type: "turn_completed" as const, sessionId: "crashed", turnId: "old-turn", finalResponse: "Done" }
+        : status === "failed"
+          ? { type: "turn_failed" as const, sessionId: "crashed", turnId: "old-turn", message: "build failed" }
+          : { type: "turn_cancelled" as const, sessionId: "crashed", turnId: "old-turn" };
+      vi.mocked(f.runtime.synchronizeSession).mockImplementation(async (id) => {
+        const session = f.sessions.get(id)!;
+        session.activeTurnId = undefined;
+        for (const listener of f.listeners) listener(terminal);
+        return session;
+      });
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(0);
+      const calls = vi.mocked(f.outbound.replyText).mock.calls;
+      expect(calls[0]).toEqual([contextKey, { messageId: "root-recovery", replyInThread: true }, expect.stringContaining("正在核对")]);
+      const expected = status === "completed" ? "原轮次已完成" : status === "failed" ? "原轮次已失败" : "原轮次已中断";
+      expect(calls.filter((call) => call[2].includes(expected))).toHaveLength(1);
+      expect(calls.at(-1)?.[2]).toContain("未重新执行");
+      expect(calls.at(-1)?.slice(0, 2)).toEqual([contextKey, { messageId: "root-recovery", replyInThread: true }]);
+      if (status === "interrupted") {
+        expect(calls.at(-1)?.[2]).toContain("继续");
+        expect(f.presenter.onEvent).toHaveBeenCalledWith(expect.objectContaining({
+          type: "turn_cancelled", message: expect.stringContaining("原轮次已中断"),
+        }));
+      }
+      for (const listener of f.listeners) listener(terminal);
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(calls.filter((call) => call[2].includes(expected))).toHaveLength(1);
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(status === "interrupted" ? 1 : 0);
+      expect(f.runtime.forkSession).not.toHaveBeenCalled();
+      expect(f.store.getTurnAttempt("recover")?.status).toBe(status === "interrupted" ? "cancelled" : status);
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("reports successful reattachment once after verification, including a retried check", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture();
+    try {
+      vi.mocked(f.runtime.resumeSession).mockRejectedValueOnce(new Error("temporarily unavailable"));
+      await f.controller.recoverInterruptedTasks();
+      expect(JSON.stringify(vi.mocked(f.outbound.sendText).mock.calls)).not.toContain("已重新连接原轮次");
+      await vi.advanceTimersByTimeAsync(5_000);
+      const notices = vi.mocked(f.outbound.sendText).mock.calls.filter((call) => call[1].includes("已重新连接原轮次"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.[1]).toContain("未重新执行");
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(vi.mocked(f.outbound.sendText).mock.calls.filter((call) => call[1].includes("已重新连接原轮次"))).toHaveLength(1);
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("reports recovery of a proven unsubmitted request without adding a second submission", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture("not_loaded");
+    try {
+      f.store.updateTurnAttempt("recover", { turnId: null, submissionState: "not_submitted", status: "accepted" });
+      Object.assign(f.remoteSessions[0]!, { lastTurnId: undefined, lastTurnStatus: undefined, status: "idle" });
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.runtime.startTurn).toHaveBeenCalledExactlyOnceWith("crashed", "finish work");
+      expect(vi.mocked(f.outbound.sendText).mock.calls.filter((call) => call[1].includes("确认尚未提交"))).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("continues only once even when its recovery notification fails", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture("not_loaded");
+    try {
+      f.remoteSessions[0]!.lastTurnStatus = "interrupted";
+      vi.mocked(f.outbound.sendText).mockImplementation(async (_context, text) => {
+        if (text.includes("原轮次已中断")) throw new Error("Feishu unavailable");
+        return "notice";
+      });
+      vi.mocked(f.runtime.synchronizeSession).mockImplementation(async (id) => {
+        const session = f.sessions.get(id)!;
+        session.activeTurnId = undefined;
+        for (const listener of f.listeners) listener({ type: "turn_cancelled", sessionId: id, turnId: "old-turn" });
+        return session;
+      });
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("cancelled");
+      expect(f.store.getSession("crashed")?.status).toBe("running");
+      expect(f.runtime.synchronizeSession).toHaveBeenCalledTimes(1);
+      expect(f.runtime.startTurn).toHaveBeenCalledTimes(1);
+      expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ result: "continuing" }), "Failed to send the task recovery result.");
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
+  test("does not invite continuation when Stop supersedes a recovery check", async () => {
+    vi.useFakeTimers();
+    const f = recoveryFixture("not_loaded");
+    try {
+      vi.mocked(f.runtime.synchronizeSession).mockImplementation(async (id) => {
+        const session = f.sessions.get(id)!;
+        session.activeTurnId = undefined;
+        f.store.requestSessionExecutionStop(id);
+        for (const listener of f.listeners) listener({ type: "turn_cancelled", sessionId: id, turnId: "old-turn" });
+        return session;
+      });
+      await f.controller.recoverInterruptedTasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.store.getTurnAttempt("recover")?.status).toBe("cancelled");
+      expect(f.presenter.onEvent).toHaveBeenCalledWith({ type: "turn_cancelled", sessionId: "crashed", turnId: "old-turn" });
+      expect(JSON.stringify(vi.mocked(f.outbound.sendText).mock.calls)).not.toContain("请发送“继续”");
+      expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    } finally { f.controller.close(); vi.useRealTimers(); }
+  });
+
   test("ends recovery and shows the writer conflict without claiming a new running card or closing processes", async () => {
     vi.useFakeTimers();
     const f = recoveryFixture();
@@ -1834,7 +2203,7 @@ describe("ProxySessionController", () => {
     expect(outbound.replyText).toHaveBeenCalledWith(
       contextKey,
       { messageId: "om_original", replyInThread: true },
-      "检测到任务在 Agent Bot 重启前尚未完成，正在自动恢复。",
+      "检测到重启前存在未完成任务，正在核对远端执行状态并尝试恢复。",
     );
     expect(presenter.startPendingTurn).not.toHaveBeenCalled();
     expect(runtime.startTurn).not.toHaveBeenCalled();
@@ -1898,7 +2267,7 @@ describe("ProxySessionController", () => {
 
     expect(outbound.sendText).toHaveBeenCalledWith(
       groupContextKey,
-      "检测到任务在 Agent Bot 重启前尚未完成，正在自动恢复。",
+      "检测到重启前存在未完成任务，正在核对远端执行状态并尝试恢复。",
     );
     expect(presenter.startPendingTurn).not.toHaveBeenCalled();
     expect(runtime.startTurn).not.toHaveBeenCalled();
@@ -1906,9 +2275,9 @@ describe("ProxySessionController", () => {
     expect(store.getSession("session_shared_recovery")?.contextKey).toBe(privateContextKey);
   });
 
-  test("expires an interrupted turn inactive for more than ten minutes without recovering it", async () => {
+  test("expires an interrupted turn inactive for more than twenty minutes without recovering it", async () => {
     const { controller, runtime, outbound, presenter, store } = fixture();
-    const staleAt = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
+    const staleAt = new Date(Date.now() - 21 * 60 * 1_000).toISOString();
     store.getOrCreateUserContext("chat_id:c1", "codex");
     store.createSession({
       localSessionId: "session_stale_recovery",

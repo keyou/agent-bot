@@ -774,9 +774,46 @@ export class StateStore {
     return row ? mapTurnAttempt(row) : undefined;
   }
 
+  findLatestTurnAttemptByTurnId(turnId: string): TurnAttemptRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM turn_attempts WHERE turn_id = ? ORDER BY rowid DESC LIMIT 1")
+      .get(turnId) as TurnAttemptRow | undefined;
+    return row ? mapTurnAttempt(row) : undefined;
+  }
+
+  isLatestTurnAttempt(attemptId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM turn_attempts source WHERE source.attempt_id = ?
+      AND NOT EXISTS (SELECT 1 FROM turn_attempts newer
+        WHERE newer.local_session_id = source.local_session_id AND newer.rowid > source.rowid)`)
+      .get(attemptId));
+  }
+
+  claimRecoveryContinuation(attemptId: string, promptText: string): TurnAttemptRecord | undefined {
+    return this.db.transaction(() => {
+      const source = this.getTurnAttempt(attemptId);
+      if (!source?.turnId || source.submissionState !== "submitted" || !isIncompleteTurnAttemptStatus(source.status)
+        || source.executionGeneration !== this.executionGeneration(source.localSessionId)
+        || !this.isLatestTurnAttempt(attemptId) || this.countQueuedPrompts(source.localSessionId) > 0) return undefined;
+      const continuationId = `recovery_continuation:${source.localSessionId}:${source.turnId}`;
+      if (this.getTurnAttempt(continuationId)) return undefined;
+      // Commit the terminal source and its one-shot successor together, including across a second crash.
+      this.updateTurnAttempt(attemptId, { status: "cancelled" });
+      return this.createTurnAttempt({
+        attemptId: continuationId, localSessionId: source.localSessionId, contextKey: source.contextKey,
+        promptText, messageId: source.messageId, replyMessageId: source.replyMessageId,
+        recoveredFromTurnId: source.turnId, recoveryCount: 1, executionGeneration: source.executionGeneration,
+      });
+    })();
+  }
+
   hasTurnAttemptsForSession(localSessionId: string): boolean {
     return Boolean(this.db.prepare("SELECT 1 FROM turn_attempts WHERE local_session_id = ? LIMIT 1")
       .get(localSessionId));
+  }
+
+  hasStoppedTurnAttemptForTurn(turnId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM turn_attempts WHERE turn_id = ?
+      AND execution_generation < COALESCE((SELECT generation FROM task_execution_control
+        WHERE local_session_id = turn_attempts.local_session_id), 0) LIMIT 1`).get(turnId));
   }
 
   findIncompleteTurnAttemptForSession(localSessionId: string): TurnAttemptRecord | undefined {
@@ -797,6 +834,37 @@ export class StateStore {
       ORDER BY created_at ASC, rowid ASC
     `).all() as TurnAttemptRow[];
     return rows.map(mapTurnAttempt);
+  }
+
+  listRecentlyInterruptedTurnAttempts(cutoff: string): TurnAttemptRecord[] {
+    const rows = this.db.prepare(`SELECT source.* FROM turn_attempts source
+      WHERE source.status = 'cancelled' AND source.turn_id IS NOT NULL
+        AND source.submission_state = 'submitted' AND source.updated_at >= ?
+        AND source.execution_generation = COALESCE((SELECT generation FROM task_execution_control
+          WHERE local_session_id = source.local_session_id), 0)
+        AND NOT EXISTS (SELECT 1 FROM turn_attempts newer
+          WHERE newer.local_session_id = source.local_session_id AND newer.rowid > source.rowid)
+      ORDER BY source.updated_at, source.rowid`).all(cutoff) as TurnAttemptRow[];
+    return rows.map(mapTurnAttempt);
+  }
+
+  prepareInterruptedTurnAttemptRecovery(attemptId: string, cutoff: string): TurnAttemptRecord | undefined {
+    return this.db.transaction(() => {
+      const source = this.getTurnAttempt(attemptId);
+      if (!source?.turnId || source.status !== "cancelled" || source.submissionState !== "submitted"
+        || source.updatedAt < cutoff || source.executionGeneration !== this.executionGeneration(source.localSessionId)
+        || !this.isLatestTurnAttempt(attemptId)) return undefined;
+      // Checking an interruption is not new execution activity; retain the original recovery deadline.
+      this.db.prepare("UPDATE turn_attempts SET status = 'recovering' WHERE attempt_id = ?").run(attemptId);
+      return this.getTurnAttempt(attemptId);
+    })();
+  }
+
+  markTurnAttemptRecovering(attemptId: string): void {
+    this.db.prepare(`UPDATE turn_attempts SET status = 'recovering' WHERE attempt_id = ?
+      AND status IN ('accepted', 'running', 'recovering')
+      AND execution_generation = COALESCE((SELECT generation FROM task_execution_control
+        WHERE local_session_id = turn_attempts.local_session_id), 0)`).run(attemptId);
   }
 
   listCancellationRequestedTurnAttempts(): TurnAttemptRecord[] {
@@ -862,8 +930,8 @@ export class StateStore {
     this.db.prepare(`
       UPDATE turn_attempts
       SET status = ?, updated_at = ?
-      WHERE turn_id = ?
-    `).run(status, new Date().toISOString(), turnId);
+      WHERE turn_id = ? AND status <> ?
+    `).run(status, new Date().toISOString(), turnId, status);
     const runs = this.db.prepare(`SELECT s.id FROM scheduled_runs s JOIN turn_attempts t ON t.attempt_id = s.id
       WHERE t.turn_id = ?`).all(turnId) as Array<{ id: string }>;
     for (const run of runs) this.schedules.finish(run.id, status);
@@ -882,7 +950,7 @@ export class StateStore {
   requestTurnAttemptCancellation(turnId: string): TurnAttemptRecord | undefined {
     const existing = this.findIncompleteTurnAttemptByTurnId(turnId);
     if (!existing) return undefined;
-    this.updateTurnAttempt(existing.attemptId, { status: "cancelling" });
+    this.requestSessionExecutionStop(existing.localSessionId);
     return existing;
   }
 

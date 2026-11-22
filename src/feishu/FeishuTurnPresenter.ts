@@ -257,7 +257,7 @@ export class FeishuTurnPresenter {
     const state: TurnViewState = {
       ...snapshot,
       status: "cancelled",
-      progressText: message,
+      statusMessage: message,
       activeTool: undefined,
       approval: undefined,
       completedAt,

@@ -1086,7 +1086,7 @@ describe("FeishuTurnPresenter", () => {
     expect(outbound.sendInteractiveCard).toHaveBeenCalledTimes(2);
   });
 
-  test("closes the interrupted card and creates a distinct thinking card for recovery", async () => {
+  test.each([false, true])("closes the interrupted card with one visible explanation (activities: %s)", async (hasActivities) => {
     const store = new MemoryStore();
     const outbound = outboundWithMarkdown(vi.fn(async () => "final"));
     (outbound.sendInteractiveCard as ReturnType<typeof vi.fn>)
@@ -1097,7 +1097,9 @@ describe("FeishuTurnPresenter", () => {
 
     await presenter.startPendingTurn("s1", "chat_id:c1", "Task", undefined, "original prompt");
     await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: 1 });
+    if (hasActivities) await presenter.onEvent({ type: "progress", sessionId: "s1", turnId: "turn_1", activityId: "commentary:build", text: "Building" });
     await presenter.interruptTurnForRecovery("s1", "chat_id:c1", "turn_1", "continuing after restart");
+    expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1]).match(/continuing after restart/g)).toHaveLength(1);
     const recoveredPendingId = await presenter.startPendingTurn(
       "s1",
       "chat_id:c1",
@@ -1114,8 +1116,29 @@ describe("FeishuTurnPresenter", () => {
     );
     expect(store.getTurnSnapshot("turn_1")).toMatchObject({
       status: "cancelled",
-      progressText: "continuing after restart",
+      statusMessage: "continuing after restart",
     });
+    expect((store.getTurnSnapshot("turn_1") as TurnViewState).progressText).toBe(hasActivities ? "Building" : undefined);
+  });
+
+  test("persists a recovered cancellation explanation in the card and Preview", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-recovery-result-"));
+    const store = new MemoryStore();
+    store.previews = new TurnPreviewJournal(directory);
+    const outbound = outboundWithMarkdown(vi.fn(async () => "final"));
+    const presenter = new FeishuTurnPresenter(outbound, store, undefined, { criticalGapMs: 0 });
+    try {
+      presenter.registerSession("s1", "chat_id:c1");
+      await presenter.onEvent({ type: "turn_started", sessionId: "s1", turnId: "turn_1", startedAt: Date.now() });
+      await presenter.onEvent({ type: "progress", sessionId: "s1", turnId: "turn_1", activityId: "commentary:build", text: "Building" });
+      const event = { type: "turn_cancelled" as const, sessionId: "s1", turnId: "turn_1", message: "Original turn interrupted; not replayed. Send continue." };
+      await presenter.onEvent(event);
+      await presenter.flushAll();
+      expect(store.getTurnSnapshot("turn_1")).toMatchObject({ status: "cancelled", statusMessage: event.message });
+      expect(store.previews.load("turn_1")).toMatchObject({ status: "cancelled", statusMessage: event.message });
+      expect(JSON.stringify(vi.mocked(outbound.updateInteractiveCard).mock.calls.at(-1)?.[1])).toContain(event.message);
+      expect(outbound.sendMarkdown).not.toHaveBeenCalled();
+    } finally { store.previews.close(); fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
   test("delivers a rehydrated turn failure to its persisted group instead of the latest session context", async () => {

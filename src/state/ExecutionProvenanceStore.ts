@@ -3,7 +3,7 @@ import type { RuntimeSession } from "../runtime/types.js";
 import { createId } from "../utils/id.js";
 
 export type ExecutionTrigger = "user" | "queue" | "schedule" | "recovery" | "retry"
-  | "plan_handoff" | "response_continuation";
+  | "plan_handoff" | "response_continuation" | "recovery_continuation";
 
 export interface ExecutionProvenance {
   submissionId: string;

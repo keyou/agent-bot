@@ -364,7 +364,7 @@ function reduceEvent(state: TurnViewState, event: AgentEvent): TurnViewState {
       return {
         ...state,
         status: "cancelled",
-        statusMessage: undefined,
+        statusMessage: event.message,
         activeTool: undefined,
         approval: undefined,
         completedAt,

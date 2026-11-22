@@ -1300,6 +1300,51 @@ describe("StateStore runtime metadata", () => {
     expect(second.getTurnAttempt("attempt_1")).toMatchObject({ turnId: "turn_1", status: "completed" });
   });
 
+  test("atomically claims one continuation per interrupted source and persists it across reopen", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-recovery-claim-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "state.sqlite");
+    const first = new StateStore(file);
+    stores.push(first);
+    first.createTurnAttempt({ attemptId: "source", localSessionId: "s", contextKey: "chat:topic",
+      promptText: "original sensitive prompt", turnId: "old-turn", messageId: "user", replyMessageId: "root",
+      localImagePaths: ["original.png"] });
+    const next = first.claimRecoveryContinuation("source", "continue remaining work")!;
+    expect(next).toMatchObject({
+      promptText: "continue remaining work", localImagePaths: undefined, contextKey: "chat:topic", messageId: "user",
+      replyMessageId: "root", recoveredFromTurnId: "old-turn", recoveryCount: 1,
+      submissionState: "not_submitted", status: "accepted", executionGeneration: 0,
+    });
+    expect(first.getTurnAttempt("source")).toMatchObject({ status: "cancelled", promptText: "original sensitive prompt", turnId: "old-turn" });
+    expect(first.claimRecoveryContinuation("source", "duplicate")).toBeUndefined();
+    first.close();
+    stores.pop();
+    const reopened = new StateStore(file);
+    stores.push(reopened);
+    expect(reopened.listIncompleteTurnAttempts().map((attempt) => attempt.attemptId)).toEqual([next.attemptId]);
+    expect(reopened.claimRecoveryContinuation("source", "duplicate after restart")).toBeUndefined();
+    expect(reopened.isLatestTurnAttempt("source")).toBe(false);
+    expect(reopened.isLatestTurnAttempt(next.attemptId)).toBe(true);
+    reopened.beginTurnAttemptSubmission(next.attemptId);
+    expect(() => reopened.beginTurnAttemptSubmission(next.attemptId)).toThrow();
+  });
+
+  test.each(["stop", "unknown-submission", "newer-work", "completed"] as const)(
+    "does not claim an automatic continuation over %s", (change) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-recovery-guard-"));
+      tempDirectories.push(directory);
+      const store = new StateStore(path.join(directory, "state.sqlite"));
+      stores.push(store);
+      store.createTurnAttempt({ attemptId: "source", localSessionId: "s", contextKey: "chat", promptText: "original", turnId: "old-turn" });
+      if (change === "stop") store.requestSessionExecutionStop("s");
+      if (change === "unknown-submission") store.updateTurnAttempt("source", { submissionState: "submission_unknown" });
+      if (change === "newer-work") store.createTurnAttempt({ attemptId: "newer", localSessionId: "s", contextKey: "chat", promptText: "new work" });
+      if (change === "completed") store.markTurnAttemptTerminal("old-turn", "completed");
+      expect(store.claimRecoveryContinuation("source", "continue")).toBeUndefined();
+      expect(store.hasStoppedTurnAttemptForTurn("old-turn")).toBe(change === "stop");
+    },
+  );
+
   test("persists user cancellation intent separately from crash-recoverable attempts", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-state-"));
     tempDirectories.push(directory);
@@ -1321,13 +1366,78 @@ describe("StateStore runtime metadata", () => {
     expect(store.listCancellationRequestedTurnAttempts()).toEqual([
       expect.objectContaining({ attemptId: "attempt_cancel", status: "cancelling" }),
     ]);
+    expect(store.executionGeneration("session_cancel")).toBe(1);
     store.requestSessionExecutionStop("session_cancel");
     expect(store.getTurnAttempt("attempt_cancel")?.status).toBe("cancelling");
     const reopened = new StateStore(path.join(directory, "state.sqlite"));
     stores.push(reopened);
-    expect(reopened.executionGeneration("session_cancel")).toBe(1);
+    expect(reopened.executionGeneration("session_cancel")).toBe(2);
     expect(reopened.prepareTurnAttemptRecovery("attempt_cancel")).toBeUndefined();
     expect(() => reopened.beginTurnAttemptSubmission("attempt_cancel")).toThrow("automatic replay refused");
+  });
+
+  test("distinguishes non-user interruption from Stop across reopen without extending the recovery deadline", () => {
+    vi.useFakeTimers();
+    const interruptedAt = Date.now();
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-interruption-recovery-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "state.sqlite");
+    const first = new StateStore(file);
+    stores.push(first);
+    try {
+      first.createTurnAttempt({ attemptId: "source", localSessionId: "s", contextKey: "chat", promptText: "original", turnId: "old-turn" });
+      first.markTurnAttemptTerminal("old-turn", "cancelled");
+      vi.setSystemTime(interruptedAt + 15 * 60_000);
+      first.markTurnAttemptTerminal("old-turn", "cancelled");
+      expect(first.getTurnAttempt("source")?.updatedAt).toBe(new Date(interruptedAt).toISOString());
+      first.close();
+      stores.pop();
+      const second = new StateStore(file);
+      stores.push(second);
+      const cutoff = new Date(Date.now() - 20 * 60_000).toISOString();
+      expect(second.listRecentlyInterruptedTurnAttempts(cutoff).map((attempt) => attempt.attemptId)).toEqual(["source"]);
+      expect(second.prepareInterruptedTurnAttemptRecovery("source", cutoff)).toMatchObject({
+        status: "recovering", updatedAt: new Date(interruptedAt).toISOString(),
+      });
+      expect(second.prepareInterruptedTurnAttemptRecovery("source", cutoff)).toBeUndefined();
+      second.requestTurnAttemptCancellation("old-turn");
+      second.markTurnAttemptTerminal("old-turn", "cancelled");
+      second.close();
+      stores.pop();
+      const third = new StateStore(file);
+      stores.push(third);
+      expect(third.hasStoppedTurnAttemptForTurn("old-turn")).toBe(true);
+      expect(third.listRecentlyInterruptedTurnAttempts(cutoff)).toEqual([]);
+      expect(third.prepareInterruptedTurnAttemptRecovery("source", cutoff)).toBeUndefined();
+    } finally { vi.useRealTimers(); }
+  });
+
+  test.each(["cancelled", "failed", "completed", "unknown"] as const)("Stop remains authoritative after the turn is reported %s", (status) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-stop-status-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    store.createTurnAttempt({ attemptId: "source", localSessionId: "s", contextKey: "chat", promptText: "original", turnId: "old-turn" });
+    store.requestTurnAttemptCancellation("old-turn");
+    store.updateTurnAttempt("source", { status });
+    expect(store.hasStoppedTurnAttemptForTurn("old-turn")).toBe(true);
+    expect(store.listRecentlyInterruptedTurnAttempts(new Date(Date.now() - 20 * 60_000).toISOString())).toEqual([]);
+  });
+
+  test.each(["stale", "newer-work", "not-submitted", "ambiguous"] as const)("does not reopen a cancelled record with %s", (change) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bot-interruption-candidate-"));
+    tempDirectories.push(directory);
+    const store = new StateStore(path.join(directory, "state.sqlite"));
+    stores.push(store);
+    store.createTurnAttempt({ attemptId: "source", localSessionId: "s", contextKey: "chat", promptText: "original", turnId: "old-turn" });
+    store.markTurnAttemptTerminal("old-turn", "cancelled");
+    if (change === "newer-work") store.createTurnAttempt({ attemptId: "newer", localSessionId: "s", contextKey: "chat", promptText: "new" });
+    if (change === "not-submitted") store.updateTurnAttempt("source", { submissionState: "not_submitted" });
+    if (change === "ambiguous") store.updateTurnAttempt("source", { submissionState: "submission_unknown" });
+    const cutoff = new Date(Date.now() + (change === "stale" ? 60_000 : -20 * 60_000)).toISOString();
+    expect(store.listRecentlyInterruptedTurnAttempts(cutoff)).toEqual([]);
+    expect(store.prepareInterruptedTurnAttemptRecovery("source", cutoff)).toBeUndefined();
+    expect(store.getTurnAttempt("source")?.status).toBe("cancelled");
   });
 
   test("refreshes unfinished turn activity while throttling frequent persistence writes", () => {
