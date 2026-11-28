@@ -54,7 +54,8 @@ test("source terminal management card retains reopen and close controls after th
     expiresAt: Date.now() + 300_000, reopenToken: "B8j3N2pS", reopenUrl: "https://preview.example/terminal/B8j3N2pS", recovery: true, connected: false };
   const card = renderer.renderTerminalAuthorization({ ...view, state: "running" });
   expect(JSON.stringify(card)).toContain("网页已断开，Shell 仍在运行");
-  expect(JSON.stringify(card)).toContain("网页断开 3 分钟后会自动关闭 Shell");
+  expect(JSON.stringify(card)).toContain("网页断开 30 分钟后会自动关闭 Shell");
+  expect(JSON.stringify(card)).toContain("无需再次输入密码");
   expect(JSON.stringify(card)).toContain("[重新打开终端](https://preview.example/terminal/B8j3N2pS)");
   expect(JSON.stringify(card)).toContain("**终端**：`B8j3N2pS`");
   expect(JSON.stringify(card)).not.toContain("original");

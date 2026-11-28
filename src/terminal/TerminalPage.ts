@@ -1,17 +1,21 @@
-export function terminalPage(base: string, recovery = false): string {
+import { DEFAULT_TERMINAL_PASSWORD } from "../config/schema.js";
+
+export function terminalPage(base: string, recovery = false, autoResume = false, defaultPassword = false): string {
+  defaultPassword = defaultPassword && !autoResume;
   base = base.replaceAll("&", "&amp;").replaceAll(String.fromCharCode(34), "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AgentBot Terminal</title><link rel="stylesheet" href="${base}/assets/xterm.css"><link rel="stylesheet" href="${base}/assets/terminal.css">
 <script defer src="${base}/assets/xterm.js"></script><script defer src="${base}/assets/fit.js"></script><script defer src="${base}/assets/terminal.js"></script></head>
-<body data-base="${base}" data-recovery="${recovery}"><header><strong>AgentBot <span>Terminal</span></strong><div id="status" role="status">尚未连接</div><button id="connect">连接</button><button id="interrupt" disabled>Ctrl+C</button><button id="close" disabled>关闭终端</button></header>
-<section id="welcome"><h1>连接终端</h1><p>此终端拥有 AgentBot 所在电脑的系统用户权限。</p><label for="password">终端密码</label><div class="password-row"><input id="password" type="password" autocomplete="current-password" maxlength="256" autofocus><button id="welcome-connect" type="button">连接</button></div></section><div id="terminal"></div>
-<footer id="details">前台连接时不因空闲关闭；后台空闲 30 分钟或网页断开 3 分钟后自动关闭 Shell · 成功重连取消断开计时并重置空闲计时 · 可从原会话的终端管理卡打开或关闭终端</footer></body></html>`;
+<body data-base="${base}" data-recovery="${recovery}" data-resume="${autoResume}" data-default-password="${defaultPassword}"><header><strong>AgentBot <span>Terminal</span></strong><div id="status" role="status">尚未连接</div><button id="connect">连接</button><button id="interrupt" disabled>Ctrl+C</button><button id="close" title="前台连接不因空闲关闭；后台空闲或网页断开 30 分钟后关闭。重连重新计时，可从原会话的终端管理卡打开或关闭终端。" disabled>关闭终端</button></header>
+<section id="welcome"><h1>连接终端</h1><p>此终端拥有 AgentBot 所在电脑的系统用户权限。</p><label for="password">终端密码</label><div class="password-row"><input id="password" type="password" autocomplete="current-password" maxlength="256" value="${defaultPassword ? DEFAULT_TERMINAL_PASSWORD : ""}" aria-describedby="password-hint" autofocus><button id="welcome-connect" type="button">连接</button></div><p id="password-hint">可在飞书 /setting → 高级 → 终端密码中修改默认密码。</p></section><div id="terminal"></div>
+</body></html>`;
 }
 
 export const TERMINAL_CSS = `
 #welcome-connect{padding:10px 20px;font:inherit}
 #welcome{width:100%}.password-row{display:flex;gap:12px;margin-top:8px;max-width:440px}#password{min-width:0;flex:1;background:#191f2b;border:1px solid #415775;border-radius:6px;padding:10px 12px;color:inherit;font:inherit}#password:focus{outline:2px solid #84c1ff;outline-offset:2px}
-:root{color-scheme:dark;font:14px system-ui,sans-serif;background:#10141b;color:#dbe4f1}*{box-sizing:border-box}body{margin:0;height:100dvh;display:flex;flex-direction:column}header{display:flex;gap:12px;align-items:center;padding:12px 18px;background:#191f2b;border-bottom:1px solid #303a4d;flex-wrap:wrap}header strong{font-size:17px}header strong span{font-weight:400;color:#9aacc7}#status{flex:1;color:#adbfdb;font-size:13px}button{background:#25334a;border:1px solid #415775;border-radius:7px;padding:8px 12px;color:#e5efff;cursor:pointer}button:hover{background:#304661}button:disabled{opacity:.45;cursor:default}#close{border-color:#86505a}#welcome{margin:40px auto;max-width:780px;padding:0 24px;line-height:1.8}h1{font-size:25px}#terminal{flex:1;min-height:0;padding:12px 14px;display:none}.xterm{height:100%}footer{font-size:12px;color:#8f9eb7;padding:9px 18px;border-top:1px solid #293142}body.connected #welcome{display:none}body.connected #terminal{display:block}@media(max-width:650px){header{padding:10px;gap:8px}#status{min-width:100%}footer{padding:7px 10px}#terminal{padding:6px}}
+:root{color-scheme:dark;font:14px system-ui,sans-serif;background:#10141b;color:#dbe4f1}*{box-sizing:border-box}body{margin:0;height:100dvh;display:flex;flex-direction:column}header{display:flex;gap:12px;align-items:center;padding:12px 18px;background:#191f2b;border-bottom:1px solid #303a4d;flex-wrap:wrap}header strong{font-size:17px}header strong span{font-weight:400;color:#9aacc7}#status{flex:1;color:#adbfdb;font-size:13px}button{background:#25334a;border:1px solid #415775;border-radius:7px;padding:8px 12px;color:#e5efff;cursor:pointer}button:hover{background:#304661}button:disabled{opacity:.45;cursor:default}#close{border-color:#86505a}#welcome{margin:40px auto;max-width:780px;padding:0 24px;line-height:1.8}h1{font-size:25px}#terminal{flex:1;min-height:0;padding:12px 14px;display:none}.xterm{height:100%}body.connected #welcome{display:none}body.connected #terminal{display:block}
+@media(max-width:650px){header{padding:4px 6px;gap:6px;flex-shrink:0}header strong{display:none}#status{flex:0 0 100%;min-width:0;font-size:12px;line-height:1.4;overflow-wrap:anywhere}#status:has(.terminal-directory){flex:1}.terminal-directory{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}header button{flex-shrink:0;min-height:44px;padding:6px 8px;font-size:12px}#terminal{padding:6px}}
 `;
 
 export const TERMINAL_SCRIPT = String.raw`(() => {
@@ -24,8 +28,12 @@ export const TERMINAL_SCRIPT = String.raw`(() => {
   const interrupt = document.getElementById('interrupt');
   const storageKey = 'agentbot-terminal:' + location.pathname;
   const recovery = document.body.dataset.recovery === 'true';
+  const autoResume = recovery && document.body.dataset.resume === 'true';
+  const defaultPassword = document.body.dataset.defaultPassword === 'true';
+  const initialPassword = password.value;
+  if (autoResume) document.getElementById('welcome').hidden = true;
   if (recovery) document.querySelector('#welcome h1').textContent = '恢复已有终端';
-  let session, ws, term, observer, retryTimer, socketTimer, checking, visibilityTimer;
+  let session, ws, term, observer, retryTimer, socketTimer, checking, visibilityTimer, countdownTimer;
   let socketReady = false;
   let epoch = 0, failures = 0, stopped = false, pageHidden = false, offline = false, busy = false;
   try { session = JSON.parse(sessionStorage.getItem(storageKey) || 'null'); } catch {}
@@ -57,11 +65,25 @@ export const TERMINAL_SCRIPT = String.raw`(() => {
     password.disabled = busy;
   }
   function invalidate() {
+    cancelDefaultConnect();
     epoch++; clearTimeout(retryTimer); clearTimeout(socketTimer);
     clearTimeout(visibilityTimer); socketReady = false;
     checking?.abort(); checking = undefined;
     const old = ws; ws = undefined; old?.close(); interrupt.disabled = true;
     if (term) term.options.disableStdin = true;
+  }
+  function cancelDefaultConnect() {
+    if (countdownTimer === undefined) return;
+    clearTimeout(countdownTimer); countdownTimer = undefined;
+    status.textContent = '已取消自动连接';
+  }
+  function countdown(seconds = 5) {
+    if (!awake() || busy || session || password.value !== initialPassword) { cancelDefaultConnect(); return; }
+    status.textContent = '使用默认密码，' + seconds + ' 秒后自动连接';
+    countdownTimer = setTimeout(() => {
+      if (!awake() || password.value !== initialPassword) { cancelDefaultConnect(); return; }
+      if (seconds === 1) connect.click(); else countdown(seconds - 1);
+    }, 1000);
   }
   function forget() {
     session = undefined; sessionStorage.removeItem(storageKey);
@@ -133,7 +155,10 @@ export const TERMINAL_SCRIPT = String.raw`(() => {
           const restored = () => {
             if (!active()) return;
             terminal.options.disableStdin = false; terminal.focus();
-            status.textContent = '已连接 · ' + result.cwd; interrupt.disabled = false; buttons();
+            status.textContent = '已连接 · ';
+            const directory = document.createElement('span');
+            directory.className = 'terminal-directory'; directory.textContent = result.cwd; directory.title = result.cwd;
+            status.append(directory); interrupt.disabled = false; buttons();
           };
           // xterm parses asynchronously. Keep replay silent until its write callback,
           // before subsequently queued live output is parsed. Startup output is live.
@@ -174,23 +199,25 @@ export const TERMINAL_SCRIPT = String.raw`(() => {
     stopped = false; failures = 0; invalidate();
     if (session) { status.textContent = '正在恢复已有终端授权…'; buttons(); check(); return; }
     document.body.classList.remove('connected');
-    if (!password.value) { status.textContent = '请输入终端密码'; password.focus(); return; }
-    busy = true; buttons(); status.textContent = '正在验证密码…';
+    if (!autoResume && !password.value) { status.textContent = '请输入终端密码'; password.focus(); return; }
+    busy = true; buttons(); status.textContent = autoResume ? '正在恢复原终端…' : '正在验证密码…';
     try {
       if (!globalThis.crypto?.getRandomValues) throw new Error('浏览器不支持安全随机数，请使用新版浏览器。');
       const browserKey = Array.from(crypto.getRandomValues(new Uint8Array(32)), (n) => n.toString(16).padStart(2,'0')).join('');
-      const result = await post('request', {launch:location.pathname,browserKey,password:password.value});
+      const result = await post('request', {launch:location.pathname,browserKey,password:autoResume ? undefined : password.value});
       password.value = '';
       session = {requestId:result.requestId,browserKey}; sessionStorage.setItem(storageKey,JSON.stringify(session));
-      status.textContent = '密码已验证，正在连接终端…';
+      status.textContent = autoResume ? '正在恢复原终端…' : '密码已验证，正在连接终端…';
     } catch (error) { status.textContent = '连接失败：' + message(error); password.focus(); }
     finally { busy = false; buttons(!session); }
     check();
   };
   password.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); welcomeConnect.click(); } });
+  password.addEventListener('input', cancelDefaultConnect);
+  password.addEventListener('change', cancelDefaultConnect);
   interrupt.onclick = () => { if (ws?.readyState === WebSocket.OPEN && !interrupt.disabled) ws.send(JSON.stringify({type:'input',data:String.fromCharCode(3)})); };
   close.onclick = async () => {
-    if (busy || !session || !confirm('关闭该终端和 Shell？已脱离终端的后台进程可能继续运行。')) return;
+    if (busy || !session || !confirm('关闭该终端和 Shell？\n' + close.title + '\n已脱离终端的后台进程可能继续运行。')) return;
     busy = true; stopped = true; invalidate(); buttons();
     try { await post('close',session); end('终端已关闭'); }
     catch (error) {
@@ -212,5 +239,8 @@ export const TERMINAL_SCRIPT = String.raw`(() => {
   window.addEventListener('offline', () => { offline = true; suspend(); });
   window.addEventListener('online', () => { offline = false; resume(); });
   window.addEventListener('focus', resume);
-  buttons(); check();
+  buttons();
+  if (!session && autoResume) connect.click();
+  else if (!session && defaultPassword) countdown();
+  else check();
 })();`;

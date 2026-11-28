@@ -36,10 +36,34 @@ test("wrong passwords display the server error without saving a grant or automat
   f.event("pagehide");
 });
 
-function page(saved = false, origin = "https://preview.example", pathname = "/proxy/terminal/A7k2M9qR", recovery = false) {
+test.each([
+  "D:\\dev\\" + "long-directory\\".repeat(20),
+  '<img src=x onerror=alert(1)>',
+])("keeps the connected directory as plain text and replaces it with full errors (%s)", async (cwd) => {
+  const f = page(true);
+  await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
+  const ws = f.sockets[0]!;
+  ws.receive({ type: "ready", cwd });
+  const status = f.document.getElementById("status")!;
+  const directory = status.querySelector<HTMLElement>(".terminal-directory")!;
+  expect(status.getAttribute("role")).toBe("status");
+  expect(status.textContent).toBe("已连接 · " + cwd);
+  expect(directory.textContent).toBe(cwd);
+  expect(directory.title).toBe(cwd);
+  expect(directory.children).toHaveLength(0);
+  const error = "连接已在另一页面恢复，请重新连接。".repeat(10);
+  ws.receive({ type: "error", message: error });
+  expect(status.querySelector(".terminal-directory")).toBeNull();
+  expect(status.textContent).toBe("终端连接被拒绝：" + error);
+  expect(f.document.getElementById("interrupt")!.hasAttribute("disabled")).toBe(true);
+  f.event("pagehide");
+});
+
+function page(saved = false, origin = "https://preview.example", pathname = "/proxy/terminal/A7k2M9qR", recovery = false, autoResume = false,
+  requestFailure?: { status: number; error: string }, defaultPassword = false) {
   const base = "/proxy/terminal";
-  const { document } = parseHTML(terminalPage(base, recovery));
-  document.querySelector<HTMLInputElement>("#password")!.value = "test-password";
+  const { document } = parseHTML(terminalPage(base, recovery, autoResume, defaultPassword));
+  if (!defaultPassword) document.querySelector<HTMLInputElement>("#password")!.value = "test-password";
   const windowEvents = new Map<string, () => void>();
   const documentEvents = new Map<string, () => void>();
   document.addEventListener = ((name: string, listener: () => void) => { documentEvents.set(name, listener); }) as typeof document.addEventListener;
@@ -47,8 +71,10 @@ function page(saved = false, origin = "https://preview.example", pathname = "/pr
   const key = "agentbot-terminal:" + pathname;
   if (saved) stored.set(key, JSON.stringify({ requestId: "saved", browserKey: "a".repeat(64) }));
   const sessionStorage = { getItem: (key: string) => stored.get(key), setItem: (key: string, value: string) => stored.set(key, value), removeItem: (key: string) => stored.delete(key) };
-  const fetch = vi.fn(async (url: string, _options?: RequestInit): Promise<{ ok: boolean; status?: number; json(): Promise<unknown> }> => ({ ok: true, json: async () => url.endsWith("/request")
-    ? { requestId: "request", code: "123456" } : { state: "approved" } }));
+  const fetch = vi.fn(async (url: string, _options?: RequestInit): Promise<{ ok: boolean; status?: number; json(): Promise<unknown> }> => {
+    if (url.endsWith("/request") && requestFailure) return { ok: false, status: requestFailure.status, json: async () => ({ error: requestFailure.error }) };
+    return { ok: true, json: async () => url.endsWith("/request") ? { requestId: "request", code: "123456" } : { state: "approved" } };
+  });
   const sockets: Socket[] = [];
   class Socket {
     static OPEN = 1; readyState = 1; send = vi.fn(); close = vi.fn();
@@ -76,12 +102,13 @@ function page(saved = false, origin = "https://preview.example", pathname = "/pr
     onData(listener: typeof onInput) { onInput = listener; this.emulator.onData(listener); }
     onResize(listener: typeof onResize) { onResize = listener; }
   }
+  const confirm = vi.fn((_message: string) => true);
   runInNewContext(TERMINAL_SCRIPT, { document, window: { isSecureContext: origin.startsWith("https:"), addEventListener: (name: string, listener: () => void) => windowEvents.set(name, listener) },
     location: { pathname, origin, protocol: new URL(origin).protocol },
     sessionStorage, crypto: webcrypto, fetch, URL, WebSocket: Socket, Terminal,
     FitAddon: { FitAddon: class { fit() {} } }, ResizeObserver: class { observe() {} disconnect() {} },
-    setTimeout, clearTimeout, AbortController, confirm: () => true });
-  return { document, fetch, sockets, stored, key, write, reset, instances, keyHandlers, select: (text: string) => { selection = text; },
+    setTimeout, clearTimeout, AbortController, confirm });
+  return { document, fetch, sockets, stored, key, write, reset, instances, keyHandlers, confirm, select: (text: string) => { selection = text; },
     input: (data: string) => onInput(data), resize: (cols: number, rows: number) => onResize({ cols, rows }),
     event: (name: string) => windowEvents.get(name)?.(),
     visibility: (hidden: boolean) => { Object.defineProperty(document, "hidden", { configurable: true, value: hidden }); documentEvents.get("visibilitychange")?.(); },
@@ -90,8 +117,8 @@ function page(saved = false, origin = "https://preview.example", pathname = "/pr
 
 test.each(["connect", "welcome-connect"])("%s submits the password, streams input and closes independently", async (buttonId) => {
   const f = page();
-  expect(f.document.getElementById("details")!.textContent).toContain("网页断开 3 分钟后自动关闭 Shell");
-  expect(f.document.getElementById("details")!.textContent).toContain("空闲 30 分钟或网页断开 3 分钟");
+  expect(f.document.querySelector("footer")).toBeNull();
+  expect(f.document.getElementById("close")!.title).toContain("后台空闲或网页断开 30 分钟后关闭");
   expect(f.fetch).not.toHaveBeenCalled();
   f.document.getElementById(buttonId)!.click();
   await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
@@ -117,6 +144,7 @@ test.each(["connect", "welcome-connect"])("%s submits the password, streams inpu
   expect(JSON.parse(ws.send.mock.lastCall![0] as string)).toEqual({ type: "input", data: String.fromCharCode(3) });
   f.document.getElementById("close")!.click();
   await vi.waitFor(() => expect(f.stored.has(f.key)).toBe(false));
+  expect(f.confirm).toHaveBeenCalledWith(expect.stringContaining("后台空闲或网页断开 30 分钟后关闭"));
   expect(ws.close).toHaveBeenCalled();
 });
 
@@ -453,7 +481,7 @@ test("server-selected recovery mode requests password access to the exact termin
   expect(f.document.querySelector("#welcome h1")!.textContent).toBe("恢复已有终端");
   expect(f.document.getElementById("connect")!.textContent).toBe("恢复连接");
   expect(f.document.getElementById("welcome-connect")!.textContent).toBe("恢复连接");
-  expect(f.document.getElementById("details")!.textContent).toContain("原会话的终端管理卡");
+  expect(f.document.getElementById("close")!.title).toContain("原会话的终端管理卡");
   expect(f.document.getElementById("welcome")!.textContent).toContain("终端密码");
   expect(f.fetch).not.toHaveBeenCalled();
   f.document.getElementById("welcome-connect")!.click();
@@ -461,5 +489,122 @@ test("server-selected recovery mode requests password access to the exact termin
   expect(JSON.parse(f.fetch.mock.calls[0]![1]!.body as string)).toMatchObject({ launch: pathname });
   expect(f.fetch.mock.calls[0]![0]).toBe("/proxy/terminal/api/request");
   expect(f.stored.has(f.key)).toBe(true);
+  f.event("pagehide");
+});
+
+test("a running recovery automatically reattaches without showing or sending a password", async () => {
+  const pathname = "/proxy/terminal/B8j3N2pS";
+  const f = page(false, "https://preview.example", pathname, true, true);
+  expect(f.document.getElementById("welcome")!.hidden).toBe(true);
+  await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
+  const request = JSON.parse(f.fetch.mock.calls[0]![1]!.body as string);
+  expect(request).toMatchObject({ launch: pathname }); expect(request).not.toHaveProperty("password");
+  const ws = f.sockets[0]!; ws.onopen?.();
+  ws.receive({ type: "ready", cwd: "/tmp", output: "previous output", replay: true });
+  await vi.waitFor(() => expect(f.document.getElementById("status")!.textContent).toBe("已连接 · /tmp"));
+  expect(f.write).toHaveBeenCalledWith("previous output");
+  f.event("pagehide");
+});
+
+test("a saved recovery grant reconnects without requesting another grant", async () => {
+  const f = page(true, "https://preview.example", "/proxy/terminal/B8j3N2pS", true, true);
+  await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
+  expect(f.fetch.mock.calls.every(([url]) => url.endsWith("/status"))).toBe(true);
+  f.sockets[0]!.onopen?.();
+  expect(JSON.parse(f.sockets[0]!.send.mock.calls[0]![0] as string)).toMatchObject({ type: "auth", requestId: "saved" });
+  f.event("pagehide");
+});
+
+test("a terminal that ends during automatic recovery reports failure without starting another one", async () => {
+  vi.useFakeTimers();
+  const f = page(false, "https://preview.example", "/proxy/terminal/B8j3N2pS", true, true, { status: 400, error: "原终端已结束" });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(f.document.getElementById("status")!.textContent).toContain("原终端已结束");
+  expect(f.fetch).toHaveBeenCalledOnce(); expect(f.sockets).toHaveLength(0); expect(f.stored.has(f.key)).toBe(false);
+  f.event("pagehide");
+});
+
+test("close-button help replaces the footer and cancelling closure preserves the Shell", async () => {
+  const f = page(true);
+  await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
+  const ws = f.sockets[0]!; ws.receive({ type: "ready", cwd: "/tmp" });
+  const close = f.document.getElementById("close")!;
+  expect(f.document.querySelector("footer")).toBeNull();
+  expect(f.document.body.textContent).not.toContain("后台空闲或网页断开 30 分钟");
+  f.confirm.mockReturnValueOnce(false); close.click();
+  expect(f.confirm).toHaveBeenCalledWith(expect.stringContaining(close.title));
+  expect(f.confirm).toHaveBeenCalledWith(expect.stringContaining("已脱离终端的后台进程可能继续运行"));
+  expect(ws.close).not.toHaveBeenCalled(); expect(f.stored.has(f.key)).toBe(true);
+  expect(f.fetch.mock.calls.some(([url]) => url.endsWith("/close"))).toBe(false);
+  close.click();
+  await vi.waitFor(() => expect(f.stored.has(f.key)).toBe(false));
+  expect(f.fetch.mock.calls.filter(([url]) => url.endsWith("/close"))).toHaveLength(1);
+});
+
+test("the default password is prefilled and connects exactly once after a five-second countdown", async () => {
+  vi.useFakeTimers(); const f = page(false, undefined, undefined, false, false, undefined, true);
+  expect(f.document.querySelector<HTMLInputElement>("#password")!.value).toBe("123456");
+  expect(f.document.getElementById("password-hint")!.textContent).toContain("/setting → 高级 → 终端密码");
+  expect(f.document.getElementById("status")!.textContent).toContain("5 秒后自动连接");
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(f.document.getElementById("status")!.textContent).toContain("4 秒后自动连接");
+  await vi.advanceTimersByTimeAsync(3999); expect(f.fetch).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(f.sockets).toHaveLength(1);
+  expect(JSON.parse(f.fetch.mock.calls[0]![1]!.body as string).password).toBe("123456");
+  expect(f.document.querySelector<HTMLInputElement>("#password")!.value).toBe("");
+  expect(f.stored.get(f.key)).not.toContain("123456");
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(f.fetch.mock.calls.filter(([url]) => url.endsWith("/request"))).toHaveLength(1);
+  f.event("pagehide");
+});
+
+test("editing the default password cancels auto-connect and preserves manual login", async () => {
+  vi.useFakeTimers(); const f = page(false, undefined, undefined, false, false, undefined, true);
+  await vi.advanceTimersByTimeAsync(2000);
+  const input = f.document.querySelector<HTMLInputElement>("#password")!; input.value = "edited-password";
+  input.dispatchEvent(new f.document.defaultView!.Event("input"));
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(f.fetch).not.toHaveBeenCalled(); expect(f.document.getElementById("status")!.textContent).toBe("已取消自动连接");
+  f.document.getElementById("welcome-connect")!.click(); await vi.advanceTimersByTimeAsync(0);
+  expect(JSON.parse(f.fetch.mock.calls[0]![1]!.body as string).password).toBe("edited-password");
+  f.event("pagehide");
+});
+
+test.each(["connect", "welcome-connect"])("manual %s cancels the countdown without a duplicate login", async (buttonId) => {
+  vi.useFakeTimers(); const f = page(false, undefined, undefined, false, false, undefined, true);
+  await vi.advanceTimersByTimeAsync(2000); f.document.getElementById(buttonId)!.click();
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(f.fetch.mock.calls.filter(([url]) => url.endsWith("/request"))).toHaveLength(1);
+  expect(f.sockets).toHaveLength(1); f.event("pagehide");
+});
+
+test.each(["pagehide", "offline", "hidden"])("%s cancels countdown and returning never creates a delayed Shell", async (event) => {
+  vi.useFakeTimers(); const f = page(false, undefined, undefined, false, false, undefined, true);
+  await vi.advanceTimersByTimeAsync(2000);
+  if (event === "hidden") f.visibility(true); else f.event(event);
+  await vi.advanceTimersByTimeAsync(5000);
+  if (event === "hidden") f.visibility(false); else f.event(event === "offline" ? "online" : "pageshow");
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(f.fetch).not.toHaveBeenCalled(); expect(f.sockets).toHaveLength(0); f.event("pagehide");
+});
+
+test("a password changed before automatic login reports the error without retrying", async () => {
+  vi.useFakeTimers();
+  const f = page(false, undefined, undefined, false, false, { status: 401, error: "终端密码错误，请重新输入。" }, true);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(f.document.getElementById("status")!.textContent).toContain("终端密码错误");
+  expect(f.fetch).toHaveBeenCalledOnce(); expect(f.sockets).toHaveLength(0); f.event("pagehide");
+});
+
+test.each(["saved", "running-recovery"])("%s connects immediately without a default-password countdown", async (mode) => {
+  vi.useFakeTimers();
+  const recovery = mode === "running-recovery";
+  const f = page(!recovery, undefined, undefined, recovery, recovery, undefined, true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.sockets).toHaveLength(1);
+  expect(f.document.getElementById("status")!.textContent).not.toContain("秒后自动连接");
+  if (recovery) expect(JSON.parse(f.fetch.mock.calls[0]![1]!.body as string)).not.toHaveProperty("password");
+  else expect(f.fetch.mock.calls.every(([url]) => url.endsWith("/status"))).toBe(true);
   f.event("pagehide");
 });

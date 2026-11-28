@@ -6,6 +6,7 @@ describe("CommandRouter", () => {
 
   test("opens global settings without treating arguments as a Prompt", () => {
     expect(router.parse("/settings")).toEqual({ type: "settings" });
+    expect(router.parse("/setting")).toEqual({ type: "settings" });
     expect(router.parse("/sett")).toEqual({ type: "settings" });
     expect(() => router.parse("/settings auto")).toThrow("不接受参数");
     expect(() => router.parse("/se")).toThrow("不唯一");

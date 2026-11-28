@@ -1025,8 +1025,8 @@ export class CardRenderer {
     } else {
       const waiting = view.state === "approved";
       const label = waiting ? "打开终端" : "重新打开终端";
-      elements.push(markdown(`**状态**：${waiting ? "已授权，等待网页连接" : view.connected ? "已连接" : "网页已断开，Shell 仍在运行"}\n${waiting ? "请返回原网页连接；原网页已关闭时，点击下方“打开终端”。Shell 尚未启动。" : "点击下方“重新打开终端”恢复原 Shell。前台连接时不因空闲关闭；后台空闲 30 分钟或网页断开 3 分钟后会自动关闭 Shell，成功重连取消断开计时并重置空闲计时；“关闭终端”会中断其中的命令。"}`));
-      elements.push(markdown(`[${label}](${view.reopenUrl}) · 新网页输入终端密码${waiting ? "，连接成功后启动 Shell" : "，恢复原 Shell"}`));
+      elements.push(markdown(`**状态**：${waiting ? "已授权，等待网页连接" : view.connected ? "已连接" : "网页已断开，Shell 仍在运行"}\n${waiting ? "请返回原网页连接；原网页已关闭时，点击下方“打开终端”。Shell 尚未启动。" : "点击下方“重新打开终端”直接恢复原 Shell，无需再次输入密码。前台连接时不因空闲关闭；后台空闲 30 分钟或网页断开 30 分钟后会自动关闭 Shell，成功重连取消断开计时并重置空闲计时；“关闭终端”会中断其中的命令。"}`));
+      elements.push(markdown(`[${label}](${view.reopenUrl}) · ${waiting ? "新网页输入终端密码，连接成功后启动 Shell" : "直接恢复原 Shell"}`));
       elements.push(taskActionRow([{ text: "关闭终端", type: "danger", value: action("close") }, { text: "刷新", value: action("refresh") }]));
     }
     return sectionCard("网页终端管理", elements, view.state === "closed" ? "grey" : "blue");

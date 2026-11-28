@@ -4,6 +4,7 @@ import path from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import http from "node:http";
 import { WebSocket } from "ws";
+import { parseHTML } from "linkedom";
 import { afterEach, expect, test, vi } from "vitest";
 import { TerminalServer, type TerminalCardView } from "../../src/terminal/TerminalServer.js";
 import { LocalFileViewerServer } from "../../src/local-files/LocalFileViewerServer.js";
@@ -12,6 +13,19 @@ import type { TerminalProcess } from "../../src/terminal/TerminalProcess.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { try { for (const cleanup of cleanups.splice(0)) await cleanup(); } finally { vi.useRealTimers(); } });
 const jobId = "00000000-0000-4000-8000-000000000001";
+
+test.each([undefined, "123456", "custom-secret"])("password pages enable default login only when the effective password is %s", async (password) => {
+  const f = await fixture();
+  if (password !== undefined) Object.assign(f.options, { password: () => password });
+  const response = await f.fetchPage(new URL(f.launch, f.base));
+  const html = await response.text(); const { document } = parseHTML(html);
+  const isDefault = password !== "custom-secret";
+  expect(document.body.dataset.defaultPassword).toBe(String(isDefault));
+  expect(document.querySelector("#password")!.getAttribute("value")).toBe(isDefault ? "123456" : "");
+  expect(document.getElementById("password-hint")!.textContent).toContain("/setting");
+  expect(html).not.toContain("custom-secret");
+  expect(f.spawn).not.toHaveBeenCalled(); expect(f.requestApproval).not.toHaveBeenCalled();
+});
 
 test("custom passwords are exact, do not expose credentials, and replace the default", async () => {
   const f = await fixture();
@@ -380,12 +394,14 @@ test("stale foreground status cannot keep an abandoned Shell alive indefinitely"
   expect(f.pty.kill).toHaveBeenCalledOnce();
 });
 
-test("disconnecting a foreground page still closes its Shell after three minutes", async () => {
+test("disconnecting a foreground page keeps its Shell for thirty minutes", async () => {
   const f = await fixture(); const credentials = await f.request(); await f.approve();
   const c = await f.connect(credentials); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
   await visibility(f, c.ws, true); await disconnect(f, c.ws);
-  f.tick(180_000); f.data("background output");
-  expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "closed", message: "网页已断开 3 分钟，Shell 已自动关闭" });
+  f.tick(3 * 60_000);
+  expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "running" });
+  f.tick(27 * 60_000); f.data("background output");
+  expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "closed", message: "网页已断开 30 分钟，Shell 已自动关闭" });
   expect(f.pty.kill).toHaveBeenCalledOnce();
 });
 
@@ -401,32 +417,32 @@ test("visibility cannot authorize a Shell or bypass manual closure", async () =>
   expect(f.pty.kill).toHaveBeenCalledOnce();
 });
 
-test("a disconnected shell closes after three minutes despite output, polling and card refreshes", async () => {
+test("a disconnected shell closes after thirty minutes despite output, polling and card refreshes", async () => {
   const f = await fixture(); const credentials = await f.request(); await f.approve();
   const c = await f.connect(credentials); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
   await disconnect(f, c.ws);
-  f.tick(179_999); f.data("background command output");
+  f.tick(30 * 60_000 - 1); f.data("background command output");
   expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "running" });
   const card = f.authorization();
   await f.approve({ value: { requestId: card.requestId, token: card.approvalToken, decision: "refresh" } });
   expect(f.pty.kill).not.toHaveBeenCalled();
   f.tick(1); f.data("more output");
-  expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "closed", message: "网页已断开 3 分钟，Shell 已自动关闭" });
+  expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "closed", message: "网页已断开 30 分钟，Shell 已自动关闭" });
   expect(f.pty.kill).toHaveBeenCalledOnce(); expect(f.server.activeCount).toBe(0);
   await vi.waitFor(() => expect(f.options.updateCard).toHaveBeenCalledWith("approval-card", expect.objectContaining({ state: "closed" })));
   const late = await f.connect(credentials); await vi.waitFor(() => expect(late.messages[0]?.type).toBe("error"));
   expect(f.spawn).toHaveBeenCalledOnce();
 });
 
-test("reconnection cancels expiry and a later disconnect receives its own full three minutes", async () => {
+test("reconnection cancels expiry and a later disconnect receives its own full thirty minutes", async () => {
   const f = await fixture(); const credentials = await f.request(); await f.approve();
   const first = await f.connect(credentials); await vi.waitFor(() => expect(first.messages[0]?.type).toBe("ready"));
-  await disconnect(f, first.ws); f.tick(179_999);
+  await disconnect(f, first.ws); f.tick(30 * 60_000 - 1);
   const next = await f.connect(credentials); await vi.waitFor(() => expect(next.messages[0]?.type).toBe("ready"));
   f.tick(5 * 60_000);
   expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "running" });
   expect(f.spawn).toHaveBeenCalledOnce(); expect(f.pty.kill).not.toHaveBeenCalled();
-  await disconnect(f, next.ws); f.tick(179_999);
+  await disconnect(f, next.ws); f.tick(30 * 60_000 - 1); f.data("background output");
   expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "running" });
   f.tick(1);
   expect(await (await f.post("status", credentials)).json()).toMatchObject({ state: "closed" });
@@ -438,22 +454,22 @@ test("the disconnect timer ends the Shell without waiting for another browser re
   const c = await f.connect(credentials); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   await disconnect(f, c.ws);
-  f.tick(179_999); await vi.advanceTimersByTimeAsync(179_999);
+  f.tick(30 * 60_000 - 1); await vi.advanceTimersByTimeAsync(30 * 60_000 - 1);
   expect(f.pty.kill).not.toHaveBeenCalled();
   f.data("still producing output"); f.tick(1); await vi.advanceTimersByTimeAsync(100);
   expect(f.pty.kill).toHaveBeenCalledOnce(); expect(f.server.activeCount).toBe(0);
 });
 
-test("recovery approval does not extend a disconnected Shell's deadline", async () => {
+test("issuing recovery credentials does not extend a disconnected Shell's deadline", async () => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve();
   const c = await f.connect(original); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
-  await disconnect(f, c.ws); f.tick(120_000);
+  await disconnect(f, c.ws); f.tick(29 * 60_000); f.data("background output");
   const browserKey = randomBytes(32).toString("hex");
   const response = await f.post("request", { launch: new URL(management.reopenUrl).pathname, browserKey });
   expect(response.status).toBe(200);
   const recovered = { ...await response.json() as { requestId: string }, browserKey };
   await f.approve(); f.tick(60_000);
-  expect(await (await f.post("status", recovered)).json()).toMatchObject({ state: "closed" });
+  expect(await (await f.post("status", recovered)).json()).toMatchObject({ state: "closed", message: "网页已断开 30 分钟，Shell 已自动关闭" });
   expect(f.pty.kill).toHaveBeenCalledOnce();
 });
 
@@ -464,8 +480,9 @@ test("recovery handoff starts the deadline if the replacement browser never conn
   const browserKey = randomBytes(32).toString("hex");
   const response = await f.post("request", { launch: new URL(management.reopenUrl).pathname, browserKey });
   const recovered = { ...await response.json() as { requestId: string }, browserKey };
-  await f.approve(); f.tick(180_000);
-  expect(await (await f.post("status", recovered)).json()).toMatchObject({ state: "closed" });
+  await f.approve(); f.tick(30 * 60_000); f.data("background output");
+  expect((await f.post("status", recovered)).status).toBe(400);
+  await vi.waitFor(() => expect(f.options.updateCard).toHaveBeenCalledWith("approval-card", expect.objectContaining({ state: "closed", message: "网页已断开 30 分钟，Shell 已自动关闭" })));
   expect(f.pty.kill).toHaveBeenCalledOnce();
 });
 
@@ -477,7 +494,7 @@ test("a connected Shell still expires at the eight-hour absolute limit", async (
   expect(f.pty.kill).toHaveBeenCalledOnce();
 });
 
-test("idle expiry can close a disconnected Shell before the three-minute deadline", async () => {
+test("idle expiry can close a disconnected Shell before the thirty-minute disconnect deadline", async () => {
   const f = await fixture(); const credentials = await f.request(); await f.approve();
   const c = await f.connect(credentials); await vi.waitFor(() => expect(c.messages[0]?.type).toBe("ready"));
   f.tick(29 * 60_000); await disconnect(f, c.ws); f.tick(60_000);
@@ -806,14 +823,15 @@ test("a missing source conversation fails closed rather than delivering elsewher
   expect(f.requestApproval).not.toHaveBeenCalled(); expect(f.spawn).not.toHaveBeenCalled();
 });
 
-test("password reopens a lost tab and the owner can close its original Shell from Feishu", async () => {
+test("reopening a lost tab needs no password and restores its original Shell during safe restart", async () => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve();
   const first = await f.connect(original); await vi.waitFor(() => expect(first.messages[0]?.type).toBe("ready"));
   first.ws.close(); f.data("keep my shell"); f.tick(11_000); f.blockStart();
   const launch = new URL(management.reopenUrl).pathname;
-  expect((await f.fetchPage(management.reopenUrl)).status).toBe(200);
+  const page = await f.fetchPage(management.reopenUrl);
+  expect(page.status).toBe(200); expect(await page.text()).toContain('data-resume="true"');
   const browserKey = randomBytes(32).toString("hex");
-  const response = await f.post("request", { launch, browserKey });
+  const response = await f.post("request", { launch, browserKey, password: undefined });
   expect(response.status).toBe(200);
   const recovered = { ...await response.json() as { requestId: string }, browserKey };
   expect(await (await f.post("status", recovered)).json()).toMatchObject({ state: "running" });
@@ -834,18 +852,32 @@ test("password reopens a lost tab and the owner can close its original Shell fro
   expect(f.spawn).toHaveBeenCalledOnce();
 });
 
-test("wrong recovery passwords never close or revoke the original Shell", async () => {
+test.each(["incorrect", undefined, ""])("a live recovery ignores password %s and revokes old browser access", async (password) => {
   const f = await fixture(); const original = await f.request(); const management = f.authorization(); await f.approve();
   const first = await f.connect(original); await vi.waitFor(() => expect(first.messages[0]?.type).toBe("ready"));
   const launch = new URL(management.reopenUrl).pathname;
-  for (const password of ["incorrect", undefined, ""] as const) {
-    f.tick(11_000);
-    const browserKey = randomBytes(32).toString("hex");
-    const response = await f.post("request", { launch, browserKey, password });
-    expect(response.status).toBe(401);
-    expect(await (await f.post("status", original)).json()).toMatchObject({ state: "running" });
-    expect(f.pty.kill).not.toHaveBeenCalled();
-  }
+  const browserKey = randomBytes(32).toString("hex");
+  const response = await f.post("request", { launch, browserKey, password });
+  expect(response.status).toBe(200);
+  const recovered = { ...await response.json() as { requestId: string }, browserKey };
+  expect((await f.post("status", original)).status).toBe(400);
+  const next = await f.connect(recovered); await vi.waitFor(() => expect(next.messages[0]?.type).toBe("ready"));
+  expect(f.spawn).toHaveBeenCalledOnce(); expect(f.pty.kill).not.toHaveBeenCalled();
+});
+
+test.each(["closed", "expired", "owner-change", "password-change"])("passwordless recovery cannot revive a terminal after %s", async (reason) => {
+  const f = await fixture(); const original = await f.request(); const management = f.authorization();
+  const first = await f.connect(original); await vi.waitFor(() => expect(first.messages[0]?.type).toBe("ready"));
+  if (reason === "closed") await f.post("close", original);
+  else if (reason === "expired") { await disconnect(f, first.ws); f.tick(30 * 60_000); }
+  else if (reason === "owner-change") f.owner("another-owner");
+  else Object.assign(f.options, { password: () => "changed-password" });
+  const launch = new URL(management.reopenUrl).pathname;
+  const response = await f.post("request", { launch, browserKey: randomBytes(32).toString("hex"), password: undefined });
+  expect(response.status).toBe(400);
+  expect(await response.json()).toMatchObject({ error: expect.stringContaining("已结束") });
+  expect(f.spawn).toHaveBeenCalledOnce(); expect(f.pty.kill).toHaveBeenCalledOnce();
+  expect(f.readJob).toHaveBeenCalledOnce(); expect(f.requestApproval).toHaveBeenCalledOnce();
 });
 
 test("recovery keeps the displayed terminal token while rotating browser access and superseding older grants", async () => {

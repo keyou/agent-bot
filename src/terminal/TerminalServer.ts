@@ -18,7 +18,7 @@ import type { TerminalCommandState } from "./TerminalCommandTracker.js";
 const require = createRequire(import.meta.url);
 const AUTH_TTL = 5 * 60_000;
 const IDLE_TTL = 30 * 60_000;
-const DISCONNECT_TTL = 3 * 60_000;
+const DISCONNECT_TTL = 30 * 60_000;
 const FOREGROUND_TTL = 90_000;
 const MAX_TTL = 8 * 60 * 60_000;
 const KEY = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -221,7 +221,7 @@ export class TerminalServer {
     const expire = () => {
       if (session.state !== "running" || session.socket || session.disconnectedAt === undefined) return;
       const remaining = DISCONNECT_TTL - (this.now() - session.disconnectedAt);
-      if (remaining <= 0) this.disposeSession(session, "网页已断开 3 分钟，Shell 已自动关闭");
+      if (remaining <= 0) this.disposeSession(session, "网页已断开 30 分钟，Shell 已自动关闭");
       else { session.disconnectTimer = setTimeout(expire, remaining); session.disconnectTimer.unref(); }
     };
     session.disconnectTimer = setTimeout(expire, DISCONNECT_TTL); session.disconnectTimer.unref();
@@ -303,7 +303,12 @@ export class TerminalServer {
         body = fs.readFileSync(path.join(path.dirname(require.resolve("@xterm/xterm")), "../css/xterm.css"), "utf8"); type = "text/css";
       } else {
         const resumeId = this.resumeId(url.pathname);
-        if (this.launchJob(url.pathname) || resumeId) { body = terminalPage(this.basePath, Boolean(resumeId)); type = "text/html; charset=utf-8"; }
+        if (this.launchJob(url.pathname) || resumeId) {
+          const session = resumeId ? this.sessions.get(resumeId) : undefined;
+          body = terminalPage(this.basePath, Boolean(resumeId), session?.state === "running" && Boolean(session.pty),
+            (this.options.password?.() ?? DEFAULT_TERMINAL_PASSWORD) === DEFAULT_TERMINAL_PASSWORD);
+          type = "text/html; charset=utf-8";
+        }
       }
       this.headers(res); res.statusCode = body === undefined ? 404 : 200; res.setHeader("Content-Type", type);
       res.end(req.method === "HEAD" ? undefined : body ?? "Not found."); return;
@@ -317,27 +322,31 @@ export class TerminalServer {
       if (!result.success) { this.json(res, 400, { error: "终端连接参数无效。" }); return; }
       const parsed = result.data;
       const now = this.now();
-      const address = req.socket.remoteAddress ?? "unknown";
-      while (this.passwordFailures[0] && this.passwordFailures[0].at <= now - 60_000) this.passwordFailures.shift();
-      if (this.passwordFailures.length >= 50 || this.passwordFailures.filter((failure) => failure.address === address).length >= 5) {
-        this.json(res, 429, { error: "密码尝试过于频繁，请一分钟后重试。" }); return;
-      }
-      const passwordHash = hash(this.options.password?.() ?? DEFAULT_TERMINAL_PASSWORD);
-      if (parsed.password === undefined || !timingSafeEqual(hash(parsed.password), passwordHash)) {
-        this.passwordFailures.push({ address, at: now });
-        this.json(res, 401, { error: "终端密码错误，请重新输入。" }); return;
-      }
       const resumeId = this.resumeId(parsed.launch);
       const jobId = this.launchJob(parsed.launch);
       const ownerId = this.options.ownerId();
-      if ((!jobId && !resumeId) || !ownerId) throw new Error("终端链接无效，或尚未配置飞书所有者。");
       const existing = resumeId ? this.sessions.get(resumeId) : undefined;
       if (resumeId && (!existing || !this.canReopen(existing) || existing.ownerId !== ownerId)) {
         throw new Error("原终端尚未授权、已结束或服务已重启；请从原命令卡片创建新终端。");
       }
+      // A live Shell's recovery link grants reattachment, never a new Shell.
+      const resumeRunning = existing?.state === "running" && Boolean(existing.pty) && existing.ownerId === ownerId;
+      const passwordHash = hash(this.options.password?.() ?? DEFAULT_TERMINAL_PASSWORD);
+      if (!resumeRunning) {
+        const address = req.socket.remoteAddress ?? "unknown";
+        while (this.passwordFailures[0] && this.passwordFailures[0].at <= now - 60_000) this.passwordFailures.shift();
+        if (this.passwordFailures.length >= 50 || this.passwordFailures.filter((failure) => failure.address === address).length >= 5) {
+          this.json(res, 429, { error: "密码尝试过于频繁，请一分钟后重试。" }); return;
+        }
+        if (parsed.password === undefined || !timingSafeEqual(hash(parsed.password), passwordHash)) {
+          this.passwordFailures.push({ address, at: now });
+          this.json(res, 401, { error: "终端密码错误，请重新输入。" }); return;
+        }
+      }
+      if ((!jobId && !resumeId) || !ownerId) throw new Error("终端链接无效，或尚未配置飞书所有者。");
       if (!existing || existing.state === "approved") this.assertCanStart();
       while (this.requests[0] !== undefined && this.requests[0] < now - 3600_000) this.requests.shift();
-      if (this.requests.length >= 20 || (this.requests.length > 0 && now - this.requests.at(-1)! < 10_000)
+      if (this.requests.length >= 20 || (!resumeRunning && this.requests.length > 0 && now - this.requests.at(-1)! < 10_000)
         || (!existing && [...this.sessions.values()].filter((s) => s.state !== "closed").length >= 3)) {
         this.json(res, 429, { error: "终端请求过于频繁或已达 3 个会话上限，请稍后重试。" }); return;
       }
@@ -500,7 +509,7 @@ export class TerminalServer {
         this.disposeSession(s, "终端已超时或授权已失效，请重新连接");
       }
       if (s.state === "running" && s.disconnectedAt !== undefined && now - s.disconnectedAt >= DISCONNECT_TTL) {
-        this.disposeSession(s, "网页已断开 3 分钟，Shell 已自动关闭");
+        this.disposeSession(s, "网页已断开 30 分钟，Shell 已自动关闭");
       }
       if (s.state === "running" && now - Math.max(s.lastActivity, s.foregroundUntil ?? 0) >= IDLE_TTL) {
         this.disposeSession(s, "连续 30 分钟无输入或输出，Shell 已自动关闭");
