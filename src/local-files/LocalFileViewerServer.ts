@@ -11,6 +11,7 @@ import dockerfile from "highlight.js/lib/languages/dockerfile";
 import powershell from "highlight.js/lib/languages/powershell";
 import MarkdownIt from "markdown-it";
 import { CSV_PREVIEW_CSS, renderCsvPreview, csvSourcePreview } from "./CsvPreview.js";
+import { GIT_DIFF_PREVIEW_CSS, readGitFileDiff, renderGitFileDiff } from "./GitDiffPreview.js";
 import { enableDiagramFences, DIAGRAM_PREVIEW_CLIENT_SCRIPT, DIAGRAM_PREVIEW_CSS } from "./DiagramPreview.js";
 import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 import {
@@ -404,18 +405,20 @@ export class LocalFileViewerServer {
     } catch { return undefined; }
   }
 
-  createFileUrl(filePath: string, reference?: string): string | undefined {
+  createFileUrl(filePath: string, reference?: string, options?: { diff?: boolean }): string | undefined {
     if (!this.address || !this.secret) return undefined;
     const absolutePath = normalizeAbsolutePath(filePath);
     if (!absolutePath) return undefined;
     try {
       const stat = fs.statSync(absolutePath);
       if (!stat.isFile() && !stat.isDirectory()) return undefined;
-    } catch {
-      return undefined;
+      if (options?.diff && stat.isDirectory()) return undefined;
+    } catch (error) {
+      if (!options?.diff || !["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
     }
 
     const url = this.createPreviewUrl(absolutePath);
+    if (options?.diff) url.searchParams.set("diff", "1");
     const line = parseLineReference(reference);
     if (line !== undefined) url.hash = `L${line}`;
     return url.toString();
@@ -513,7 +516,7 @@ export class LocalFileViewerServer {
           && (snapshot.fullToolOutputs?.[tool.id]?.length ?? 0) > outputAppend.length
           ? { key, revision: String(tool.tool.previewRevision), content: "", outputAppend,
               footer: renderToolFooter(tool.tool, snapshot.fullToolOutputs?.[tool.id]?.length ?? 0, language) }
-          : renderTurnPreviewDetail(snapshot, key, (filePath) => this.createFileUrl(filePath), language);
+          : renderTurnPreviewDetail(snapshot, key, (filePath, options) => this.createFileUrl(filePath, undefined, options), language);
         setSecurityHeaders(response);
         response.statusCode = detail ? 200 : 404;
         response.setHeader("Cache-Control", "no-store");
@@ -533,7 +536,7 @@ export class LocalFileViewerServer {
         state: snapshot,
         eventsUrl: eventsUrl.toString(),
         scriptPath: `${this.basePath}/assets/turn-preview.js`.replace(/\/{2,}/gu, "/"),
-        localFileUrl: (filePath) => this.createFileUrl(filePath),
+        localFileUrl: (filePath, options) => this.createFileUrl(filePath, undefined, options),
         diagramScriptPath: `${this.basePath}/assets/mermaid.js`.replace(/\/{2,}/gu, "/"),
         language,
       });
@@ -556,6 +559,24 @@ export class LocalFileViewerServer {
     if (!filePath) {
       this.sendHtml(response, 403, errorPage("文件链接无效", "签名校验失败，Agent Bot 已拒绝该请求。"), request.method === "HEAD");
       return;
+    }
+
+    if (requestUrl.searchParams.get("diff") === "1" && requestUrl.searchParams.get("raw") !== "1"
+      && legacyMatch?.[1] !== "raw" && requestUrl.searchParams.get("render") !== "html"
+      && requestUrl.searchParams.get("events") !== "1") {
+      const content = await readGitDiffPreview(filePath);
+      if (content !== undefined) {
+        const original = this.createFileUrl(filePath);
+        const actions: Array<{ href: string; label: string }> = [];
+        if (original) {
+          const raw = new URL(original); raw.searchParams.set("raw", "1");
+          const download = new URL(raw); download.searchParams.set("download", "1");
+          actions.push({ href: original, label: "查看文件" }, { href: raw.toString(), label: "打开原始文件" }, { href: download.toString(), label: "下载" });
+        }
+        this.sendHtml(response, 200, renderViewerPage({ title: path.basename(filePath), filePath,
+          metadata: ["Git diff", "完整文件", "当前工作区"], actions, content }), request.method === "HEAD");
+        return;
+      }
     }
 
     let stat: fs.Stats;
@@ -853,7 +874,7 @@ export class LocalFileViewerServer {
         if (!batch.records.length) {
           const state = projection.state;
           if (state && ["completed", "cancelled", "failed"].includes(state.status)) {
-            const update = renderTurnPreviewPatch(state, new Set(), new Set(), (file) => this.createFileUrl(file), language);
+            const update = renderTurnPreviewPatch(state, new Set(), new Set(), (file, options) => this.createFileUrl(file, undefined, options), language);
             response.write(`id: ${offset}\nevent: patch\ndata: ${JSON.stringify(update)}\n\n`);
             cleanup(); response.end();
           }
@@ -864,8 +885,8 @@ export class LocalFileViewerServer {
         const state = projection.state;
         if (!state) return;
         const render = initial
-          ? renderTurnPreviewSnapshot(state, (file) => this.createFileUrl(file), language, { deferDetails: true })
-          : renderTurnPreviewPatch(state, projection.changed, projection.removed, (file) => this.createFileUrl(file), language);
+          ? renderTurnPreviewSnapshot(state, (file, options) => this.createFileUrl(file, undefined, options), language, { deferDetails: true })
+          : renderTurnPreviewPatch(state, projection.changed, projection.removed, (file, options) => this.createFileUrl(file, undefined, options), language);
         // A terminal record can share a batch with later metadata. Drain the captured prefix first.
         render.terminal = render.terminal && batch.end;
         waitingDrain = !response.write(`id: ${offset}\nevent: ${initial ? "update" : "patch"}\ndata: ${JSON.stringify(render)}\n\n`);
@@ -916,7 +937,7 @@ export class LocalFileViewerServer {
       const serialized = JSON.stringify(state);
       if (serialized === previousSnapshot) return;
       previousSnapshot = serialized;
-      const snapshot = renderTurnPreviewSnapshot(state, (filePath) => this.createFileUrl(filePath), language, { deferDetails: true });
+      const snapshot = renderTurnPreviewSnapshot(state, (filePath, options) => this.createFileUrl(filePath, undefined, options), language, { deferDetails: true });
       writeServerSentEvent(response, "update", JSON.stringify(snapshot));
     };
     sendSnapshot();
@@ -1149,6 +1170,7 @@ function renderViewerPage(input: {
     .markdown-body img { max-width: 100%; height: auto; }
     .markdown-body hr { height: 1px; margin: 1.5em 0; border: 0; background: #dfe3e8; }
     ${CSV_PREVIEW_CSS}
+    ${GIT_DIFF_PREVIEW_CSS}
     .media { display: grid; place-items: center; min-height: 220px; }
     .media img, .media video { max-width: 100%; max-height: calc(100vh - 70px); }
     .media audio { width: min(720px, 100%); }
@@ -1348,6 +1370,29 @@ function parseDirectoryPage(value: string | null): number {
   if (!value || !/^\d+$/u.test(value)) return 0;
   const page = Number.parseInt(value, 10);
   return Number.isSafeInteger(page) && page >= 0 ? page : 0;
+}
+
+async function readGitDiffPreview(filePath: string): Promise<string | undefined> {
+  try {
+    const before = fs.statSync(filePath, { throwIfNoEntry: false });
+    let text = "";
+    if (before) {
+      if (!before.isFile() || before.size > MAX_TEXT_PREVIEW_BYTES) return undefined;
+      const classification = classifyFileContent(filePath, before.size);
+      if (classification.kind !== "text") return undefined;
+      const preview = readTextPreview(filePath, before.size, classification.encoding);
+      if (preview.truncated) return undefined;
+      text = preview.text;
+    }
+    const diff = await readGitFileDiff(filePath);
+    if (!diff) return undefined;
+    const after = fs.statSync(filePath, { throwIfNoEntry: false });
+    if (before?.size !== after?.size || before?.mtimeMs !== after?.mtimeMs || before?.ctimeMs !== after?.ctimeMs
+      || before?.ino !== after?.ino || before?.dev !== after?.dev) return undefined;
+    return renderGitFileDiff(diff, text);
+  } catch {
+    return undefined;
+  }
 }
 
 function readTextPreview(

@@ -565,7 +565,7 @@ describe("Turn Preview", () => {
     expect(content).toContain('<span class="additions">+3</span>');
     expect(content).toContain('<span class="deletions">-1</span>');
     expect(content).toContain("<li><code>removed.ts</code></li>");
-    expect(resolveUrl).toHaveBeenCalledWith(absolutePath);
+    expect(resolveUrl).toHaveBeenCalledWith(absolutePath, { diff: true });
     expect(resolveUrl).not.toHaveBeenCalledWith(file.path);
   });
 

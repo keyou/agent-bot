@@ -992,7 +992,7 @@ describe("LocalFileViewerServer", () => {
     filesDetailUrl.searchParams.set("detail", "files");
     const filesDetail = await (await fetch(filesDetailUrl)).json() as { content: string };
     const fileUrl = /class="file-link" href="([^"]+)"/u.exec(filesDetail.content)?.[1]?.replaceAll("&amp;", "&");
-    expect(fileUrl).toBe(server.createFileUrl(path.join(directory, changedFile)));
+    expect(fileUrl).toBe(server.createFileUrl(path.join(directory, changedFile), undefined, { diff: true }));
     const fileResponse = await fetch(fileUrl!);
     expect(fileResponse.status).toBe(200);
     expect(await fileResponse.text()).toContain("previewChange");

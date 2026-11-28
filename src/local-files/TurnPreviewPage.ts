@@ -13,6 +13,8 @@ import { visibleTurnActivities } from "../presentation/visibleTurnActivities.js"
 import { displayRuntimeError } from "../runtime/responseErrors.js";
 import { isFileUrl, rewriteMarkdownFileLinks } from "./MarkdownFileLinks.js";
 
+type PreviewFileUrl = (filePath: string, options?: { diff?: boolean }) => string | undefined;
+
 const MARKDOWN = new MarkdownIt({
   breaks: true,
   html: false,
@@ -236,7 +238,9 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
   });
 
   let source;
+  let eventCursor;
   const terminalAtLoad = document.body.dataset.terminal === "true";
+  let terminal = terminalAtLoad;
   const updateElapsed = () => {
     document.querySelectorAll("[data-live-elapsed]").forEach((element) => {
       const startedAt = Number(element.dataset.startedAt);
@@ -270,7 +274,37 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
     });
   };
   updateElapsed();
-  const clock = terminalAtLoad ? undefined : setInterval(updateElapsed, 1000);
+  let clock = terminalAtLoad ? undefined : setInterval(updateElapsed, 1000);
+
+  const historyKey = "agentBotTurnPreview";
+  const turnId = document.body.dataset.turnId;
+  const disclosureStates = new Map();
+  const restoredDisclosures = new WeakSet();
+  try {
+    const saved = window.history?.state?.[historyKey];
+    if (saved?.turnId === turnId && Array.isArray(saved.details)) {
+      for (const entry of saved.details) {
+        if (Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "boolean") disclosureStates.set(entry[0], entry[1]);
+      }
+    }
+  } catch {}
+  const saveDisclosures = () => {
+    for (const details of content.querySelectorAll("details[data-activity-id]")) {
+      disclosureStates.set(details.dataset.activityId, details.hasAttribute("open"));
+    }
+    try {
+      window.history?.replaceState({ ...window.history.state,
+        [historyKey]: { turnId, details: Array.from(disclosureStates) } }, "");
+    } catch {}
+  };
+  const restoreDisclosures = () => {
+    for (const details of content.querySelectorAll("details[data-activity-id]")) {
+      if (restoredDisclosures.has(details)) continue;
+      restoredDisclosures.add(details);
+      const open = disclosureStates.get(details.dataset.activityId);
+      if (typeof open === "boolean") details.toggleAttribute("open", open);
+    }
+  };
 
   const nodeKey = (node) => {
     if (node.nodeType !== 1) return undefined;
@@ -441,6 +475,7 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
   };
   content.addEventListener("toggle", (event) => {
     const details = event.target;
+    if (details.matches?.("details[data-activity-id]")) saveDisclosures();
     if (!details.matches?.("details[data-detail-key]")) return;
     if (details.open) { void loadDetails(details, true); return; }
     const state = detailState(details);
@@ -451,13 +486,22 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
     if (message) message.textContent = "";
   }, true);
   const refreshDetails = () => {
+    restoreDisclosures();
     for (const details of content.querySelectorAll("details[data-detail-key][open]")) void loadDetails(details);
   };
   window.addEventListener("pagehide", () => {
+    saveDisclosures();
     source?.close();
+    source = undefined;
     clearInterval(clock);
-    for (const details of content.querySelectorAll("details[data-detail-key]")) detailStates.get(details)?.pending?.controller.abort();
-  }, { once: true });
+    clock = undefined;
+    for (const details of content.querySelectorAll("details[data-detail-key]")) {
+      const state = detailStates.get(details);
+      state?.pending?.controller.abort();
+      if (state) state.pending = undefined;
+      details.querySelector("[data-detail-body]")?.removeAttribute("aria-busy");
+    }
+  });
   let previousContent;
   let previousMetadata;
   const applySnapshot = (update) => {
@@ -533,38 +577,58 @@ export const TURN_PREVIEW_CLIENT_SCRIPT = DIAGRAM_PREVIEW_CLIENT_SCRIPT + `(() =
     refreshDetails();
     updateElapsed();
   };
-  if (terminalAtLoad || typeof EventSource !== "function") return;
-  source = new EventSource(eventsUrl);
-  source.addEventListener("patch", (event) => {
-    try {
-      const update = JSON.parse(event.data);
-      applyPatch(update);
-      live.textContent = update.terminal ? "" : labels.live;
-      live.className = update.terminal ? "live terminal" : "live connected";
-      if (update.terminal) { source.close(); clearInterval(clock); }
-    } catch { live.textContent = labels.waitingForUpdates; }
-  });
-  source.addEventListener("update", (event) => {
-    try {
-      const update = JSON.parse(event.data);
-      if (typeof update.content !== "string" || typeof update.metadata !== "string") return;
-      applySnapshot(update);
-      live.textContent = update.terminal ? "" : labels.live;
-      live.className = update.terminal ? "live terminal" : "live connected";
-      if (update.terminal) { source.close(); clearInterval(clock); }
-    } catch {
-      live.textContent = labels.waitingForUpdates;
-      live.className = "live";
-    }
-  });
-  source.addEventListener("unavailable", () => {
-    live.textContent = labels.unavailable;
-    live.className = "live disconnected";
-  });
-  source.onerror = () => {
-    live.textContent = labels.reconnecting;
-    live.className = "live disconnected";
+  const connect = () => {
+    if (terminal || source || typeof EventSource !== "function") return;
+    const resumeUrl = eventCursor ? new URL(eventsUrl, window.location.href) : undefined;
+    if (resumeUrl) resumeUrl.searchParams.set("after", eventCursor);
+    const connection = new EventSource(resumeUrl?.toString() ?? eventsUrl);
+    source = connection;
+    connection.addEventListener("patch", (event) => {
+      if (source !== connection) return;
+      try {
+        const update = JSON.parse(event.data);
+        applyPatch(update);
+        eventCursor = event.lastEventId || eventCursor;
+        live.textContent = update.terminal ? "" : labels.live;
+        live.className = update.terminal ? "live terminal" : "live connected";
+        if (update.terminal) { terminal = true; connection.close(); clearInterval(clock); }
+      } catch { live.textContent = labels.waitingForUpdates; }
+    });
+    connection.addEventListener("update", (event) => {
+      if (source !== connection) return;
+      try {
+        const update = JSON.parse(event.data);
+        if (typeof update.content !== "string" || typeof update.metadata !== "string") return;
+        applySnapshot(update);
+        eventCursor = event.lastEventId || eventCursor;
+        live.textContent = update.terminal ? "" : labels.live;
+        live.className = update.terminal ? "live terminal" : "live connected";
+        if (update.terminal) { terminal = true; connection.close(); clearInterval(clock); }
+      } catch {
+        live.textContent = labels.waitingForUpdates;
+        live.className = "live";
+      }
+    });
+    connection.addEventListener("unavailable", () => {
+      if (source !== connection) return;
+      live.textContent = labels.unavailable;
+      live.className = "live disconnected";
+    });
+    connection.onerror = () => {
+      if (source !== connection) return;
+      live.textContent = labels.reconnecting;
+      live.className = "live disconnected";
+    };
   };
+  window.addEventListener("pageshow", (event) => {
+    if (!event.persisted) return;
+    updateElapsed();
+    refreshDetails();
+    if (!terminal && clock === undefined) clock = setInterval(updateElapsed, 1000);
+    connect();
+  });
+  refreshDetails();
+  connect();
 })();
 `;
 
@@ -594,7 +658,7 @@ export function renderTurnPreviewPage(input: {
   eventsUrl: string;
   scriptPath: string;
   diagramScriptPath?: string;
-  localFileUrl?: (filePath: string) => string | undefined;
+  localFileUrl?: PreviewFileUrl;
   language?: TurnPreviewLanguage;
 }): string {
   const language = input.language ?? "zh";
@@ -608,7 +672,7 @@ export function renderTurnPreviewPage(input: {
   <title>${escapeHtml(title)} · Agent Bot</title>
   <style>${TURN_PREVIEW_CSS}${DIAGRAM_PREVIEW_CSS}${PREVIEW_SYNTAX_CSS}</style>
 </head>
-<body data-terminal="${snapshot.terminal}" data-events-url="${escapeAttribute(input.eventsUrl)}" data-diagram-script="${escapeAttribute(input.diagramScriptPath ?? "")}">
+<body data-turn-id="${escapeAttribute(input.state.turnId)}" data-terminal="${snapshot.terminal}" data-events-url="${escapeAttribute(input.eventsUrl)}" data-diagram-script="${escapeAttribute(input.diagramScriptPath ?? "")}">
   <header class="page-header">
     <div class="header-inner">
       <div class="header-top">
@@ -627,7 +691,7 @@ export function renderTurnPreviewPage(input: {
 
 export function renderTurnPreviewPatch(
   state: TurnViewState, changed: Set<string>, removed: Set<string>,
-  localFileUrl: (filePath: string) => string | undefined, language: TurnPreviewLanguage,
+  localFileUrl: PreviewFileUrl, language: TurnPreviewLanguage,
 ): TurnPreviewSnapshot & { removed: string[]; before: Record<string, string> } {
   const visible = visibleTurnActivities(state);
   const visibleIds = new Set(visible.map((activity) => activity.id));
@@ -646,15 +710,15 @@ export function renderTurnPreviewPatch(
 
 export function renderTurnPreviewSnapshot(
   state: TurnViewState,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   language: TurnPreviewLanguage = "zh",
   options: { deferDetails?: boolean } = {},
 ): TurnPreviewSnapshot {
   const labels = previewLabels(language);
-  const resolveFileUrl = localFileUrl ? (filePath: string): string | undefined => {
-    if (path.isAbsolute(filePath) || path.win32.isAbsolute(filePath)) return localFileUrl(filePath);
-    if (!state.projectCwd || !path.isAbsolute(state.projectCwd)) return undefined;
-    return localFileUrl(path.resolve(state.projectCwd, filePath));
+  const resolveFileUrl: PreviewFileUrl | undefined = localFileUrl ? (filePath, options) => {
+    const target = path.isAbsolute(filePath) || path.win32.isAbsolute(filePath) ? filePath
+      : state.projectCwd && path.isAbsolute(state.projectCwd) ? path.resolve(state.projectCwd, filePath) : undefined;
+    return target ? options ? localFileUrl(target, options) : localFileUrl(target) : undefined;
   } : undefined;
   const renderText = (value: string): string => renderMarkdown(value, state.projectCwd, localFileUrl, language);
   const timeline = renderTimeline({ ...state, activities: visibleTurnActivities(state) }, renderText, resolveFileUrl, state.fullToolOutputs, state.fullToolErrors, language, state.projectCwd, options.deferDetails);
@@ -736,7 +800,7 @@ function renderPlan(state: TurnViewState, language: TurnPreviewLanguage): string
 function renderTimeline(
   state: TurnViewState,
   renderText: (value: string) => string,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
@@ -800,7 +864,7 @@ function leadingReasoningHeading(text: string): { title: string; body: string } 
 function renderReasoningItem(
   item: TurnReasoningItem,
   cwd: string | undefined,
-  localFileUrl: ((filePath: string) => string | undefined) | undefined,
+  localFileUrl: PreviewFileUrl | undefined,
   language: TurnPreviewLanguage,
   deferDetails: boolean,
 ): string {
@@ -819,7 +883,7 @@ function renderReasoningItem(
 function renderReasoningBody(
   item: TurnReasoningItem,
   cwd: string | undefined,
-  localFileUrl: ((filePath: string) => string | undefined) | undefined,
+  localFileUrl: PreviewFileUrl | undefined,
   language: TurnPreviewLanguage,
   presentation = reasoningPresentation(item),
 ): string {
@@ -838,7 +902,7 @@ function reasoningRevision(item: TurnReasoningItem, cwd?: string): string {
 function renderActivity(
   activity: Exclude<TurnActivity, { kind: "reasoning" }>,
   renderText: (value: string) => string,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
@@ -862,7 +926,7 @@ function renderMessageActivity(id: string, text: string, kind: string, renderTex
   return `<article class="activity message ${kind}" data-activity="${escapeAttribute(id)}"><div class="markdown">${renderText(text)}${images}</div></article>`;
 }
 
-function renderMessageImages(paths: string[] | undefined, localFileUrl: ((filePath: string) => string | undefined) | undefined, language: TurnPreviewLanguage): string {
+function renderMessageImages(paths: string[] | undefined, localFileUrl: PreviewFileUrl | undefined, language: TurnPreviewLanguage): string {
   if (!paths?.length) return "";
   return [...new Set(paths)].map((filePath, index) => {
     const label = language === "zh" ? `图片 ${index + 1}` : `Image ${index + 1}`;
@@ -883,7 +947,7 @@ function renderMessageImages(paths: string[] | undefined, localFileUrl: ((filePa
 function renderToolActivity(
   activityId: string,
   tool: ToolState,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
@@ -916,7 +980,7 @@ function renderToolActivity(
 function renderToolBody(
   activityId: string,
   tool: ToolState,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   fullToolOutputs?: Record<string, string>,
   fullToolErrors?: Record<string, string>,
   language: TurnPreviewLanguage = "zh",
@@ -1109,7 +1173,7 @@ function formatShortDuration(duration: string): string {
 
 function renderToolImage(
   tool: ToolState,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   language: TurnPreviewLanguage = "zh",
 ): string {
   if (!tool.imagePath || !localFileUrl) return "";
@@ -1127,7 +1191,7 @@ function renderToolImage(
 function renderFileSummary(
   state: TurnViewState,
   language: TurnPreviewLanguage,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   deferDetails = false,
 ): string {
   const labels = previewLabels(language);
@@ -1136,7 +1200,7 @@ function renderFileSummary(
   return `<details class="files-summary" data-activity-id="turn:files-summary"${lazy}><summary><h2>${escapeHtml(labels.fileChanges)} <span>${state.fileSummary.length}</span></h2></summary>${body}</details>`;
 }
 
-function renderFileSummaryBody(state: TurnViewState, localFileUrl?: (filePath: string) => string | undefined): string {
+function renderFileSummaryBody(state: TurnViewState, localFileUrl?: PreviewFileUrl): string {
   return `<ul class="files">${state.fileSummary.map((file) => renderFileEntry(file, localFileUrl, state.projectCwd)).join("")}</ul>`;
 }
 
@@ -1167,13 +1231,13 @@ export interface TurnPreviewDetail {
 export function renderTurnPreviewDetail(
   state: TurnViewState,
   key: string,
-  localFileUrl?: (filePath: string) => string | undefined,
+  localFileUrl?: PreviewFileUrl,
   language: TurnPreviewLanguage = "zh",
 ): TurnPreviewDetail | undefined {
-  const resolveFileUrl = localFileUrl ? (filePath: string): string | undefined => {
-    if (path.isAbsolute(filePath) || path.win32.isAbsolute(filePath)) return localFileUrl(filePath);
-    if (!state.projectCwd || !path.isAbsolute(state.projectCwd)) return undefined;
-    return localFileUrl(path.resolve(state.projectCwd, filePath));
+  const resolveFileUrl: PreviewFileUrl | undefined = localFileUrl ? (filePath, options) => {
+    const target = path.isAbsolute(filePath) || path.win32.isAbsolute(filePath) ? filePath
+      : state.projectCwd && path.isAbsolute(state.projectCwd) ? path.resolve(state.projectCwd, filePath) : undefined;
+    return target ? options ? localFileUrl(target, options) : localFileUrl(target) : undefined;
   } : undefined;
   if (key === "files" && state.fileSummary.length > 0) {
     return { key, revision: fileSummaryRevision(state), content: renderFileSummaryBody(state, resolveFileUrl) };
@@ -1195,9 +1259,9 @@ export function renderTurnPreviewDetail(
   };
 }
 
-function renderFileEntry(file: FileSummary, localFileUrl?: (filePath: string) => string | undefined, projectCwd?: string): string {
+function renderFileEntry(file: FileSummary, localFileUrl?: PreviewFileUrl, projectCwd?: string): string {
   const label = `<code>${escapeHtml(displayFilePath(file.path, projectCwd))}</code>`;
-  const url = localFileUrl?.(file.path);
+  const url = localFileUrl?.(file.path, { diff: true });
   const link = url
     ? `<a class="file-link" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`
     : label;
@@ -1238,7 +1302,7 @@ function previewTitle(state: TurnViewState): string {
   return value.length > 80 ? `${value.slice(0, 79)}…` : value;
 }
 
-function renderMarkdown(value: string, projectCwd?: string, localFileUrl?: (filePath: string) => string | undefined, language: TurnPreviewLanguage = "zh"): string {
+function renderMarkdown(value: string, projectCwd?: string, localFileUrl?: PreviewFileUrl, language: TurnPreviewLanguage = "zh"): string {
   const environment = { language };
   const tokens = MARKDOWN.parse(value, environment);
   // Only the directory is used to resolve relative links; no Markdown file is created.

@@ -15,6 +15,11 @@ import {
 const imagePath = path.resolve("preview/image.png");
 const localFileUrl = (filePath: string) => `https://viewer.test/preview/image?path=${encodeURIComponent(filePath)}`;
 
+function previewHistory(state: unknown = null) {
+  const history = { state, replaceState: vi.fn((next: unknown, _title: string) => { history.state = structuredClone(next); }) };
+  return history;
+}
+
 function initialState(): TurnViewState {
   return {
     sessionId: "session", turnId: "turn", startedAt: 1_000, status: "running",
@@ -30,12 +35,18 @@ function startClient(initial = initialState(), lazy = false, options: {
   clipboard?: { writeText: (text: string) => Promise<void> };
   legacyCopy?: (text: string) => boolean;
   language?: "zh" | "en";
+  history?: { state: unknown; replaceState: (next: unknown, title: string) => void };
 } = {}) {
   let current = initial;
   const { document } = parseHTML(renderTurnPreviewPage({
     state: initial, eventsUrl: "/turn-events", scriptPath: "/client.js", localFileUrl, language: options.language,
   }));
   if (!lazy) document.getElementById("turn-content")!.innerHTML = renderTurnPreviewSnapshot(initial, localFileUrl, options.language).content;
+  const detailsPrototype = Object.getPrototypeOf(document.createElement("details"));
+  Object.defineProperty(detailsPrototype, "open", { configurable: true,
+    get(this: Element) { return this.hasAttribute("open"); },
+    set(this: Element, open: boolean) { this.toggleAttribute("open", open); },
+  });
   const requests: Array<{ key: string; signal: AbortSignal }> = [];
   const fetchDetail = vi.fn(async (url: URL, options: { signal: AbortSignal }) => {
     const key = url.searchParams.get("detail")!;
@@ -43,17 +54,27 @@ function startClient(initial = initialState(), lazy = false, options: {
     const detail = renderTurnPreviewDetail(current, key, localFileUrl);
     return { ok: Boolean(detail), status: detail ? 200 : 404, json: async () => detail };
   });
-  const listeners = new Map<string, (event: { data: string }) => void>();
+  const listeners = new Map<string, (event: { data: string; lastEventId?: string }) => void>();
   const close = vi.fn();
+  const connections: EventSource[] = [];
   class EventSource {
+    constructor(readonly url: string) { connections.push(this); }
     onerror?: () => void;
+    listeners = new Map<string, (event: { data: string; lastEventId?: string }) => void>();
     close = close;
-    addEventListener(type: string, callback: (event: { data: string }) => void) { listeners.set(type, callback); }
+    addEventListener(type: string, callback: (event: { data: string; lastEventId?: string }) => void) { listeners.set(type, callback); this.listeners.set(type, callback); }
   }
   const frames: Array<() => void> = [];
-  const setInterval = vi.fn();
+  let timerId = 0;
+  const setInterval = vi.fn((_callback: () => void, _delay: number) => ++timerId);
+  const clearInterval = vi.fn();
   const scrollTo = vi.fn();
-  const window = { location: { href: "https://viewer.test/turn" }, scrollY: 120, innerHeight: 600, scrollTo, addEventListener: vi.fn(),
+  const pageListeners = new Map<string, Array<(event: { persisted: boolean }) => void>>();
+  const history = options.history ?? previewHistory();
+  const window = { location: { href: "https://viewer.test/turn" }, history, scrollY: 120, innerHeight: 600, scrollTo,
+    addEventListener: vi.fn((name: string, callback: (event: { persisted: boolean }) => void) => {
+      const callbacks = pageListeners.get(name) ?? []; callbacks.push(callback); pageListeners.set(name, callbacks);
+    }),
     navigator: { clipboard: options.clipboard } };
   const blobs = new Map<string, Blob>();
   const createObjectURL = vi.fn((blob: Blob) => {
@@ -82,7 +103,7 @@ function startClient(initial = initialState(), lazy = false, options: {
   Object.assign(document, { execCommand: legacyCopy });
   Object.defineProperty(document.documentElement, "scrollHeight", { value: 2_000, configurable: true });
   runInNewContext(TURN_PREVIEW_CLIENT_SCRIPT, {
-    document, window, EventSource, setInterval, clearInterval: vi.fn(), setTimeout, clearTimeout, AbortController,
+    document, window, EventSource, setInterval, clearInterval, setTimeout, clearTimeout, AbortController,
     URL: PreviewURL, Blob, TextDecoder, atob, fetch: fetchDetail,
     requestAnimationFrame: (callback: () => void) => frames.push(callback),
   });
@@ -104,12 +125,180 @@ function startClient(initial = initialState(), lazy = false, options: {
     details.dispatchEvent(new document.defaultView!.Event("toggle", { bubbles: true }));
   };
   const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
-  return { document, element, update, flushFrames, close, setInterval, scrollTo, window, listeners, requests, fetchDetail, toggle, settle,
+  const pageEvent = (name: string, persisted = true) => { for (const callback of pageListeners.get(name) ?? []) callback({ persisted }); };
+  return { document, element, update, flushFrames, close, setInterval, clearInterval, scrollTo, window, listeners, requests, fetchDetail, toggle, settle,
+    history, connections, pageEvent,
     downloads, createObjectURL, revokeObjectURL, legacyCopy };
 
 }
 
 describe("Turn Preview incremental client", () => {
+  test.each(["running", "completed"] as const)("restores open and closed file lists after returning to a reloaded %s preview", async (status) => {
+    const input = { ...initialState(), status, fileSummary: [{ path: path.resolve("preview/changed.ts"), additions: 5 }] };
+    const history = previewHistory({ unrelated: "preserved" });
+    const first = startClient(input, true, { history });
+    first.toggle(".files-summary", true);
+    await first.settle();
+    first.pageEvent("pagehide", false);
+    expect(history.state).toMatchObject({ unrelated: "preserved" });
+    expect(JSON.stringify(history.state)).not.toContain("changed.ts");
+
+    const returned = startClient(input, true, { history });
+    await returned.settle();
+    expect(returned.element(".files-summary").hasAttribute("open")).toBe(true);
+    expect(returned.element(".files-summary .file-link").textContent).toContain("changed.ts");
+    expect(returned.requests.map((request) => request.key)).toEqual(["files"]);
+    expect(returned.element(".tool-step").hasAttribute("open")).toBe(false);
+    returned.toggle(".files-summary", false);
+    returned.pageEvent("pagehide", false);
+
+    const closed = startClient(input, true, { history });
+    await closed.settle();
+    expect(closed.element(".files-summary").hasAttribute("open")).toBe(false);
+    expect(closed.requests).toHaveLength(0);
+    expect(closed.document.querySelector(".file-link")).toBeNull();
+  });
+
+  test("keeps disclosure preferences within their Turn and history entry", async () => {
+    const input = { ...initialState(), fileSummary: [{ path: "changed.ts" }] };
+    const first = startClient(input, true);
+    first.toggle(".files-summary", true);
+    await first.settle();
+    const otherTurn = startClient({ ...input, turnId: "other-turn" }, true, { history: first.history });
+    const freshEntry = startClient(input, true);
+    for (const client of [otherTurn, freshEntry]) {
+      expect(client.element(".files-summary").hasAttribute("open")).toBe(false);
+      expect(client.requests).toHaveLength(0);
+    }
+  });
+
+  test.each(["update", "patch"] as const)("restores saved file-list expansion arriving later via %s without undoing later user toggles", async (event) => {
+    const history = previewHistory({ agentBotTurnPreview: { turnId: "turn", details: [["turn:files-summary", true]] } });
+    const initial = initialState();
+    const client = startClient(initial, true, { history });
+    expect(client.document.querySelector(".files-summary")).toBeNull();
+    const next = { ...initial, fileSummary: [{ path: "changed.ts" }] };
+    const publish = (state: TurnViewState) => {
+      if (event === "update") client.update(state);
+      else client.listeners.get("patch")!({ data: JSON.stringify(renderTurnPreviewPatch(state, new Set(), new Set(), localFileUrl, "zh")) });
+    };
+    publish(next);
+    await client.settle();
+    expect(client.element(".files-summary").hasAttribute("open")).toBe(true);
+    expect(client.fetchDetail).toHaveBeenCalledTimes(1);
+    client.toggle(".files-summary", false);
+    publish({ ...next, totalTokens: 50 });
+    await client.settle();
+    expect(client.element(".files-summary").hasAttribute("open")).toBe(false);
+    expect(client.fetchDetail).toHaveBeenCalledTimes(1);
+  });
+
+  test("restores tool and reasoning disclosures through the same history state", async () => {
+    const initial = initialState();
+    initial.reasoningItems = [{ itemId: "r1", summary: ["**Checking image**"], content: ["Look at the image."] }];
+    const first = startClient(initial, true);
+    first.toggle(".reasoning-step", true);
+    first.toggle(".tool-step", true);
+    await first.settle();
+    first.pageEvent("pagehide");
+    const returned = startClient(initial, true, { history: first.history });
+    await returned.settle();
+    expect(returned.element(".reasoning-step").hasAttribute("open")).toBe(true);
+    expect(returned.element(".tool-step").hasAttribute("open")).toBe(true);
+    expect(returned.requests.map((request) => request.key).sort()).toEqual(["reasoning:r1", "tool:tool:image"]);
+    expect(returned.element(".tool-image img")).toBeDefined();
+  });
+
+  test.each(["read", "write"] as const)("continues lazy loading and live updates when history %s is unavailable", async (failure) => {
+    const history = previewHistory();
+    if (failure === "read") Object.defineProperty(history, "state", { get: () => { throw new Error("History denied"); } });
+    else history.replaceState.mockImplementation(() => { throw new Error("History denied"); });
+    const initial = { ...initialState(), fileSummary: [{ path: path.resolve("preview/changed.ts") }] };
+    const client = startClient(initial, true, { history });
+    client.toggle(".files-summary", true);
+    await client.settle();
+    expect(client.element(".files-summary .file-link")).toBeDefined();
+    client.update({ ...initial, totalTokens: 10 });
+    expect(client.element(".files-summary").hasAttribute("open")).toBe(true);
+    client.pageEvent("pagehide");
+    client.pageEvent("pageshow");
+    expect(client.connections).toHaveLength(2);
+  });
+
+  test("ignores malformed stored disclosure values", () => {
+    const history = previewHistory({ agentBotTurnPreview: { turnId: "turn", details: [null, true, {}, ["turn:files-summary", "yes"]] } });
+    const client = startClient({ ...initialState(), fileSummary: [{ path: "changed.ts" }] }, true, { history });
+    expect(client.element(".files-summary").hasAttribute("open")).toBe(false);
+    expect(client.fetchDetail).not.toHaveBeenCalled();
+  });
+
+  test("keeps loaded disclosures and reconnects live updates on repeated back-forward cache returns", async () => {
+    const input = { ...initialState(), fileSummary: [{ path: path.resolve("preview/changed.ts") }] };
+    const client = startClient(input, true);
+    client.toggle(".files-summary", true);
+    await client.settle();
+    const list = client.element(".files-summary");
+    const link = client.element(".file-link");
+    client.pageEvent("pageshow", false);
+    expect(client.connections).toHaveLength(1);
+    for (let round = 1; round <= 2; round += 1) {
+      const previous = client.connections.at(-1)!;
+      client.pageEvent("pagehide");
+      expect(client.clearInterval).toHaveBeenCalledTimes(round);
+      client.pageEvent("pageshow");
+      client.pageEvent("pageshow");
+      expect(client.connections).toHaveLength(round + 1);
+      expect(client.setInterval).toHaveBeenCalledTimes(round + 1);
+      previous.listeners.get("unavailable")!({ data: "" });
+      previous.onerror?.();
+      expect(client.element("#turn-live").className).toBe("live connected");
+      client.update({ ...input, totalTokens: round * 10 });
+      expect(client.element(".files-summary")).toBe(list);
+      expect(list.hasAttribute("open")).toBe(true);
+      expect(client.element(".file-link")).toBe(link);
+    }
+    expect(client.requests).toHaveLength(1);
+  });
+
+  test.each(["update", "patch"] as const)("resumes the last applied %s cursor after a back-forward cache return", (event) => {
+    const initial = initialState();
+    const client = startClient(initial, true);
+    const update = event === "update" ? renderTurnPreviewSnapshot(initial, localFileUrl, "zh", { deferDetails: true })
+      : renderTurnPreviewPatch(initial, new Set(), new Set(), localFileUrl, "zh");
+    client.listeners.get(event)!({ data: JSON.stringify(update), lastEventId: "42" });
+    client.pageEvent("pagehide");
+    client.pageEvent("pageshow");
+    expect(new URL(client.connections.at(-1)!.url).searchParams.get("after")).toBe("42");
+  });
+
+  test.each([true, false])("does not reopen a completed Turn's stream or timer on cache return (completed at load: %s)", (atLoad) => {
+    const input = initialState();
+    const client = startClient(atLoad ? { ...input, status: "completed" } : input, true);
+    if (!atLoad) client.update({ ...input, status: "completed" });
+    const count = client.connections.length;
+    const timers = client.setInterval.mock.calls.length;
+    client.pageEvent("pagehide");
+    client.pageEvent("pageshow");
+    expect(client.connections).toHaveLength(count);
+    expect(client.setInterval).toHaveBeenCalledTimes(timers);
+  });
+
+  test("aborts pending details on leave and retries them after a cache return without a spurious error", async () => {
+    const client = startClient(initialState(), true);
+    client.fetchDetail.mockImplementationOnce(async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
+    }));
+    client.toggle(".tool-step", true);
+    client.pageEvent("pagehide");
+    await client.settle();
+    expect(client.element("[data-detail-message]").textContent).not.toContain("加载失败");
+    client.pageEvent("pageshow");
+    await client.settle();
+    expect(client.fetchDetail).toHaveBeenCalledTimes(2);
+    expect(client.element(".tool-image img")).toBeDefined();
+    expect(client.element("[data-detail-body]").hasAttribute("aria-busy")).toBe(false);
+  });
+
   test.each(["update", "patch"] as const)("adds a disclosure only when a reasoning body arrives via %s", async (event) => {
     const initial = initialState();
     initial.reasoningItems = [{ itemId: "r1", summary: ["**Reading build log**"], content: [" "] }];
