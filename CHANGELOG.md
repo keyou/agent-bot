@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.27-alpha.1] - 2026-11-28
+
 - Keep Turn Preview file-list, tool and reasoning disclosure states when returning from a file/diff page or reloading the same history entry. Restore only expanded lazy details, isolate state by Turn, and resume live updates after back-forward cache restoration.
 
 - Open changed-file links from Turn Preview summaries/tool details as full-file inline Git diffs when available: retain all unchanged context, highlight additions/deletions, and show old/new line numbers. Include staged/unstaged changes and tracked deletions, verify source/patch consistency, keep ordinary previews/downloads as fallbacks, read Git only on file open with bounded execution/output, and disable repository external diff/textconv/clean/process/fsmonitor commands.
