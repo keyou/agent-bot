@@ -6,6 +6,15 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Keep Turn Preview file-list, tool and reasoning disclosure states when returning from a file/diff page or reloading the same history entry. Restore only expanded lazy details, isolate state by Turn, and resume live updates after back-forward cache restoration.
+
+- Open changed-file links from Turn Preview summaries/tool details as full-file inline Git diffs when available: retain all unchanged context, highlight additions/deletions, and show old/new line numbers. Include staged/unstaged changes and tracked deletions, verify source/patch consistency, keep ordinary previews/downloads as fallbacks, read Git only on file open with bounded execution/output, and disable repository external diff/textconv/clean/process/fsmonitor commands.
+
+- Show the terminal password settings shortcut, prefill the public default `123456` only while it remains configured, and connect after a cancellable five-second countdown. Keep custom passwords private, use normal server authentication, and skip the countdown for existing browser grants and running-Shell recovery.
+
+- Reopen running browser terminals directly without another password, retaining the original Shell/output and revoking older browser access. First-start terminals still require the password; closed, expired and pre-restart terminals cannot be revived. Treat running-terminal recovery links as private credentials.
+- Keep disconnected terminal Shells for thirty minutes instead of three, independently of the thirty-minute idle timeout. Move lifecycle help from the permanent page footer into the Close Terminal button tooltip and confirmation.
+
 ## [0.1.27-alpha.0] - 2026-11-22
 
 - Generate macOS LaunchAgents with `ProcessType=Standard` instead of `Background`, avoiding background scheduling for user-requested Agent and build work. Re-register existing Profiles with `agentbot server autostart enable`, then reload the LaunchAgent after active work has finished (for example by logging out and back in); an ordinary Agent Bot restart alone does not replace an already-loaded launchd policy.
